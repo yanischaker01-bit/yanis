@@ -59,7 +59,8 @@ Fonctions:
    - Main file path: `streamlit_lgv_pro.py`
 5. Clique `Deploy`.
 
-Au premier demarrage, l'app genere automatiquement un snapshot si aucun fichier n'existe.
+Sur Streamlit Cloud, l'app lit en priorite le snapshot publie par GitHub Pages:
+`https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json`.
 
 ## Fonctionnement
 

@@ -3,17 +3,21 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import altair as alt
 import folium
 import pandas as pd
+import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
 
 SNAPSHOT_LATEST = Path("reports/streamlit_snapshot_latest.json")
 SNAPSHOT_GLOB = "streamlit_snapshot_*.json"
+REMOTE_SNAPSHOT_URLS = [
+    "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json",
+]
 
 RISK_ORDER = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
 RISK_COLOR = {
@@ -56,16 +60,6 @@ def _find_snapshot() -> Path | None:
     return snapshots[0] if snapshots else None
 
 
-def _bootstrap_snapshot() -> Path | None:
-    try:
-        from meteo_test import LGVSeaMonitor
-
-        LGVSeaMonitor().run_cycle()
-    except Exception:
-        return None
-    return _find_snapshot()
-
-
 @st.cache_data(show_spinner=False)
 def _load_snapshot(path_str: str, mtime: float) -> Dict[str, object]:
     _ = mtime
@@ -73,6 +67,30 @@ def _load_snapshot(path_str: str, mtime: float) -> Dict[str, object]:
     with path.open("r", encoding="utf-8") as f:
         payload = json.load(f)
     return payload if isinstance(payload, dict) else {}
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_remote_snapshot(url: str) -> Dict[str, object]:
+    try:
+        response = requests.get(url, timeout=20)
+        if response.status_code != 200 or not response.text.strip():
+            return {}
+        payload = response.json()
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _load_snapshot_payload() -> Tuple[Dict[str, object], str]:
+    local_path = _find_snapshot()
+    if local_path is not None:
+        return _load_snapshot(str(local_path), local_path.stat().st_mtime), f"local:{local_path}"
+
+    for url in REMOTE_SNAPSHOT_URLS:
+        payload = _load_remote_snapshot(url)
+        if payload:
+            return payload, url
+    return {}, ""
 
 
 def _safe_df(records: object) -> pd.DataFrame:
@@ -294,24 +312,14 @@ st.markdown(
 st.title("LGV SEA - Rapport Streamlit Pro")
 st.caption("Suivi hydrometeo et geotechnique avec classement par commune")
 
-snapshot_path = _find_snapshot()
-if snapshot_path is None:
-    if "bootstrap_attempted" not in st.session_state:
-        st.session_state["bootstrap_attempted"] = True
-        with st.spinner("Initialisation des donnees (premier demarrage)..."):
-            snapshot_path = _bootstrap_snapshot()
-
-if snapshot_path is None:
-    st.warning("Aucun snapshot disponible pour l'instant.")
-    if st.button("Generer un snapshot maintenant", use_container_width=True):
-        with st.spinner("Generation du snapshot..."):
-            snapshot_path = _bootstrap_snapshot()
-        if snapshot_path is not None:
-            st.success("Snapshot genere.")
-            st.rerun()
+snapshot, snapshot_source = _load_snapshot_payload()
+if not snapshot:
+    st.error("Aucune donnee chargee. Le snapshot n'est pas disponible.")
+    st.info("Verifie que GitHub Pages est actif puis recharge la page.")
+    if st.button("Reessayer le chargement", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
     st.stop()
-
-snapshot = _load_snapshot(str(snapshot_path), snapshot_path.stat().st_mtime)
 
 weather_df = _safe_df(snapshot.get("weather"))
 sectors_df = _safe_df((snapshot.get("sectors") or {}).get("sectors"))
@@ -338,11 +346,7 @@ if not alerts_df.empty and "level" in alerts_df.columns:
 
 with st.sidebar:
     st.subheader("Filtres")
-    if st.button("Rafraichir donnees (nouveau cycle)", use_container_width=True):
-        from meteo_test import LGVSeaMonitor
-
-        with st.spinner("Execution du cycle en cours..."):
-            LGVSeaMonitor().run_cycle()
+    if st.button("Rafraichir snapshot", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
 
@@ -574,5 +578,6 @@ with tabs[2]:
 ts = snapshot.get("timestamp_utc")
 if ts:
     st.caption(f"Donnees snapshot: {ts}")
-st.caption(f"Fichier: {snapshot_path}")
+if snapshot_source:
+    st.caption(f"Source snapshot: {snapshot_source}")
 st.caption(f"Interface update: {datetime.now(timezone.utc).isoformat()}")
