@@ -37,6 +37,13 @@ RAIN_PERIODS = {
     "Mois courant": ("rain_month_mm", "weather_max_month_mm"),
 }
 
+RAIN_COMPONENT_THRESHOLDS = {
+    "weather_max_24h_mm": (20.0, 50.0, 80.0, 120.0),
+    "weather_max_7d_mm": (35.0, 70.0, 110.0, 160.0),
+    "weather_max_30d_mm": (60.0, 110.0, 170.0, 240.0),
+    "weather_max_month_mm": (60.0, 110.0, 170.0, 240.0),
+}
+
 
 def _risk_rank(level: str) -> int:
     return RISK_ORDER.get(str(level or "").upper(), 0)
@@ -50,6 +57,29 @@ def _risk_level_from_note(note_gc: float) -> str:
     if note_gc >= 40:
         return "MODERE"
     return "FAIBLE"
+
+
+def _score_from_thresholds(value: float, thresholds: Tuple[float, float, float, float]) -> float:
+    t1, t2, t3, t4 = thresholds
+    if value >= t4:
+        return 4.0
+    if value >= t3:
+        return 3.0
+    if value >= t2:
+        return 2.0
+    if value >= t1:
+        return 1.5
+    return 1.0
+
+
+def _score_from_presence_count(value: float, medium: float, high: float) -> float:
+    if value >= high:
+        return 4.0
+    if value >= medium:
+        return 3.0
+    if value > 0.0:
+        return 2.0
+    return 1.0
 
 
 def _find_snapshot() -> Path | None:
@@ -203,41 +233,51 @@ def _load_sector_monthly_history(lat: float, lon: float, years_back: int) -> Dic
         return {"monthly": [], "climatology": [], "model": used_model, "error": str(exc)}
 
 
-def _build_multi_sector_history(sector_rows: List[Dict[str, object]], years_back: int) -> Tuple[pd.DataFrame, Dict[str, str]]:
+def _build_multi_commune_history(commune_rows: List[Dict[str, object]], years_back: int) -> Tuple[pd.DataFrame, Dict[str, str]]:
     frames: List[pd.DataFrame] = []
-    model_by_sector: Dict[str, str] = {}
-    for sec in sector_rows:
-        sid = str(sec.get("sector_id"))
-        lat = float(sec.get("latitude"))
-        lon = float(sec.get("longitude"))
+    model_by_commune: Dict[str, str] = {}
+    for com in commune_rows:
+        cname = str(com.get("commune_name") or "Inconnue")
+        ccode = str(com.get("commune_code") or "")
+        commune_label = f"{cname} ({ccode})" if ccode else cname
+        try:
+            lat = float(com.get("latitude"))
+            lon = float(com.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+
         payload = _load_sector_monthly_history(lat, lon, years_back)
-        model_by_sector[sid] = str(payload.get("model") or "")
+        model_by_commune[commune_label] = str(payload.get("model") or "")
         monthly = _safe_df(payload.get("monthly"))
         if monthly.empty:
             continue
-        monthly["sector_id"] = sid
-        monthly["commune_name"] = str(sec.get("commune_name") or "Inconnue")
-        monthly["sector_label"] = monthly["sector_id"] + " - " + monthly["commune_name"]
+        monthly["commune_name"] = cname
+        monthly["commune_label"] = commune_label
         frames.append(monthly)
     if not frames:
-        return pd.DataFrame(), model_by_sector
+        return pd.DataFrame(), model_by_commune
     out = pd.concat(frames, ignore_index=True)
     out["ym"] = out["ym"].astype(str)
     out["year"] = pd.to_numeric(out["year"], errors="coerce").fillna(0).astype(int)
     out["month"] = pd.to_numeric(out["month"], errors="coerce").fillna(0).astype(int)
     out["monthly_precip_mm"] = pd.to_numeric(out["monthly_precip_mm"], errors="coerce")
     out = out.dropna(subset=["monthly_precip_mm"])
-    return out.sort_values(["ym", "sector_id"]), model_by_sector
+    return out.sort_values(["ym", "commune_label"]), model_by_commune
 
 
-def _aggregate_communes(sectors_df: pd.DataFrame, sector_rain_col: str) -> pd.DataFrame:
+def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.DataFrame:
     if sectors_df.empty:
         return pd.DataFrame()
 
     df = sectors_df.copy()
+    df["latitude"] = pd.to_numeric(df.get("latitude"), errors="coerce")
+    df["longitude"] = pd.to_numeric(df.get("longitude"), errors="coerce")
     df["commune_name"] = df.get("commune_name", "Inconnue").fillna("Inconnue")
     df["sector_score"] = pd.to_numeric(df.get("score", 0.0), errors="coerce").fillna(0.0)
-    df["rain_period_mm"] = pd.to_numeric(df.get(sector_rain_col, 0.0), errors="coerce").fillna(0.0)
+    df["rain_period_mm"] = pd.to_numeric(df.get(commune_rain_col, 0.0), errors="coerce").fillna(0.0)
+    df["geotech_points"] = pd.to_numeric(df.get("geotech_points", 0.0), errors="coerce").fillna(0.0)
+    df["piezometers"] = pd.to_numeric(df.get("piezometers", 0.0), errors="coerce").fillna(0.0)
+    df["hydro_stations"] = pd.to_numeric(df.get("hydro_stations", 0.0), errors="coerce").fillna(0.0)
     df["is_critical"] = (df.get("risk_level", "") == "CRITIQUE").astype(int)
     df["is_high"] = (df.get("risk_level", "") == "ELEVE").astype(int)
     df["is_moderate"] = (df.get("risk_level", "") == "MODERE").astype(int)
@@ -257,6 +297,14 @@ def _aggregate_communes(sectors_df: pd.DataFrame, sector_rain_col: str) -> pd.Da
             watch=("is_watch", "sum"),
             avg_rain_period_mm=("rain_period_mm", "mean"),
             max_rain_period_mm=("rain_period_mm", "max"),
+            avg_geotech_points=("geotech_points", "mean"),
+            max_geotech_points=("geotech_points", "max"),
+            avg_piezometers=("piezometers", "mean"),
+            max_piezometers=("piezometers", "max"),
+            avg_hydro_stations=("hydro_stations", "mean"),
+            max_hydro_stations=("hydro_stations", "max"),
+            latitude=("latitude", "mean"),
+            longitude=("longitude", "mean"),
         )
         .reset_index()
     )
@@ -268,6 +316,33 @@ def _aggregate_communes(sectors_df: pd.DataFrame, sector_rain_col: str) -> pd.Da
     ).clip(lower=0.0, upper=100.0)
     grouped["note_gc"] = grouped["note_gc"].round(1)
     grouped["commune_risk_level"] = grouped["note_gc"].map(_risk_level_from_note)
+    grouped["latitude"] = pd.to_numeric(grouped.get("latitude"), errors="coerce").round(6)
+    grouped["longitude"] = pd.to_numeric(grouped.get("longitude"), errors="coerce").round(6)
+
+    rain_thresholds = RAIN_COMPONENT_THRESHOLDS.get(
+        str(commune_rain_col),
+        (20.0, 50.0, 80.0, 120.0),
+    )
+    grouped["weather_component_score"] = grouped["avg_rain_period_mm"].map(lambda v: _score_from_thresholds(float(v or 0.0), rain_thresholds))
+    grouped["geotech_component_score"] = grouped["max_geotech_points"].map(
+        lambda v: _score_from_presence_count(float(v or 0.0), medium=2.0, high=4.0)
+    )
+    grouped["piezo_component_score"] = grouped["max_piezometers"].map(
+        lambda v: _score_from_presence_count(float(v or 0.0), medium=1.0, high=2.0)
+    )
+    grouped["hydro_component_score"] = grouped["max_hydro_stations"].map(
+        lambda v: _score_from_presence_count(float(v or 0.0), medium=1.0, high=2.0)
+    )
+
+    grouped["weather_component_note"] = (grouped["weather_component_score"] / 4.0 * 100.0).round(1)
+    grouped["geotech_component_note"] = (grouped["geotech_component_score"] / 4.0 * 100.0).round(1)
+    grouped["piezo_component_note"] = (grouped["piezo_component_score"] / 4.0 * 100.0).round(1)
+    grouped["hydro_component_note"] = (grouped["hydro_component_score"] / 4.0 * 100.0).round(1)
+    grouped["global_gc_note"] = grouped["note_gc"]
+
+    grouped["lgv_points_count"] = grouped["sector_count"]
+    grouped["avg_point_score"] = grouped["avg_sector_score"]
+    grouped["max_point_score"] = grouped["max_sector_score"]
     grouped = grouped.sort_values(["note_gc", "critical", "high"], ascending=[False, False, False]).reset_index(drop=True)
     return grouped
 
@@ -275,15 +350,14 @@ def _aggregate_communes(sectors_df: pd.DataFrame, sector_rain_col: str) -> pd.Da
 def _build_map(
     snapshot: Dict[str, object],
     weather_df: pd.DataFrame,
-    sectors_df: pd.DataFrame,
+    commune_df: pd.DataFrame,
     hydro_df: pd.DataFrame,
     piezo_df: pd.DataFrame,
     geotech_df: pd.DataFrame,
     rain_col_weather: str,
-    sector_rain_col: str,
     min_risk: str,
     show_weather: bool,
-    show_sectors: bool,
+    show_communes: bool,
     show_hydro: bool,
     show_piezo: bool,
     show_geotech: bool,
@@ -324,31 +398,39 @@ def _build_map(
             ).add_to(weather_layer)
         weather_layer.add_to(m)
 
-    if show_sectors and not sectors_df.empty:
-        sector_layer = folium.FeatureGroup(name="Secteurs", show=True)
-        for _, row in sectors_df.iterrows():
-            lvl = str(row.get("risk_level", "INDETERMINE"))
+    if show_communes and not commune_df.empty:
+        commune_layer = folium.FeatureGroup(name="Communes", show=True)
+        for _, row in commune_df.iterrows():
+            lvl = str(row.get("commune_risk_level", "INDETERMINE"))
             if _risk_rank(lvl) < _risk_rank(min_risk):
                 continue
-            rain = float(row.get(sector_rain_col, 0.0) or 0.0)
+            lat = pd.to_numeric(row.get("latitude"), errors="coerce")
+            lon = pd.to_numeric(row.get("longitude"), errors="coerce")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            rain_avg = float(row.get("avg_rain_period_mm", 0.0) or 0.0)
+            rain_max = float(row.get("max_rain_period_mm", 0.0) or 0.0)
+            lgv_points = int(row.get("lgv_points_count", row.get("sector_count", 0)) or 0)
+            radius = max(6, min(14, 6 + lgv_points))
             popup = (
-                f"<b>{row.get('sector_id')}</b><br>"
                 f"<b>Commune:</b> {row.get('commune_name')}<br>"
+                f"<b>Code INSEE:</b> {row.get('commune_code', 'n/a')}<br>"
                 f"<b>Risque:</b> {lvl}<br>"
-                f"<b>Score:</b> {row.get('score')}<br>"
-                f"<b>Cumul filtre:</b> {rain:.1f} mm<br>"
-                f"<b>Geo/Piezo/Hydro:</b> {row.get('geotech_points')}/{row.get('piezometers')}/{row.get('hydro_stations')}"
+                f"<b>Note GC:</b> {row.get('note_gc')} /100<br>"
+                f"<b>Cumul moyen filtre:</b> {rain_avg:.1f} mm<br>"
+                f"<b>Cumul max filtre:</b> {rain_max:.1f} mm<br>"
+                f"<b>Points LGV dans commune:</b> {lgv_points}"
             )
             folium.CircleMarker(
-                [float(row["latitude"]), float(row["longitude"])],
-                radius=8,
+                [float(lat), float(lon)],
+                radius=radius,
                 color=RISK_COLOR.get(lvl, "#6b7280"),
                 fill=True,
-                fill_opacity=0.35,
+                fill_opacity=0.30,
                 weight=2,
                 popup=folium.Popup(popup, max_width=360),
-            ).add_to(sector_layer)
-        sector_layer.add_to(m)
+            ).add_to(commune_layer)
+        commune_layer.add_to(m)
 
     if show_hydro and not hydro_df.empty:
         hydro_layer = folium.FeatureGroup(name="Hydro reseau", show=False)
@@ -483,7 +565,7 @@ with st.sidebar:
         st.rerun()
 
     period_label = st.selectbox("Periode pluvio", list(RAIN_PERIODS.keys()), index=0)
-    rain_col_weather, sector_rain_col = RAIN_PERIODS[period_label]
+    rain_col_weather, commune_rain_col = RAIN_PERIODS[period_label]
     min_risk = st.selectbox("Risque minimum", ["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=1)
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
@@ -499,11 +581,11 @@ with st.sidebar:
     )
     selected_station_communes = st.multiselect("Communes des stations meteo", station_communes, default=station_communes)
 
-    top_n = st.slider("Top communes", min_value=5, max_value=25, value=12, step=1)
+    st.caption("Toutes les communes filtrees sont affichees (pas de limite a 25).")
 
     st.markdown("---")
     show_weather = st.checkbox("Layer meteo", value=True)
-    show_sectors = st.checkbox("Layer secteurs", value=True)
+    show_communes = st.checkbox("Layer communes", value=True)
     show_hydro = st.checkbox("Layer hydro", value=True)
     show_piezo = st.checkbox("Layer piezometres", value=False)
     show_geotech = st.checkbox("Layer geotech", value=False)
@@ -522,33 +604,42 @@ if not filtered_sectors.empty and selected_communes:
 if not filtered_sectors.empty:
     filtered_sectors = filtered_sectors[filtered_sectors["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
-commune_df = _aggregate_communes(filtered_sectors, sector_rain_col)
-sector_pool = filtered_sectors if not filtered_sectors.empty else sectors_df
-selected_sector: Dict[str, object] = {}
+commune_df = _aggregate_communes(filtered_sectors, commune_rain_col)
+if not commune_df.empty:
+    commune_df["commune_code"] = commune_df.get("commune_code", "").fillna("").astype(str)
+    commune_df["commune_label"] = commune_df.apply(
+        lambda r: f"{str(r.get('commune_name') or 'Inconnue')} ({str(r.get('commune_code') or '')})"
+        if str(r.get("commune_code") or "").strip()
+        else str(r.get("commune_name") or "Inconnue"),
+        axis=1,
+    )
+
+commune_pool = commune_df.copy()
+selected_commune: Dict[str, object] = {}
 history_years = 5
-selected_compare_sector_ids: List[str] = []
+selected_compare_commune_labels: List[str] = []
 compare_history_df = pd.DataFrame()
 history_models: Dict[str, str] = {}
-if not sector_pool.empty:
+if not commune_pool.empty:
     with st.sidebar:
         st.markdown("---")
-        st.subheader("Analyse secteur")
-        sector_ids = sector_pool["sector_id"].astype(str).tolist()
-        chosen_sector_id = st.selectbox("Secteur detail", sector_ids, index=0)
-        selected_compare_sector_ids = st.multiselect(
-            "Secteurs a comparer",
-            sector_ids,
-            default=sector_ids[: min(4, len(sector_ids))],
+        st.subheader("Analyse commune")
+        commune_labels = commune_pool["commune_label"].astype(str).tolist()
+        chosen_commune_label = st.selectbox("Commune detail", commune_labels, index=0)
+        selected_compare_commune_labels = st.multiselect(
+            "Communes a comparer",
+            commune_labels,
+            default=commune_labels[: min(8, len(commune_labels))],
         )
         history_years = st.slider("Historique mensuel (ans)", min_value=2, max_value=5, value=5, step=1)
-    selected_sector = sector_pool[sector_pool["sector_id"].astype(str) == chosen_sector_id].iloc[0].to_dict()
+    selected_commune = commune_pool[commune_pool["commune_label"].astype(str) == chosen_commune_label].iloc[0].to_dict()
 
-    compare_sector_rows: List[Dict[str, object]] = []
-    for sid in selected_compare_sector_ids:
-        hit = sector_pool[sector_pool["sector_id"].astype(str) == str(sid)]
+    compare_commune_rows: List[Dict[str, object]] = []
+    for label in selected_compare_commune_labels:
+        hit = commune_pool[commune_pool["commune_label"].astype(str) == str(label)]
         if not hit.empty:
-            compare_sector_rows.append(hit.iloc[0].to_dict())
-    compare_history_df, history_models = _build_multi_sector_history(compare_sector_rows, int(history_years))
+            compare_commune_rows.append(hit.iloc[0].to_dict())
+    compare_history_df, history_models = _build_multi_commune_history(compare_commune_rows, int(history_years))
 
     if not compare_history_df.empty:
         ym_options = sorted(compare_history_df["ym"].astype(str).unique().tolist())
@@ -565,9 +656,11 @@ if not sector_pool.empty:
                 (compare_history_df["ym"].astype(str) >= str(ym_start)) & (compare_history_df["ym"].astype(str) <= str(ym_end))
             ]
 
-history_payload = {"monthly": [], "climatology": [], "model": "", "error": "pas de secteur"}
-if selected_sector:
-    history_payload = _load_sector_monthly_history(float(selected_sector["latitude"]), float(selected_sector["longitude"]), int(history_years))
+history_payload = {"monthly": [], "climatology": [], "model": "", "error": "pas de commune"}
+if selected_commune:
+    history_payload = _load_sector_monthly_history(
+        float(selected_commune["latitude"]), float(selected_commune["longitude"]), int(history_years)
+    )
 history_monthly_df = _safe_df(history_payload.get("monthly"))
 history_clim_df = _safe_df(history_payload.get("climatology"))
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
@@ -577,7 +670,7 @@ col1, col2, col3, col4, col5 = st.columns(5)
 col1.metric("Risque global", risk_level)
 col2.metric("Score global", f"{score:.2f}/4")
 col3.metric("Stations meteo", int(len(filtered_weather)))
-col4.metric("Secteurs filtres", int(len(filtered_sectors)))
+col4.metric("Points LGV filtres", int(len(filtered_sectors)))
 col5.metric("Communes suivies", int(len(commune_df)))
 
 tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes", "Metadata"])
@@ -586,46 +679,45 @@ with tabs[0]:
     left, right = st.columns([1.5, 1.0])
 
     with left:
-        st.subheader("Classement des communes (note GC)")
+        st.subheader("Classement complet des communes (note GC)")
         if commune_df.empty:
             st.info("Aucune commune pour les filtres courants.")
         else:
-            top_communes = commune_df.head(top_n).copy()
-            top_communes["commune_label"] = top_communes["commune_name"] + " (" + top_communes["sector_count"].astype(str) + " sec.)"
+            ranked_communes = commune_df.sort_values("note_gc", ascending=False).copy()
             chart = (
-                alt.Chart(top_communes)
+                alt.Chart(ranked_communes)
                 .mark_bar()
                 .encode(
                     x=alt.X("note_gc:Q", title="Note GC /100"),
-                    y=alt.Y("commune_label:N", sort="-x", title="Commune"),
+                    y=alt.Y("commune_label:N", sort=alt.SortField(field="note_gc", order="descending"), title="Commune"),
                     color=alt.Color(
                         "commune_risk_level:N",
                         scale=alt.Scale(
                             domain=["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"],
                             range=[RISK_COLOR["FAIBLE"], RISK_COLOR["MODERE"], RISK_COLOR["ELEVE"], RISK_COLOR["CRITIQUE"]],
                         ),
-                        legend=alt.Legend(title="Risque"),
+                        legend=alt.Legend(title="Risque global"),
                     ),
                     tooltip=[
-                        "commune_name",
+                        "commune_label",
                         "note_gc",
-                        "sector_count",
-                        "avg_sector_score",
-                        "critical",
-                        "high",
-                        "avg_rain_period_mm",
+                        "weather_component_note",
+                        "geotech_component_note",
+                        "piezo_component_note",
+                        "hydro_component_note",
+                        "lgv_points_count",
                     ],
                 )
             )
             st.altair_chart(chart, use_container_width=True)
 
     with right:
-        st.subheader("Distribution des secteurs")
-        if filtered_sectors.empty:
-            st.info("Pas de secteur filtre.")
+        st.subheader("Distribution du risque communal")
+        if commune_df.empty:
+            st.info("Pas de commune filtree.")
         else:
             dist = (
-                filtered_sectors["risk_level"]
+                commune_df["commune_risk_level"]
                 .value_counts()
                 .rename_axis("risk_level")
                 .reset_index(name="count")
@@ -663,6 +755,57 @@ with tabs[0]:
             st.metric(f"Max {period_label}", f"{max_rain:.1f} mm")
             st.metric(f"Moyenne {period_label}", f"{mean_rain:.1f} mm")
 
+    st.subheader("Composantes de risque par commune + note GC globale")
+    if commune_df.empty:
+        st.info("Pas de donnees composantes a afficher.")
+    else:
+        component_map = {
+            "weather_component_note": "Risque pluie",
+            "geotech_component_note": "Risque geotechnique",
+            "piezo_component_note": "Risque nappes (piezo)",
+            "hydro_component_note": "Risque hydro",
+            "note_gc": "Note GC globale",
+        }
+        comp_cols = ["commune_label"] + list(component_map.keys())
+        comp_long = (
+            commune_df[comp_cols]
+            .melt(
+                id_vars=["commune_label"],
+                value_vars=list(component_map.keys()),
+                var_name="component_key",
+                value_name="component_note",
+            )
+            .assign(component_label=lambda d: d["component_key"].map(component_map))
+        )
+        comp_long = comp_long.merge(commune_df[["commune_label", "note_gc"]], on="commune_label", how="left")
+        component_order = [
+            "Risque pluie",
+            "Risque geotechnique",
+            "Risque nappes (piezo)",
+            "Risque hydro",
+            "Note GC globale",
+        ]
+        heatmap = (
+            alt.Chart(comp_long)
+            .mark_rect()
+            .encode(
+                x=alt.X("component_label:N", sort=component_order, title="Composante"),
+                y=alt.Y("commune_label:N", sort=alt.SortField(field="note_gc", order="descending"), title="Commune"),
+                color=alt.Color(
+                    "component_note:Q",
+                    title="Note /100",
+                    scale=alt.Scale(scheme="redyellowgreen", reverse=True),
+                ),
+                tooltip=[
+                    "commune_label",
+                    "component_label",
+                    alt.Tooltip("component_note:Q", title="Note composante", format=".1f"),
+                    alt.Tooltip("note_gc:Q", title="Note GC globale", format=".1f"),
+                ],
+            )
+        )
+        st.altair_chart(heatmap, use_container_width=True)
+
     st.subheader("Top stations meteo")
     if filtered_weather.empty or rain_col_weather not in filtered_weather.columns:
         st.info("Pas de station meteo pour ce filtre.")
@@ -689,9 +832,9 @@ with tabs[0]:
         )
         st.altair_chart(chart_st, use_container_width=True)
 
-    st.subheader("Comparaison pluvio entre secteurs (5 dernieres annees)")
+    st.subheader("Comparaison pluvio entre communes (5 dernieres annees)")
     if compare_history_df.empty:
-        st.info("Selectionne des secteurs avec historique disponible pour comparer les pluies mensuelles.")
+        st.info("Selectionne des communes avec historique disponible pour comparer les pluies mensuelles.")
     else:
         hist_line = (
             alt.Chart(compare_history_df)
@@ -699,14 +842,14 @@ with tabs[0]:
             .encode(
                 x=alt.X("ym:N", sort=None, title="Mois"),
                 y=alt.Y("monthly_precip_mm:Q", title="Pluie mensuelle (mm)"),
-                color=alt.Color("sector_label:N", title="Secteur"),
-                tooltip=["ym", "sector_label", "monthly_precip_mm"],
+                color=alt.Color("commune_label:N", title="Commune"),
+                tooltip=["ym", "commune_label", "monthly_precip_mm"],
             )
         )
         st.altair_chart(hist_line, use_container_width=True)
 
         month_compare = (
-            compare_history_df.groupby(["sector_label", "month"], as_index=False)["monthly_precip_mm"]
+            compare_history_df.groupby(["commune_label", "month"], as_index=False)["monthly_precip_mm"]
             .mean()
             .rename(columns={"monthly_precip_mm": "mean_monthly_mm"})
         )
@@ -732,26 +875,25 @@ with tabs[0]:
             .encode(
                 x=alt.X("month_label:N", sort=month_order, title="Mois"),
                 y=alt.Y("mean_monthly_mm:Q", title="Moyenne mensuelle (mm)"),
-                color=alt.Color("sector_label:N", title="Secteur"),
-                xOffset=alt.XOffset("sector_label:N"),
-                tooltip=["sector_label", "month_label", "mean_monthly_mm"],
+                color=alt.Color("commune_label:N", title="Commune"),
+                xOffset=alt.XOffset("commune_label:N"),
+                tooltip=["commune_label", "month_label", "mean_monthly_mm"],
             )
         )
         st.altair_chart(climat_cmp, use_container_width=True)
         st.caption("Modele historique: " + ", ".join([f"{k}:{v}" for k, v in history_models.items() if v]))
 
         latest_rows: List[Dict[str, object]] = []
-        if selected_compare_sector_ids:
-            for sid in selected_compare_sector_ids:
-                hit = sector_pool[sector_pool["sector_id"].astype(str) == str(sid)]
+        if selected_compare_commune_labels:
+            for label in selected_compare_commune_labels:
+                hit = commune_pool[commune_pool["commune_label"].astype(str) == str(label)]
                 if hit.empty:
                     continue
-                sec = hit.iloc[0].to_dict()
-                nwx = _nearest_row(weather_df, float(sec["latitude"]), float(sec["longitude"]))
+                com = hit.iloc[0].to_dict()
+                nwx = _nearest_row(weather_df, float(com["latitude"]), float(com["longitude"]))
                 latest_rows.append(
                     {
-                        "sector_id": sid,
-                        "commune_secteur": sec.get("commune_name"),
+                        "commune": label,
                         "station_meteo": nwx.get("station_id"),
                         "commune_station": nwx.get("station_commune_name"),
                         "dist_station_km": nwx.get("_dist_km"),
@@ -762,30 +904,26 @@ with tabs[0]:
                     }
                 )
         if latest_rows:
-            st.markdown("**Dernieres mesures meteo par secteur compare**")
+            st.markdown("**Dernieres mesures meteo par commune comparee**")
             st.dataframe(pd.DataFrame(latest_rows), use_container_width=True, hide_index=True)
 
-    st.subheader("Analyse detaillee secteur")
-    if not selected_sector:
-        st.info("Aucun secteur disponible pour l'analyse detaillee.")
+    st.subheader("Analyse detaillee commune")
+    if not selected_commune:
+        st.info("Aucune commune disponible pour l'analyse detaillee.")
     else:
-        sec_commune = str(selected_sector.get("commune_name") or "Inconnue")
-        commune_note = None
-        if not commune_df.empty:
-            match = commune_df[commune_df["commune_name"].astype(str) == sec_commune]
-            if not match.empty:
-                commune_note = float(match.iloc[0].get("note_gc", 0.0))
+        commune_name = str(selected_commune.get("commune_name") or "Inconnue")
+        commune_code = str(selected_commune.get("commune_code") or "N/A")
 
         s1, s2, s3, s4, s5 = st.columns(5)
-        s1.metric("Secteur", str(selected_sector.get("sector_id")))
-        s2.metric("Commune", sec_commune)
-        s3.metric("Risque secteur", str(selected_sector.get("risk_level")))
-        s4.metric("Score secteur", str(selected_sector.get("score")))
-        s5.metric("Note GC commune", f"{commune_note:.1f}/100" if commune_note is not None else "N/A")
+        s1.metric("Commune", commune_name)
+        s2.metric("Code INSEE", commune_code)
+        s3.metric("Risque commune", str(selected_commune.get("commune_risk_level", "INDETERMINE")))
+        s4.metric("Note GC globale", f"{float(selected_commune.get('note_gc', 0.0)):.1f}/100")
+        s5.metric("Points LGV", int(float(selected_commune.get("lgv_points_count", 0) or 0)))
 
-        nearest_weather = _nearest_row(weather_df, float(selected_sector["latitude"]), float(selected_sector["longitude"]))
-        nearest_hydro = _nearest_row(hydro_df, float(selected_sector["latitude"]), float(selected_sector["longitude"]))
-        nearest_piezo = _nearest_row(piezo_df, float(selected_sector["latitude"]), float(selected_sector["longitude"]))
+        nearest_weather = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
+        nearest_hydro = _nearest_row(hydro_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
+        nearest_piezo = _nearest_row(piezo_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
 
         cwx, chx, cpx = st.columns(3)
         with cwx:
@@ -836,7 +974,7 @@ with tabs[0]:
             else:
                 st.info("Pas de piezometre proche.")
 
-        st.markdown("**Historique meteo mensuel multi-annees (secteur)**")
+        st.markdown("**Historique meteo mensuel multi-annees (commune)**")
         if history_payload.get("error"):
             st.warning(f"Historique indisponible: {history_payload.get('error')}")
         elif history_monthly_df.empty:
@@ -869,21 +1007,20 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Carte multi-couches")
-    if filtered_sectors.empty and filtered_weather.empty:
+    if commune_df.empty and filtered_weather.empty:
         st.info("Pas de donnees cartographiques avec ces filtres.")
     else:
         m = _build_map(
             snapshot=snapshot,
             weather_df=filtered_weather,
-            sectors_df=filtered_sectors,
+            commune_df=commune_df,
             hydro_df=hydro_df,
             piezo_df=piezo_df,
             geotech_df=geotech_df,
             rain_col_weather=rain_col_weather,
-            sector_rain_col=sector_rain_col,
             min_risk=min_risk,
             show_weather=show_weather,
-            show_sectors=show_sectors,
+            show_communes=show_communes,
             show_hydro=show_hydro,
             show_piezo=show_piezo,
             show_geotech=show_geotech,
@@ -901,11 +1038,15 @@ with tabs[2]:
                     "commune_name",
                     "commune_code",
                     "departement_code",
-                    "sector_count",
+                    "lgv_points_count",
                     "note_gc",
                     "commune_risk_level",
-                    "avg_sector_score",
-                    "max_sector_score",
+                    "weather_component_note",
+                    "geotech_component_note",
+                    "piezo_component_note",
+                    "hydro_component_note",
+                    "avg_point_score",
+                    "max_point_score",
                     "critical",
                     "high",
                     "moderate",
@@ -917,16 +1058,16 @@ with tabs[2]:
             hide_index=True,
         )
 
-    st.subheader("Secteurs filtres")
+    st.subheader("Points LGV filtres (detail)")
     if filtered_sectors.empty:
-        st.info("Aucun secteur filtre.")
+        st.info("Aucun point LGV filtre.")
     else:
         view_cols = [
             "sector_id",
             "commune_name",
             "risk_level",
             "score",
-            sector_rain_col,
+            commune_rain_col,
             "geotech_points",
             "piezometers",
             "hydro_stations",
@@ -973,8 +1114,8 @@ with tabs[3]:
         """
         Cette application est construite pour le suivi d'une ligne de **300 km**:
         - **Niveau 1 (mesure actuelle)**: dernier etat meteo/hydro/nappes/geotech.
-        - **Niveau 2 (pilotage secteur)**: scoring par secteurs le long de la LGV.
-        - **Niveau 3 (vision historique)**: comparaison mensuelle multi-annees entre secteurs.
+        - **Niveau 2 (pilotage communal)**: agregation des points LGV par commune traversee.
+        - **Niveau 3 (vision historique)**: comparaison mensuelle multi-annees entre communes.
         - **Niveau 4 (decision territoriale)**: note GC par commune traversee.
         """
     )
@@ -993,13 +1134,14 @@ with tabs[3]:
     st.subheader("Score GC et notes")
     st.markdown(
         """
-        - **Score secteur (0-4)**:
-          - composantes pluie / geotech / nappes / hydro
-          - score final = moyenne des composantes
-          - classes: faible, modere, eleve, critique.
+        - **Composantes de risque separees par commune**:
+          - `Risque pluie`: derive du cumul pluie moyen de la periode filtree.
+          - `Risque geotechnique`: derive de la densite de points geotechniques proches.
+          - `Risque nappes (piezo)`: derive de la densite de piezometres proches.
+          - `Risque hydro`: derive de la densite de stations hydro proches.
         - **Note GC commune (0-100)**:
-          - base = `(score secteur moyen / 4) * 68`
-          - + majoration secteurs critiques/eleves
+          - base = `(score moyen points LGV / 4) * 68`
+          - + majoration points LGV critiques/eleves
           - + signal pluie moyen sur la periode
           - borne entre 0 et 100.
         - Seuils de lecture de la note GC:
@@ -1010,12 +1152,13 @@ with tabs[3]:
         """
     )
 
-    st.subheader("Données ajoutees et comparables")
+    st.subheader("Donnees ajoutees et comparables")
     st.markdown(
         """
-        - Comparaison **inter-secteurs** des pluies mensuelles sur 5 ans.
+        - Comparaison **inter-communes** des pluies mensuelles sur 5 ans.
         - Filtre de date mensuel (debut/fin) pour isoler des saisons ou annees hydrologiques.
-        - Tableau des **dernieres mesures meteo proches** par secteur compare.
+        - Tableau des **dernieres mesures meteo proches** par commune comparee.
+        - Affichage des composantes de risque **separees** puis de la **note GC globale**.
         """
     )
 
