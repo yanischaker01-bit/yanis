@@ -112,6 +112,8 @@ class LGVSeaMonitor:
         self.soil_cache_file = os.path.join("data", "soil_risk_cache.json")
         self.piezometer_cache_file = os.path.join("data", "piezometer_cache.json")
         self.hydro_network_cache_file = os.path.join("data", "hydro_network_cache.json")
+        self.commune_cache_file = os.path.join("data", "commune_cache.json")
+        self.commune_cache = self._load_commune_cache()
 
     def _now_utc(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -585,6 +587,65 @@ class LGVSeaMonitor:
 
     def _save_station_cache(self) -> None:
         self._save_json(self.station_cache, self.station_cache_file)
+
+    def _load_commune_cache(self) -> Dict[str, Dict[str, object]]:
+        if not os.path.exists(self.commune_cache_file):
+            return {}
+        try:
+            with open(self.commune_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_commune_cache(self) -> None:
+        self._save_json(self.commune_cache, self.commune_cache_file)
+
+    @staticmethod
+    def _commune_cache_key(lat: float, lon: float) -> str:
+        return f"{round(float(lat), 4)},{round(float(lon), 4)}"
+
+    def _resolve_commune_for_point(self, lat: float, lon: float) -> Dict[str, object]:
+        key = self._commune_cache_key(lat, lon)
+        cached = self.commune_cache.get(key)
+        if isinstance(cached, dict) and cached.get("commune_name"):
+            return cached
+
+        info: Dict[str, object] = {
+            "commune_name": "Inconnue",
+            "commune_code": None,
+            "departement_code": None,
+            "departement_name": None,
+        }
+        try:
+            response = self.session.get(
+                "https://geo.api.gouv.fr/communes",
+                params={
+                    "lat": f"{lat:.6f}",
+                    "lon": f"{lon:.6f}",
+                    "fields": "nom,code,departement",
+                    "format": "json",
+                    "geometry": "centre",
+                },
+                timeout=15,
+            )
+            if response.status_code == 200 and response.text.strip():
+                payload = response.json()
+                if isinstance(payload, list) and payload:
+                    first = payload[0] if isinstance(payload[0], dict) else {}
+                    dep = first.get("departement") if isinstance(first.get("departement"), dict) else {}
+                    info = {
+                        "commune_name": first.get("nom") or "Inconnue",
+                        "commune_code": first.get("code"),
+                        "departement_code": dep.get("code"),
+                        "departement_name": dep.get("nom"),
+                    }
+        except Exception:
+            pass
+
+        self.commune_cache[key] = info
+        self._save_commune_cache()
+        return info
 
     @staticmethod
     def _downsample_coords(coords: List[Tuple[float, float]], max_points: int = 3500) -> List[Tuple[float, float]]:
@@ -1386,10 +1447,11 @@ class LGVSeaMonitor:
                 max24 = max(float(r.get("rain_24h_mm", 0.0) or 0.0) for r in near_weather)
                 max7 = max(float(r.get("rain_7d_mm", r.get("rain_24h_mm", 0.0)) or 0.0) for r in near_weather)
                 max30 = max(float(r.get("rain_30d_mm", r.get("rain_24h_mm", 0.0)) or 0.0) for r in near_weather)
+                maxmonth = max(float(r.get("rain_month_mm", r.get("rain_30d_mm", r.get("rain_24h_mm", 0.0))) or 0.0) for r in near_weather)
                 rain_class = self._station_pluvio_class(max24, max7, max30)
                 weather_score = rain_score_map.get(rain_class, 1)
             else:
-                max24 = max7 = max30 = 0.0
+                max24 = max7 = max30 = maxmonth = 0.0
                 rain_class = "INDETERMINE"
                 weather_score = 1
 
@@ -1413,11 +1475,16 @@ class LGVSeaMonitor:
                 risk_level = "FAIBLE"
                 color = "#16a34a"
 
+            commune_info = self._resolve_commune_for_point(lat, lon)
             sector = {
                 "sector_id": f"S{idx:02d}",
                 "latitude": round(float(lat), 6),
                 "longitude": round(float(lon), 6),
                 "radius_km": self.sector_radius_km,
+                "commune_name": commune_info.get("commune_name"),
+                "commune_code": commune_info.get("commune_code"),
+                "departement_code": commune_info.get("departement_code"),
+                "departement_name": commune_info.get("departement_name"),
                 "risk_level": risk_level,
                 "risk_color": color,
                 "score": round(avg_score, 2),
@@ -1425,6 +1492,7 @@ class LGVSeaMonitor:
                 "weather_max_24h_mm": round(max24, 1),
                 "weather_max_7d_mm": round(max7, 1),
                 "weather_max_30d_mm": round(max30, 1),
+                "weather_max_month_mm": round(maxmonth, 1),
                 "geotech_points": int(len(near_geo)),
                 "piezometers": int(len(near_piezo)),
                 "hydro_stations": int(len(near_hydro)),
@@ -1450,11 +1518,79 @@ class LGVSeaMonitor:
             "moderate": int(sum(1 for s in sectors if s["risk_level"] == "MODERE")),
             "watch": int(sum(1 for s in sectors if s["under_watch"])),
         }
+
+        risk_rank = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
+        by_commune: Dict[str, Dict[str, object]] = {}
+        for sec in sectors:
+            name = str(sec.get("commune_name") or "Inconnue")
+            code = sec.get("commune_code")
+            dep_code = sec.get("departement_code")
+            dep_name = sec.get("departement_name")
+            if name not in by_commune:
+                by_commune[name] = {
+                    "commune_name": name,
+                    "commune_code": code,
+                    "departement_code": dep_code,
+                    "departement_name": dep_name,
+                    "sector_count": 0,
+                    "sum_score": 0.0,
+                    "max_score": 0.0,
+                    "critical": 0,
+                    "high": 0,
+                    "moderate": 0,
+                    "watch": 0,
+                    "avg_risk_rank": 0.0,
+                }
+            row = by_commune[name]
+            row["sector_count"] = int(row["sector_count"]) + 1
+            row["sum_score"] = float(row["sum_score"]) + float(sec.get("score", 0.0) or 0.0)
+            row["max_score"] = max(float(row["max_score"]), float(sec.get("score", 0.0) or 0.0))
+            row["critical"] = int(row["critical"]) + (1 if sec.get("risk_level") == "CRITIQUE" else 0)
+            row["high"] = int(row["high"]) + (1 if sec.get("risk_level") == "ELEVE" else 0)
+            row["moderate"] = int(row["moderate"]) + (1 if sec.get("risk_level") == "MODERE" else 0)
+            row["watch"] = int(row["watch"]) + (1 if sec.get("under_watch") else 0)
+            row["avg_risk_rank"] = float(row["avg_risk_rank"]) + float(risk_rank.get(str(sec.get("risk_level")), 1))
+
+        commune_rows: List[Dict[str, object]] = []
+        for _, row in by_commune.items():
+            n = max(int(row["sector_count"]), 1)
+            avg_score = float(row["sum_score"]) / n
+            avg_rank = float(row["avg_risk_rank"]) / n
+            note = min(100.0, max(0.0, (avg_score / 4.0) * 100.0 + 8.0 * int(row["critical"]) + 4.0 * int(row["high"])))
+            if note >= 80:
+                commune_level = "CRITIQUE"
+            elif note >= 60:
+                commune_level = "ELEVE"
+            elif note >= 40:
+                commune_level = "MODERE"
+            else:
+                commune_level = "FAIBLE"
+            commune_rows.append(
+                {
+                    "commune_name": row["commune_name"],
+                    "commune_code": row["commune_code"],
+                    "departement_code": row["departement_code"],
+                    "departement_name": row["departement_name"],
+                    "sector_count": n,
+                    "avg_sector_score": round(avg_score, 2),
+                    "max_sector_score": round(float(row["max_score"]), 2),
+                    "avg_risk_rank": round(avg_rank, 2),
+                    "critical": int(row["critical"]),
+                    "high": int(row["high"]),
+                    "moderate": int(row["moderate"]),
+                    "watch": int(row["watch"]),
+                    "commune_note": round(note, 1),
+                    "commune_risk_level": commune_level,
+                }
+            )
+
+        commune_rows.sort(key=lambda r: (-float(r.get("commune_note", 0.0)), -int(r.get("critical", 0)), str(r.get("commune_name", ""))))
         payload = {
             "timestamp_utc": self._now_utc().isoformat(),
             "sector_length_km": self.sector_length_km,
             "sector_radius_km": self.sector_radius_km,
             "summary": summary,
+            "commune_summary": commune_rows,
             "alerts": alerts[:12],
             "sectors": sectors,
         }
@@ -2282,6 +2418,65 @@ class LGVSeaMonitor:
             f.write(html_doc)
         return latest_path
 
+    def _save_streamlit_snapshot(
+        self,
+        weather_df: pd.DataFrame,
+        weather_notice: Optional[str],
+        rivers: Dict[str, Dict[str, object]],
+        geotech: Optional[Dict[str, object]],
+        piezometers: Optional[Dict[str, object]],
+        hydro_network: Optional[Dict[str, object]],
+        sectors: Optional[Dict[str, object]],
+        risks: Dict[str, object],
+        map_path: str,
+    ) -> str:
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        snapshot_path = os.path.join("reports", f"streamlit_snapshot_{ts}.json")
+        latest_path = os.path.join("reports", "streamlit_snapshot_latest.json")
+
+        weather_records: List[Dict[str, object]] = []
+        if isinstance(weather_df, pd.DataFrame) and not weather_df.empty:
+            weather_records = json.loads(weather_df.to_json(orient="records", date_format="iso"))
+
+        rivers_rows = []
+        for river_name, details in rivers.items():
+            row = {"river": river_name}
+            if isinstance(details, dict):
+                row.update(details)
+            rivers_rows.append(row)
+
+        lgv_lines = [
+            [{"lat": float(lat), "lon": float(lon)} for lat, lon in line]
+            for line in self.lgv_lines_latlon
+            if len(line) >= 2
+        ]
+
+        payload: Dict[str, object] = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "risk_level": risks.get("risk_level"),
+            "score": risks.get("score"),
+            "weather_notice": weather_notice,
+            "alerts": risks.get("alerts", []),
+            "recommendations": risks.get("recommendations", []),
+            "details": risks.get("details", {}),
+            "map_path": map_path,
+            "lgv_lines": lgv_lines,
+            "weather": weather_records,
+            "rivers": rivers_rows,
+            "geotech": geotech if isinstance(geotech, dict) else {},
+            "piezometers": piezometers if isinstance(piezometers, dict) else {},
+            "hydro_network": hydro_network if isinstance(hydro_network, dict) else {},
+            "sectors": sectors if isinstance(sectors, dict) else {},
+            "commune_ranking": (
+                sectors.get("commune_summary", [])
+                if isinstance(sectors, dict) and isinstance(sectors.get("commune_summary"), list)
+                else []
+            ),
+        }
+        self._save_json(payload, snapshot_path)
+        self._save_json(payload, latest_path)
+        return latest_path
+
     def run_cycle(self) -> None:
         logging.info("=" * 70)
         logging.info("Cycle LGV SEA monitoring")
@@ -2302,6 +2497,17 @@ class LGVSeaMonitor:
             sectors,
         )
         map_path = self.generate_map(weather_pack["selected"], rivers, risks, geotech, piezometers, hydro_network, sectors)
+        streamlit_snapshot_path = self._save_streamlit_snapshot(
+            weather_pack["selected"],
+            weather_pack.get("notice"),
+            rivers,
+            geotech,
+            piezometers,
+            hydro_network,
+            sectors,
+            risks,
+            map_path,
+        )
 
         cycle_output = {
             "timestamp_utc": self._now_utc().isoformat(),
@@ -2316,6 +2522,7 @@ class LGVSeaMonitor:
             "map_path": map_path,
             "risk_report_path": risks.get("report_path"),
             "weather_summary_path": weather_pack.get("summary_path"),
+            "streamlit_snapshot_path": streamlit_snapshot_path,
         }
         ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
         self._save_json(cycle_output, os.path.join("reports", f"cycle_summary_{ts}.json"))

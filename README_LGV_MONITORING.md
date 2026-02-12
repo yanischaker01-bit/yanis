@@ -30,6 +30,24 @@ python run_collection.py --interval-min 60 --max-distance-km 25
 streamlit run streamlit_app.py
 ```
 
+## 5) Lancer le nouveau rapport Streamlit Pro
+
+```powershell
+python run_streamlit_pro.py
+```
+
+ou
+
+```powershell
+streamlit run streamlit_lgv_pro.py
+```
+
+Fonctions:
+- filtres interactifs (periode pluvio, niveau de risque, source, communes)
+- carte dynamique multicouche (LGV, meteo, secteurs, hydro, piezometres, geotech)
+- classement professionnel par commune (note GC /100)
+- tableaux d'alertes et recommandations
+
 ## Fonctionnement
 
 - La collecte pluvio lit SYNOP Meteo-France et stocke les observations en SQLite.
@@ -42,4 +60,3 @@ streamlit run streamlit_app.py
 - Avec un filtre strict a 1 km, il peut n'y avoir aucune station SYNOP.
 - Tant que `station_code` est vide pour un cours d'eau, l'hydrometrie reste non disponible.
 - Les distances sont calculees avec une approximation plane (suffisant pour un MVP operationnel).
-
