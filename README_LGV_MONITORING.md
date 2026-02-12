@@ -61,6 +61,7 @@ Fonctions:
 
 Sur Streamlit Cloud, l'app lit en priorite le snapshot publie par GitHub Pages:
 `https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json`.
+Le fichier `runtime.txt` force Python `3.12` pour compatibilite Streamlit.
 
 ## Fonctionnement
 
