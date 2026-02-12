@@ -98,8 +98,9 @@ class LGVSeaMonitor:
         self.hubeau_base = "https://hubeau.eaufrance.fr/api/v2/hydrometrie"
         self.hubeau_endpoints = {"observations_tr": "/observations_tr", "stations": "/referentiel/stations"}
         self.open_meteo_base = "https://api.open-meteo.com/v1/forecast"
-        self.open_meteo_sample_step_km = 5.0
-        self.open_meteo_max_points = 80
+        self.open_meteo_model = "meteofrance_seamless"
+        self.open_meteo_sample_step_km = 3.0
+        self.open_meteo_max_points = 120
 
         os.makedirs("data", exist_ok=True)
         os.makedirs("reports", exist_ok=True)
@@ -891,8 +892,16 @@ class LGVSeaMonitor:
             "past_days": 35,
             "forecast_days": 1,
             "timezone": "UTC",
+            "models": self.open_meteo_model,
         }
         response = self.session.get(self.open_meteo_base, params=params, timeout=45)
+        used_model = self.open_meteo_model
+        if response.status_code != 200:
+            # Model can be unavailable for some coordinates/time windows: fallback to default Open-Meteo model.
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            response = self.session.get(self.open_meteo_base, params=fallback_params, timeout=45)
+            used_model = "open_meteo_default"
         if response.status_code != 200:
             raise RuntimeError(f"Open-Meteo HTTP {response.status_code}")
 
@@ -961,6 +970,7 @@ class LGVSeaMonitor:
                     "rain_class": rain_class,
                     "source": DataSource.OPEN_METEO.value,
                     "selection_mode": "open_meteo_grid",
+                    "meteo_model": used_model,
                 }
             )
         return rows
@@ -996,7 +1006,7 @@ class LGVSeaMonitor:
         return {
             "all": df.copy(),
             "selected": df.copy(),
-            "notice": f"Open-Meteo grille LGV: {len(df)} points.",
+            "notice": f"Open-Meteo grille LGV ({self.open_meteo_model}): {len(df)} points.",
             "source_url": self.open_meteo_base,
             "summary_path": csv_path,
         }

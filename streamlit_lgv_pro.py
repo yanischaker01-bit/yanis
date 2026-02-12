@@ -18,6 +18,8 @@ SNAPSHOT_GLOB = "streamlit_snapshot_*.json"
 REMOTE_SNAPSHOT_URLS = [
     "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json",
 ]
+OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_MODEL = "meteofrance_seamless"
 
 RISK_ORDER = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
 RISK_COLOR = {
@@ -100,6 +102,105 @@ def _safe_df(records: object) -> pd.DataFrame:
         except Exception:
             return pd.DataFrame()
     return pd.DataFrame()
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    import math
+
+    r = 6371.0
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+    return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _nearest_row(df: pd.DataFrame, lat: float, lon: float) -> Dict[str, object]:
+    if df.empty or "latitude" not in df.columns or "longitude" not in df.columns:
+        return {}
+    work = df.copy()
+    work["latitude"] = pd.to_numeric(work["latitude"], errors="coerce")
+    work["longitude"] = pd.to_numeric(work["longitude"], errors="coerce")
+    work = work.dropna(subset=["latitude", "longitude"])
+    if work.empty:
+        return {}
+    work["_dist_km"] = work.apply(lambda r: _haversine_km(lat, lon, float(r["latitude"]), float(r["longitude"])), axis=1)
+    row = work.sort_values("_dist_km").iloc[0].to_dict()
+    row["_dist_km"] = round(float(row.get("_dist_km", 0.0)), 3)
+    return row
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
+def _load_sector_monthly_history(lat: float, lon: float, years_back: int) -> Dict[str, object]:
+    now_utc = datetime.now(timezone.utc)
+    start_year = max(2010, now_utc.year - max(int(years_back), 1) + 1)
+    start_date = f"{start_year}-01-01"
+    end_date = now_utc.strftime("%Y-%m-%d")
+    params = {
+        "latitude": f"{lat:.6f}",
+        "longitude": f"{lon:.6f}",
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "precipitation_sum",
+        "timezone": "UTC",
+        "models": OPEN_METEO_MODEL,
+    }
+
+    used_model = OPEN_METEO_MODEL
+    try:
+        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        if response.status_code != 200:
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            response = requests.get(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30)
+            used_model = "open_meteo_default"
+        if response.status_code != 200 or not response.text.strip():
+            return {"monthly": [], "climatology": [], "model": used_model, "error": f"HTTP {response.status_code}"}
+
+        payload = response.json()
+        entry = payload[0] if isinstance(payload, list) and payload else payload
+        if not isinstance(entry, dict):
+            return {"monthly": [], "climatology": [], "model": used_model, "error": "payload invalide"}
+        daily = entry.get("daily", {}) if isinstance(entry.get("daily"), dict) else {}
+        times = daily.get("time", []) or []
+        vals = daily.get("precipitation_sum", []) or []
+        if not times or not vals:
+            return {"monthly": [], "climatology": [], "model": used_model, "error": "serie vide"}
+
+        df = pd.DataFrame({"date": pd.to_datetime(times, utc=True, errors="coerce"), "precip_mm": pd.to_numeric(vals, errors="coerce")})
+        df = df.dropna(subset=["date", "precip_mm"])
+        if df.empty:
+            return {"monthly": [], "climatology": [], "model": used_model, "error": "serie vide"}
+
+        monthly = (
+            df.assign(
+                year=lambda d: d["date"].dt.year,
+                month=lambda d: d["date"].dt.month,
+                ym=lambda d: d["date"].dt.to_period("M").astype(str),
+            )
+            .groupby(["ym", "year", "month"], as_index=False)["precip_mm"]
+            .sum()
+            .rename(columns={"precip_mm": "monthly_precip_mm"})
+        )
+        monthly["monthly_precip_mm"] = monthly["monthly_precip_mm"].round(1)
+
+        clim = monthly.groupby("month", as_index=False)["monthly_precip_mm"].mean().rename(columns={"monthly_precip_mm": "climatology_mm"})
+        clim["climatology_mm"] = clim["climatology_mm"].round(1)
+        month_names = {
+            1: "Jan", 2: "Fev", 3: "Mar", 4: "Avr", 5: "Mai", 6: "Juin",
+            7: "Juil", 8: "Aou", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
+        }
+        clim["month_label"] = clim["month"].map(month_names)
+
+        return {
+            "monthly": monthly.sort_values("ym").to_dict(orient="records"),
+            "climatology": clim.sort_values("month").to_dict(orient="records"),
+            "model": used_model,
+            "error": None,
+        }
+    except Exception as exc:
+        return {"monthly": [], "climatology": [], "model": used_model, "error": str(exc)}
 
 
 def _aggregate_communes(sectors_df: pd.DataFrame, sector_rain_col: str) -> pd.DataFrame:
@@ -382,6 +483,23 @@ if not filtered_sectors.empty:
     filtered_sectors = filtered_sectors[filtered_sectors["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
 commune_df = _aggregate_communes(filtered_sectors, sector_rain_col)
+sector_pool = filtered_sectors if not filtered_sectors.empty else sectors_df
+selected_sector: Dict[str, object] = {}
+history_years = 5
+if not sector_pool.empty:
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Analyse secteur")
+        sector_ids = sector_pool["sector_id"].astype(str).tolist()
+        chosen_sector_id = st.selectbox("Secteur detail", sector_ids, index=0)
+        history_years = st.slider("Historique mensuel (ans)", min_value=2, max_value=10, value=5, step=1)
+    selected_sector = sector_pool[sector_pool["sector_id"].astype(str) == chosen_sector_id].iloc[0].to_dict()
+
+history_payload = {"monthly": [], "climatology": [], "model": "", "error": "pas de secteur"}
+if selected_sector:
+    history_payload = _load_sector_monthly_history(float(selected_sector["latitude"]), float(selected_sector["longitude"]), int(history_years))
+history_monthly_df = _safe_df(history_payload.get("monthly"))
+history_clim_df = _safe_df(history_payload.get("climatology"))
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
 score = float(snapshot.get("score", 0.0) or 0.0)
 
@@ -392,7 +510,7 @@ col3.metric("Stations meteo", int(len(filtered_weather)))
 col4.metric("Secteurs filtres", int(len(filtered_sectors)))
 col5.metric("Communes suivies", int(len(commune_df)))
 
-tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes"])
+tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes", "Metadata"])
 
 with tabs[0]:
     left, right = st.columns([1.5, 1.0])
@@ -493,6 +611,107 @@ with tabs[0]:
         )
         st.altair_chart(chart_st, use_container_width=True)
 
+    st.subheader("Analyse detaillee secteur")
+    if not selected_sector:
+        st.info("Aucun secteur disponible pour l'analyse detaillee.")
+    else:
+        sec_commune = str(selected_sector.get("commune_name") or "Inconnue")
+        commune_note = None
+        if not commune_df.empty:
+            match = commune_df[commune_df["commune_name"].astype(str) == sec_commune]
+            if not match.empty:
+                commune_note = float(match.iloc[0].get("note_gc", 0.0))
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Secteur", str(selected_sector.get("sector_id")))
+        s2.metric("Commune", sec_commune)
+        s3.metric("Risque secteur", str(selected_sector.get("risk_level")))
+        s4.metric("Score secteur", str(selected_sector.get("score")))
+        s5.metric("Note GC commune", f"{commune_note:.1f}/100" if commune_note is not None else "N/A")
+
+        nearest_weather = _nearest_row(weather_df, float(selected_sector["latitude"]), float(selected_sector["longitude"]))
+        nearest_hydro = _nearest_row(hydro_df, float(selected_sector["latitude"]), float(selected_sector["longitude"]))
+        nearest_piezo = _nearest_row(piezo_df, float(selected_sector["latitude"]), float(selected_sector["longitude"]))
+
+        cwx, chx, cpx = st.columns(3)
+        with cwx:
+            st.markdown("**Derniere mesure meteo proche**")
+            if nearest_weather:
+                st.write(
+                    {
+                        "station_id": nearest_weather.get("station_id"),
+                        "source": nearest_weather.get("source"),
+                        "distance_km": nearest_weather.get("_dist_km"),
+                        "rain_24h_mm": nearest_weather.get("rain_24h_mm"),
+                        "rain_7d_mm": nearest_weather.get("rain_7d_mm"),
+                        "rain_30d_mm": nearest_weather.get("rain_30d_mm"),
+                        "date_obs_raw": nearest_weather.get("date_obs_raw"),
+                    }
+                )
+            else:
+                st.info("Pas de mesure meteo proche.")
+        with chx:
+            st.markdown("**Derniere mesure hydro proche**")
+            if nearest_hydro:
+                st.write(
+                    {
+                        "station_code": nearest_hydro.get("station_code"),
+                        "river_name": nearest_hydro.get("river_name"),
+                        "distance_km": nearest_hydro.get("_dist_km"),
+                        "last_level_m": nearest_hydro.get("last_level_m"),
+                        "trend_mph": nearest_hydro.get("trend_mph"),
+                        "last_obs_utc": nearest_hydro.get("last_obs_utc"),
+                    }
+                )
+            else:
+                st.info("Pas de mesure hydro proche.")
+        with cpx:
+            st.markdown("**Derniere mesure piezometre proche**")
+            if nearest_piezo:
+                st.write(
+                    {
+                        "code_bss": nearest_piezo.get("code_bss"),
+                        "name": nearest_piezo.get("name"),
+                        "distance_km": nearest_piezo.get("_dist_km"),
+                        "depth_m": nearest_piezo.get("depth_m"),
+                        "trend_depth_mpd": nearest_piezo.get("trend_depth_mpd"),
+                        "last_date_utc": nearest_piezo.get("last_date_utc"),
+                    }
+                )
+            else:
+                st.info("Pas de piezometre proche.")
+
+        st.markdown("**Historique meteo mensuel multi-annees (secteur)**")
+        if history_payload.get("error"):
+            st.warning(f"Historique indisponible: {history_payload.get('error')}")
+        elif history_monthly_df.empty:
+            st.info("Pas d'historique mensuel disponible.")
+        else:
+            hist_chart = (
+                alt.Chart(history_monthly_df)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("ym:N", sort=None, title="Mois"),
+                    y=alt.Y("monthly_precip_mm:Q", title="Pluie mensuelle (mm)"),
+                    color=alt.Color("year:N", title="Annee"),
+                    tooltip=["ym", "year", "monthly_precip_mm"],
+                )
+            )
+            st.altair_chart(hist_chart, use_container_width=True)
+
+            if not history_clim_df.empty:
+                clim_chart = (
+                    alt.Chart(history_clim_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("month_label:N", title="Mois"),
+                        y=alt.Y("climatology_mm:Q", title="Moyenne historique (mm/mois)"),
+                        tooltip=["month_label", "climatology_mm"],
+                    )
+                )
+                st.altair_chart(clim_chart, use_container_width=True)
+            st.caption(f"Source historique: Open-Meteo archive ({history_payload.get('model')})")
+
 with tabs[1]:
     st.subheader("Carte multi-couches")
     if filtered_sectors.empty and filtered_weather.empty:
@@ -574,6 +793,53 @@ with tabs[2]:
             st.write(f"- {rec}")
     else:
         st.info("Pas de recommandation disponible.")
+
+with tabs[3]:
+    st.subheader("Fonctionnement general")
+    st.markdown(
+        """
+        Cette application consolide plusieurs familles de donnees pour le suivi GC de la LGV SEA:
+        - **Meteo**: pluies 24h/7j/30j/mois sur des points proches de la ligne.
+        - **Hydrologie**: niveaux et tendances des stations de cours d'eau.
+        - **Nappes**: piezometres et dynamique de remontee.
+        - **Geotechnique**: exposition retrait-gonflement des argiles + mouvements de terrain.
+        - **Secteurs**: score compose sur des secteurs de surveillance le long de la ligne.
+        """
+    )
+
+    st.subheader("Logique des stations meteo")
+    st.markdown(
+        """
+        - Les points meteo sont associes au corridor LGV et portent la distance a la ligne.
+        - Priorite aux donnees disponibles; en cas d'indisponibilite d'une source, bascule sur la source de secours.
+        - Les cumuls utilises pour le suivi sont: **24h**, **7 jours**, **30 jours**, **mois courant**.
+        - L'historique mensuel multi-annees par secteur est calcule via Open-Meteo Archive.
+        """
+    )
+
+    st.subheader("Score GC et notes")
+    st.markdown(
+        """
+        - **Score secteur (0-4)**: combine pluie, geotechnique, nappes et hydro.
+        - **Note GC commune (0-100)**: derivee des secteurs de la commune
+          (score moyen, secteurs critiques/eleves, signal pluie).
+        - Seuils de lecture de la note GC:
+          - `< 40`: faible
+          - `40-59`: modere
+          - `60-79`: eleve
+          - `>= 80`: critique
+        """
+    )
+
+    st.subheader("Donnees et fraicheur")
+    st.write(
+        {
+            "snapshot_timestamp_utc": snapshot.get("timestamp_utc"),
+            "snapshot_source": snapshot_source,
+            "weather_notice": snapshot.get("weather_notice"),
+            "history_model": history_payload.get("model"),
+        }
+    )
 
 ts = snapshot.get("timestamp_utc")
 if ts:

@@ -47,6 +47,8 @@ Fonctions:
 - carte dynamique multicouche (LGV, meteo, secteurs, hydro, piezometres, geotech)
 - classement professionnel par commune (note GC /100)
 - tableaux d'alertes et recommandations
+- suivi historique meteo mensuel multi-annees par secteur
+- onglet Metadata (logique stations, scores GC, fonctionnement global)
 
 ## 6) Publier sur Streamlit Community Cloud (lien public)
 
