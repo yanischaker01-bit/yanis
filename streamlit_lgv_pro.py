@@ -406,7 +406,7 @@ with tabs[0]:
             top_communes["commune_label"] = top_communes["commune_name"] + " (" + top_communes["sector_count"].astype(str) + " sec.)"
             chart = (
                 alt.Chart(top_communes)
-                .mark_bar(cornerRadiusTopRight=4, cornerRadiusBottomRight=4)
+                .mark_bar()
                 .encode(
                     x=alt.X("note_gc:Q", title="Note GC /100"),
                     y=alt.Y("commune_label:N", sort="-x", title="Commune"),
