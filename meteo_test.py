@@ -648,6 +648,27 @@ class LGVSeaMonitor:
         self._save_commune_cache()
         return info
 
+    def _enrich_weather_with_communes(self, weather_df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(weather_df, pd.DataFrame) or weather_df.empty:
+            return weather_df
+        out = weather_df.copy()
+        out["station_commune_name"] = None
+        out["station_commune_code"] = None
+        out["station_departement_code"] = None
+        out["station_departement_name"] = None
+
+        for idx, row in out.iterrows():
+            lat = self._safe_float(row.get("latitude"))
+            lon = self._safe_float(row.get("longitude"))
+            if lat is None or lon is None:
+                continue
+            info = self._resolve_commune_for_point(float(lat), float(lon))
+            out.at[idx, "station_commune_name"] = info.get("commune_name")
+            out.at[idx, "station_commune_code"] = info.get("commune_code")
+            out.at[idx, "station_departement_code"] = info.get("departement_code")
+            out.at[idx, "station_departement_name"] = info.get("departement_name")
+        return out
+
     @staticmethod
     def _downsample_coords(coords: List[Tuple[float, float]], max_points: int = 3500) -> List[Tuple[float, float]]:
         if len(coords) <= max_points:
@@ -1946,6 +1967,7 @@ class LGVSeaMonitor:
                 popup = (
                     f"<b>Station:</b> {html.escape(str(row.get('station_id')))}<br>"
                     f"<b>Source:</b> {html.escape(source)}<br>"
+                    f"<b>Commune station:</b> {html.escape(str(row.get('station_commune_name', 'n/a')))}<br>"
                     f"<b>Classe pluvio:</b> {html.escape(rain_class)}<br>"
                     f"<b>Cumul 24h:</b> {rain24:.1f} mm<br>"
                     f"<b>Cumul 7j:</b> {rain7:.1f} mm<br>"
@@ -2492,6 +2514,7 @@ class LGVSeaMonitor:
         logging.info("Cycle LGV SEA monitoring")
 
         weather_pack = self.fetch_pluviometry_combined()
+        weather_pack["selected"] = self._enrich_weather_with_communes(weather_pack.get("selected", pd.DataFrame()))
         rivers = self.fetch_all_river_levels()
         geotech = self.fetch_geotechnical_context()
         piezometers = self.fetch_piezometers_near_lgv()

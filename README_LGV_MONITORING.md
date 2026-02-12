@@ -49,6 +49,8 @@ Fonctions:
 - tableaux d'alertes et recommandations
 - suivi historique meteo mensuel multi-annees par secteur
 - onglet Metadata (logique stations, scores GC, fonctionnement global)
+- comparaison pluvio inter-secteurs avec filtre date mensuel (5 ans)
+- rattachement des stations meteo a leur commune
 
 ## 6) Publier sur Streamlit Community Cloud (lien public)
 
