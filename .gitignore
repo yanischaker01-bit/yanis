@@ -1,0 +1,15 @@
+﻿.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.vscode/
+cache_images/
+data/
+data_s1_grd/
+data_s1_slc/
+export_geom/
+output_ndwi/
+reports/
+sentinel1_downloads/
+shp_folder/

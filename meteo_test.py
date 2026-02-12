@@ -1,0 +1,1284 @@
+import csv
+import html
+import json
+import logging
+import math
+import os
+import time
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from io import StringIO
+from typing import Dict, List, Optional, Tuple
+import xml.etree.ElementTree as ET
+
+import pandas as pd
+import requests
+import schedule
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("lgv_monitoring.log"), logging.StreamHandler()],
+)
+
+
+class DataSource(Enum):
+    SYNOP_METEOFRANCE = "synop_meteofrance"
+    OPEN_METEO = "open_meteo"
+    HUBEAU_HYDRO = "hubeau_hydrometrie"
+    VIGICRUES_HYDRO = "vigicrues_hubeau"
+
+
+@dataclass
+class RiverMonitoringPoint:
+    river: str
+    name: str
+    latitude: float
+    longitude: float
+    station_code: Optional[str] = None
+    threshold_m: Optional[float] = None
+    rapid_rise_mph: float = 0.10
+
+
+class LGVSeaMonitor:
+    def __init__(self):
+        self.default_lgv_coordinates_latlon = [
+            (44.8378, -0.5792),
+            (45.7167, 0.3667),
+            (46.3167, 0.4667),
+            (47.3833, 0.6833),
+        ]
+        self.lgv_kmz_path = r"C:\Users\YCHAKER\Downloads\kmz\LRS_AXES.kmz"
+        self.lgv_lines_latlon = self._load_lgv_lines_from_kmz(self.lgv_kmz_path)
+        if not self.lgv_lines_latlon:
+            self.lgv_lines_latlon = [self.default_lgv_coordinates_latlon]
+        self.weather_corridor_km = 1.0
+        self.alert_thresholds_mm = {
+            "catastrophique_24h": 120.0,
+            "extreme_24h": 80.0,
+            "forte_24h": 50.0,
+            "moderee_24h": 20.0,
+        }
+        # Zones a risque d'accumulation d'eau (a ajuster avec ton retour terrain).
+        self.accumulation_zones = [
+            {"name": "Zone Bordeaux Sud remblais", "latitude": 44.82, "longitude": -0.58, "radius_km": 3.0, "risk_type": "remblai"},
+            {"name": "Zone Angouleme deblais", "latitude": 45.66, "longitude": 0.13, "radius_km": 3.0, "risk_type": "deblai"},
+            {"name": "Zone Poitiers exutoires", "latitude": 46.58, "longitude": 0.34, "radius_km": 3.0, "risk_type": "mixte"},
+            {"name": "Zone Tours Sud remblais", "latitude": 47.33, "longitude": 0.71, "radius_km": 3.0, "risk_type": "remblai"},
+        ]
+
+        self.river_points: List[RiverMonitoringPoint] = [
+            RiverMonitoringPoint("Dordogne", "Dordogne - secteur OA LGV", 44.90, -0.25, None, 3.0, 0.15),
+            RiverMonitoringPoint("Charente", "Charente - secteur Champniers", 45.72, 0.20, None, 2.0, 0.12),
+            RiverMonitoringPoint("Vienne", "Vienne - secteur OA LGV", 46.82, 0.55, None, 2.5, 0.12),
+            RiverMonitoringPoint("Auxance", "Auxance - secteur OA LGV", 46.65, 0.30, None, 1.6, 0.10),
+            RiverMonitoringPoint("Manse", "Manse - secteur OA LGV", 47.15, 0.65, None, 1.4, 0.10),
+        ]
+
+        self.headers = {
+            "User-Agent": "LGV-SEA-Monitor/4.0 (+contact: internal)",
+            "Accept": "application/json",
+            "Accept-Language": "fr-FR,fr;q=0.9",
+        }
+        self.hubeau_base = "https://hubeau.eaufrance.fr/api/v2/hydrometrie"
+        self.hubeau_endpoints = {"observations_tr": "/observations_tr", "stations": "/referentiel/stations"}
+        self.open_meteo_base = "https://api.open-meteo.com/v1/forecast"
+        self.open_meteo_sample_step_km = 5.0
+        self.open_meteo_max_points = 80
+
+        os.makedirs("data", exist_ok=True)
+        os.makedirs("reports", exist_ok=True)
+
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+
+        self.station_cache_file = os.path.join("data", "river_station_cache.json")
+        self.station_cache = self._load_station_cache()
+
+    def _now_utc(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _safe_float(value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        txt = str(value).strip().replace(",", ".")
+        if not txt or txt.lower() in {"mq", "nan", "none", "///"}:
+            return None
+        try:
+            return float(txt)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        r = 6371.0
+        p1 = math.radians(lat1)
+        p2 = math.radians(lat2)
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+        return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    @staticmethod
+    def _point_to_segment_distance_km(p_lat: float, p_lon: float, a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+        mean_lat = math.radians((a_lat + b_lat + p_lat) / 3.0)
+
+        def to_xy(lat: float, lon: float) -> Tuple[float, float]:
+            return lon * 111.320 * math.cos(mean_lat), lat * 110.574
+
+        px, py = to_xy(p_lat, p_lon)
+        ax, ay = to_xy(a_lat, a_lon)
+        bx, by = to_xy(b_lat, b_lon)
+        abx, aby = bx - ax, by - ay
+        apx, apy = px - ax, py - ay
+        ab2 = abx * abx + aby * aby
+        if ab2 == 0:
+            return math.hypot(px - ax, py - ay)
+        t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+        cx, cy = ax + t * abx, ay + t * aby
+        return math.hypot(px - cx, py - cy)
+
+    def _point_to_lgv_distance_km(self, lat: float, lon: float) -> float:
+        best = float("inf")
+        for pts in self.lgv_lines_latlon:
+            for i in range(len(pts) - 1):
+                a_lat, a_lon = pts[i]
+                b_lat, b_lon = pts[i + 1]
+                best = min(best, self._point_to_segment_distance_km(lat, lon, a_lat, a_lon, b_lat, b_lon))
+        return best
+
+    def _sample_points_along_lgv(self, step_km: float, max_points: int) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for line in self.lgv_lines_latlon:
+            if len(line) < 2:
+                continue
+            for idx in range(len(line) - 1):
+                a_lat, a_lon = line[idx]
+                b_lat, b_lon = line[idx + 1]
+                seg_km = max(self._haversine_km(a_lat, a_lon, b_lat, b_lon), 0.001)
+                count = max(1, int(seg_km / max(step_km, 0.5)))
+                for k in range(count):
+                    t = k / count
+                    lat = a_lat + (b_lat - a_lat) * t
+                    lon = a_lon + (b_lon - a_lon) * t
+                    points.append((lat, lon))
+            points.append(line[-1])
+
+        # Deduplicate lightly by rounded key.
+        dedup = []
+        seen = set()
+        for lat, lon in points:
+            key = (round(lat, 4), round(lon, 4))
+            if key not in seen:
+                seen.add(key)
+                dedup.append((lat, lon))
+        if not dedup:
+            return []
+
+        # Keep a manageable amount of Open-Meteo locations.
+        if len(dedup) > max_points:
+            stride = max(1, len(dedup) // max_points)
+            dedup = dedup[::stride]
+            if dedup[-1] != points[-1]:
+                dedup.append(points[-1])
+        return dedup[:max_points]
+
+    def _evaluate_accumulation_zones(self, weather_df: pd.DataFrame) -> List[Dict[str, object]]:
+        zone_results: List[Dict[str, object]] = []
+        if weather_df.empty:
+            return zone_results
+
+        for zone in self.accumulation_zones:
+            zlat = float(zone["latitude"])
+            zlon = float(zone["longitude"])
+            radius = float(zone.get("radius_km", 3.0))
+            in_zone = weather_df[
+                weather_df.apply(
+                    lambda r: self._haversine_km(zlat, zlon, float(r["latitude"]), float(r["longitude"])) <= radius,
+                    axis=1,
+                )
+            ].copy()
+
+            if in_zone.empty:
+                zone_results.append(
+                    {
+                        "name": zone["name"],
+                        "risk_type": zone.get("risk_type", "mixte"),
+                        "radius_km": radius,
+                        "station_count": 0,
+                        "max_24h_mm": 0.0,
+                        "max_12h_mm": 0.0,
+                        "max_instant_mm": 0.0,
+                        "vigilance": "VERT",
+                    }
+                )
+                continue
+
+            max_24h = float(in_zone.get("rain_24h_mm", in_zone["precipitation_mm"]).max())
+            max_12h = float(in_zone.get("rain_12h_mm", in_zone["precipitation_mm"]).max())
+            max_inst = float(in_zone.get("rain_instant_mm", in_zone["precipitation_mm"]).max())
+
+            if max_24h >= self.alert_thresholds_mm["catastrophique_24h"]:
+                vigilance = "NOIR"
+            elif max_24h >= self.alert_thresholds_mm["extreme_24h"]:
+                vigilance = "ROUGE"
+            elif max_24h >= self.alert_thresholds_mm["forte_24h"]:
+                vigilance = "ORANGE"
+            elif max_24h >= self.alert_thresholds_mm["moderee_24h"]:
+                vigilance = "JAUNE"
+            else:
+                vigilance = "VERT"
+
+            zone_results.append(
+                {
+                    "name": zone["name"],
+                    "risk_type": zone.get("risk_type", "mixte"),
+                    "radius_km": radius,
+                    "station_count": int(len(in_zone)),
+                    "max_24h_mm": round(max_24h, 2),
+                    "max_12h_mm": round(max_12h, 2),
+                    "max_instant_mm": round(max_inst, 2),
+                    "vigilance": vigilance,
+                }
+            )
+        return zone_results
+
+    def _save_json(self, obj: Dict, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+
+    def _load_station_cache(self) -> Dict[str, Dict[str, object]]:
+        if not os.path.exists(self.station_cache_file):
+            return {}
+        try:
+            with open(self.station_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_station_cache(self) -> None:
+        self._save_json(self.station_cache, self.station_cache_file)
+
+    @staticmethod
+    def _downsample_coords(coords: List[Tuple[float, float]], max_points: int = 3500) -> List[Tuple[float, float]]:
+        if len(coords) <= max_points:
+            return coords
+        step = max(1, len(coords) // max_points)
+        sampled = coords[::step]
+        if sampled[-1] != coords[-1]:
+            sampled.append(coords[-1])
+        return sampled
+
+    def _load_lgv_lines_from_kmz(self, kmz_path: str) -> List[List[Tuple[float, float]]]:
+        if not os.path.exists(kmz_path):
+            logging.warning("KMZ LGV introuvable: %s", kmz_path)
+            return []
+        try:
+            with zipfile.ZipFile(kmz_path) as zf:
+                kml_name = "doc.kml" if "doc.kml" in zf.namelist() else zf.namelist()[0]
+                root = ET.fromstring(zf.read(kml_name))
+        except Exception as exc:
+            logging.warning("Lecture KMZ impossible (%s): %s", kmz_path, exc)
+            return []
+
+        ns = {"k": "http://www.opengis.net/kml/2.2"}
+        lines: List[List[Tuple[float, float]]] = []
+        for pm in root.findall(".//k:Placemark", ns):
+            name = (pm.findtext("k:name", default="", namespaces=ns) or "").strip().upper()
+            # Keep only LGV polylines from the file.
+            if not name.startswith("LGV"):
+                continue
+            coord_text = pm.findtext(".//k:LineString/k:coordinates", default="", namespaces=ns)
+            if not coord_text:
+                continue
+            coords = []
+            for token in coord_text.replace("\n", " ").split():
+                parts = token.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    lon = float(parts[0])
+                    lat = float(parts[1])
+                except ValueError:
+                    continue
+                coords.append((lat, lon))
+            if len(coords) >= 2:
+                lines.append(self._downsample_coords(coords))
+
+        if lines:
+            logging.info("Trace LGV charge depuis KMZ: %s ligne(s).", len(lines))
+        else:
+            logging.warning("Aucune ligne LGV detectee dans %s", kmz_path)
+        return lines
+
+    def _synop_url_for_date(self, day: datetime) -> str:
+        return "https://donneespubliques.meteofrance.fr/donnees_libres/Txt/Synop/" + f"synop.{day.strftime('%Y%m%d')}.csv"
+
+    @staticmethod
+    def _row_get(row: Dict[str, str], keys: List[str]) -> Optional[str]:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return row[key]
+        return None
+
+    def _extract_synop_record(self, row: Dict[str, str]) -> Optional[Dict[str, object]]:
+        station_id = self._row_get(row, ["numer_sta", "station", "id", "ID"])
+        date_obs_raw = self._row_get(row, ["date", "Date"])
+        lat = self._safe_float(self._row_get(row, ["lat", "latitude", "LAT"]))
+        lon = self._safe_float(self._row_get(row, ["lon", "longitude", "LON"]))
+
+        if lat is None or lon is None:
+            values = list(row.values())
+            if len(values) > 11:
+                lat = self._safe_float(values[10])
+                lon = self._safe_float(values[11])
+        if lat is None or lon is None:
+            return None
+        if abs(lat) > 90 and abs(lat) <= 9000:
+            lat = lat / 100.0
+        if abs(lon) > 180 and abs(lon) <= 18000:
+            lon = lon / 100.0
+
+        rr1 = self._safe_float(row.get("rr1"))
+        rr3 = self._safe_float(row.get("rr3"))
+        rr12 = self._safe_float(row.get("rr12"))
+        rr24 = self._safe_float(row.get("rr24"))
+        generic_rain = self._safe_float(row.get("precipitation"))
+
+        rain_instant = rr1 if rr1 is not None else (rr3 if rr3 is not None else (generic_rain or 0.0))
+        rain_12h = rr12 if rr12 is not None else rain_instant
+        rain_24h = rr24 if rr24 is not None else rain_12h
+        rain_forecast = rain_instant  # no forecast from SYNOP row, keep same value
+
+        return {
+            "station_id": station_id or "unknown",
+            "date_obs_raw": date_obs_raw,
+            "latitude": round(float(lat), 6),
+            "longitude": round(float(lon), 6),
+            "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(lat, lon)), 3),
+            "precipitation_mm": round(float(rain_forecast), 3),
+            "rain_24h_mm": round(float(rain_24h), 3),
+            "rain_12h_mm": round(float(rain_12h), 3),
+            "rain_instant_mm": round(float(rain_instant), 3),
+            "rain_forecast_mm": round(float(rain_forecast), 3),
+            "source": DataSource.SYNOP_METEOFRANCE.value,
+        }
+
+    def fetch_pluviometry_synop(self) -> Dict[str, object]:
+        logging.info("Pluviometrie: recuperation SYNOP Meteo-France.")
+        candidates = [self._now_utc(), self._now_utc() - timedelta(days=1)]
+        last_error = None
+
+        for day in candidates:
+            url = self._synop_url_for_date(day)
+            try:
+                response = self.session.get(url, timeout=30)
+                if response.status_code != 200:
+                    logging.warning("SYNOP non disponible (%s): %s", response.status_code, url)
+                    continue
+                if not response.text.strip():
+                    continue
+
+                reader = csv.DictReader(StringIO(response.text), delimiter=";")
+                rows = [rec for rec in (self._extract_synop_record(row) for row in reader) if rec]
+                if not rows:
+                    continue
+
+                all_df = pd.DataFrame(rows)
+                all_df["date"] = pd.to_datetime(all_df["date_obs_raw"], format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+                all_df = all_df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
+                if all_df.empty:
+                    continue
+
+                selected_df = all_df[all_df["distance_to_lgv_km"] <= self.weather_corridor_km].copy()
+                notice = None
+                if selected_df.empty:
+                    selected_df = all_df.nsmallest(5, "distance_to_lgv_km").copy()
+                    selected_df["selection_mode"] = "nearest_fallback_top5"
+                    nearest = selected_df.iloc[0]
+                    notice = (
+                        "Aucune station meteo <= 1 km de la LGV. "
+                        f"Fallback: top 5 stations les plus proches (plus proche: {nearest['station_id']} "
+                        f"a {nearest['distance_to_lgv_km']:.2f} km)."
+                    )
+                    logging.warning(notice)
+                else:
+                    selected_df["selection_mode"] = "within_1km"
+
+                ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+                all_path = os.path.join("data", f"synop_all_stations_{ts}.csv")
+                selected_path = os.path.join("data", f"synop_selected_lgv_{ts}.csv")
+                all_df.to_csv(all_path, index=False)
+                selected_df.to_csv(selected_path, index=False)
+                summary_path = os.path.join("data", f"weather_summary_{ts}.json")
+                self._save_json(
+                    {
+                        "timestamp_utc": self._now_utc().isoformat(),
+                        "source_url": url,
+                        "corridor_km": self.weather_corridor_km,
+                        "all_station_count": int(len(all_df)),
+                        "selected_station_count": int(len(selected_df)),
+                        "notice": notice,
+                        "all_csv": all_path,
+                        "selected_csv": selected_path,
+                    },
+                    summary_path,
+                )
+                return {
+                    "all": all_df,
+                    "selected": selected_df,
+                    "notice": notice,
+                    "source_url": url,
+                    "summary_path": summary_path,
+                }
+            except Exception as exc:
+                last_error = exc
+                logging.warning("Erreur SYNOP (%s): %s", url, exc)
+
+        logging.error("Pluviometrie indisponible. Derniere erreur: %s", last_error)
+        empty = pd.DataFrame()
+        return {"all": empty, "selected": empty, "notice": "SYNOP indisponible", "source_url": None, "summary_path": None}
+
+    def _fetch_open_meteo_batch(self, batch_points: List[Tuple[float, float]]) -> List[Dict[str, object]]:
+        if not batch_points:
+            return []
+        lats = ",".join(f"{lat:.5f}" for lat, _ in batch_points)
+        lons = ",".join(f"{lon:.5f}" for _, lon in batch_points)
+        params = {
+            "latitude": lats,
+            "longitude": lons,
+            "hourly": "precipitation",
+            "past_days": 1,
+            "forecast_days": 1,
+            "timezone": "UTC",
+        }
+        response = self.session.get(self.open_meteo_base, params=params, timeout=45)
+        if response.status_code != 200:
+            raise RuntimeError(f"Open-Meteo HTTP {response.status_code}")
+
+        payload = response.json()
+        entries = payload if isinstance(payload, list) else [payload]
+        rows: List[Dict[str, object]] = []
+
+        now_utc = self._now_utc()
+        for idx, entry in enumerate(entries):
+            lat = self._safe_float(str(entry.get("latitude")))
+            lon = self._safe_float(str(entry.get("longitude")))
+            if lat is None or lon is None:
+                continue
+
+            hourly = entry.get("hourly", {}) or {}
+            times = hourly.get("time", []) or []
+            precs = hourly.get("precipitation", []) or []
+            points: List[Tuple[datetime, float, str]] = []
+            for t, p in zip(times, precs):
+                p_val = self._safe_float(p)
+                if p_val is None:
+                    continue
+                dt = pd.to_datetime(t, utc=True, errors="coerce")
+                if pd.isna(dt):
+                    continue
+                points.append((dt.to_pydatetime(), float(p_val), str(t)))
+
+            past = [x for x in points if x[0] <= now_utc]
+            future = [x for x in points if x[0] > now_utc]
+            past.sort(key=lambda x: x[0])
+            future.sort(key=lambda x: x[0])
+
+            if past:
+                dt_obs, rain_instant, dt_str = past[-1]
+            else:
+                dt_obs, rain_instant, dt_str = now_utc, 0.0, now_utc.strftime("%Y-%m-%dT%H:%M")
+
+            lower_12h = now_utc - timedelta(hours=12)
+            lower_24h = now_utc - timedelta(hours=24)
+            rain_12h = sum(v for dt, v, _ in past if dt > lower_12h)
+            rain_24h = sum(v for dt, v, _ in past if dt > lower_24h)
+            rain_forecast = future[0][1] if future else rain_instant
+
+            rows.append(
+                {
+                    "station_id": f"openmeteo_{idx + 1}",
+                    "date_obs_raw": dt_str,
+                    "latitude": round(float(lat), 6),
+                    "longitude": round(float(lon), 6),
+                    "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(float(lat), float(lon))), 3),
+                    "precipitation_mm": round(rain_forecast, 3),
+                    "rain_24h_mm": round(rain_24h, 3),
+                    "rain_12h_mm": round(rain_12h, 3),
+                    "rain_instant_mm": round(rain_instant, 3),
+                    "rain_forecast_mm": round(rain_forecast, 3),
+                    "source": DataSource.OPEN_METEO.value,
+                    "selection_mode": "open_meteo_grid",
+                }
+            )
+        return rows
+
+    def fetch_pluviometry_open_meteo(self) -> Dict[str, object]:
+        logging.info("Pluviometrie: recuperation Open-Meteo sur grille LGV.")
+        sampled = self._sample_points_along_lgv(self.open_meteo_sample_step_km, self.open_meteo_max_points)
+        if not sampled:
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "Open-Meteo: echantillonnage LGV vide", "source_url": self.open_meteo_base}
+
+        rows: List[Dict[str, object]] = []
+        # Keep URL length reasonable.
+        batch_size = 20
+        try:
+            for i in range(0, len(sampled), batch_size):
+                rows.extend(self._fetch_open_meteo_batch(sampled[i : i + batch_size]))
+        except Exception as exc:
+            logging.warning("Open-Meteo indisponible: %s", exc)
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": f"Open-Meteo indisponible: {exc}", "source_url": self.open_meteo_base}
+
+        if not rows:
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "Open-Meteo: aucune donnee retournee", "source_url": self.open_meteo_base}
+
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date_obs_raw"], errors="coerce", utc=True)
+        df = df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join("data", f"open_meteo_lgv_grid_{ts}.csv")
+        df.to_csv(csv_path, index=False)
+        return {
+            "all": df.copy(),
+            "selected": df.copy(),
+            "notice": f"Open-Meteo grille LGV: {len(df)} points.",
+            "source_url": self.open_meteo_base,
+            "summary_path": csv_path,
+        }
+
+    def fetch_pluviometry_combined(self) -> Dict[str, object]:
+        synop = self.fetch_pluviometry_synop()
+        open_meteo = self.fetch_pluviometry_open_meteo()
+
+        frames_all = [df for df in [synop.get("all"), open_meteo.get("all")] if isinstance(df, pd.DataFrame) and not df.empty]
+        frames_sel = [df for df in [synop.get("selected"), open_meteo.get("selected")] if isinstance(df, pd.DataFrame) and not df.empty]
+        all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
+        selected_df = pd.concat(frames_sel, ignore_index=True) if frames_sel else pd.DataFrame()
+
+        notices = [n for n in [synop.get("notice"), open_meteo.get("notice")] if n]
+        notice = " | ".join(notices) if notices else None
+
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        combined_csv = os.path.join("data", f"weather_combined_{ts}.csv")
+        if not selected_df.empty:
+            selected_df.to_csv(combined_csv, index=False)
+
+        summary_path = os.path.join("data", f"weather_summary_combined_{ts}.json")
+        self._save_json(
+            {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "synop_source": synop.get("source_url"),
+                "open_meteo_source": open_meteo.get("source_url"),
+                "selected_station_count": int(len(selected_df)) if not selected_df.empty else 0,
+                "notice": notice,
+                "combined_csv": combined_csv if not selected_df.empty else None,
+            },
+            summary_path,
+        )
+        return {
+            "all": all_df,
+            "selected": selected_df,
+            "notice": notice,
+            "source_url": {"synop": synop.get("source_url"), "open_meteo": open_meteo.get("source_url")},
+            "summary_path": summary_path,
+        }
+
+    def _discover_station_for_river(self, rp: RiverMonitoringPoint) -> Optional[Dict[str, object]]:
+        pad = 0.65
+        min_lon, min_lat = rp.longitude - pad, rp.latitude - pad
+        max_lon, max_lat = rp.longitude + pad, rp.latitude + pad
+        url = f"{self.hubeau_base}{self.hubeau_endpoints['stations']}"
+        params = {"size": 1200, "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}"}
+
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f"Hub'Eau stations HTTP {response.status_code}")
+
+        items = response.json().get("data", [])
+        if not items:
+            return None
+
+        river_name = rp.river.lower()
+        ranked: List[Tuple[int, float, Dict[str, object]]] = []
+
+        for st in items:
+            code = st.get("code_station") or st.get("code_entite") or st.get("code_site")
+            lat = st.get("latitude_station") or st.get("latitude")
+            lon = st.get("longitude_station") or st.get("longitude")
+            name = st.get("libelle_station") or st.get("libelle") or st.get("nom_station") or ""
+            if not code or lat is None or lon is None:
+                continue
+            try:
+                lat_f, lon_f = float(lat), float(lon)
+            except Exception:
+                continue
+
+            dist_ref_km = self._haversine_km(rp.latitude, rp.longitude, lat_f, lon_f)
+            priority = 0 if river_name in str(name).lower() else 1
+            ranked.append(
+                (
+                    priority,
+                    dist_ref_km,
+                    {
+                        "station_code": code,
+                        "station_name": name,
+                        "station_latitude": lat_f,
+                        "station_longitude": lon_f,
+                        "distance_to_river_ref_km": round(dist_ref_km, 2),
+                        "auto_selected": True,
+                        "match_type": "name+distance" if priority == 0 else "distance_only",
+                    },
+                )
+            )
+
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: (x[0], x[1]))
+        return ranked[0][2]
+
+    def _discover_station_by_name(self, rp: RiverMonitoringPoint, keyword: str) -> Optional[Dict[str, object]]:
+        pad = 1.0
+        min_lon, min_lat = rp.longitude - pad, rp.latitude - pad
+        max_lon, max_lat = rp.longitude + pad, rp.latitude + pad
+        url = f"{self.hubeau_base}{self.hubeau_endpoints['stations']}"
+        params = {"size": 2000, "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}"}
+
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code != 200:
+            return None
+
+        key = keyword.lower()
+        hits: List[Tuple[float, Dict[str, object]]] = []
+        for st in response.json().get("data", []):
+            code = st.get("code_station") or st.get("code_entite") or st.get("code_site")
+            lat = st.get("latitude_station") or st.get("latitude")
+            lon = st.get("longitude_station") or st.get("longitude")
+            name = st.get("libelle_station") or st.get("libelle") or st.get("nom_station") or ""
+            if not code or lat is None or lon is None:
+                continue
+            if key not in str(name).lower():
+                continue
+            try:
+                lat_f, lon_f = float(lat), float(lon)
+            except Exception:
+                continue
+            dist_ref_km = self._haversine_km(rp.latitude, rp.longitude, lat_f, lon_f)
+            hits.append(
+                (
+                    dist_ref_km,
+                    {
+                        "station_code": code,
+                        "station_name": name,
+                        "station_latitude": lat_f,
+                        "station_longitude": lon_f,
+                        "distance_to_river_ref_km": round(dist_ref_km, 2),
+                        "auto_selected": True,
+                        "match_type": f"name:{keyword}",
+                    },
+                )
+            )
+
+        if not hits:
+            return None
+        hits.sort(key=lambda x: x[0])
+        return hits[0][1]
+
+    def _resolve_station_for_river(self, rp: RiverMonitoringPoint) -> Optional[Dict[str, object]]:
+        if rp.station_code:
+            return {
+                "station_code": rp.station_code,
+                "station_name": "manual_config",
+                "station_latitude": None,
+                "station_longitude": None,
+                "distance_to_river_ref_km": None,
+                "auto_selected": False,
+                "match_type": "manual",
+            }
+
+        cached = self.station_cache.get(rp.river)
+        if cached and cached.get("station_code"):
+            cached["auto_selected"] = True
+            cached.setdefault("match_type", "cached")
+            return cached
+
+        # User requirement: Charente uses Champniers measurement point when available.
+        if rp.river.lower() == "charente":
+            champniers = self._discover_station_by_name(rp, "champniers")
+            if champniers:
+                self.station_cache[rp.river] = champniers
+                self._save_station_cache()
+                return champniers
+
+        discovered = self._discover_station_for_river(rp)
+        if discovered:
+            self.station_cache[rp.river] = discovered
+            self._save_station_cache()
+        return discovered
+
+    def fetch_hydrometry_for_station(self, station_code: str, hours: int = 24) -> pd.DataFrame:
+        url = f"{self.hubeau_base}{self.hubeau_endpoints['observations_tr']}"
+        now = self._now_utc()
+        start = now - timedelta(hours=hours)
+
+        params = {
+            "code_entite": station_code,
+            "grandeur_hydro": "H",
+            "size": 500,
+            "sort": "desc",
+            "date_debut_obs": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "date_fin_obs": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f"Hub'Eau observations_tr HTTP {response.status_code}")
+
+        rows = []
+        for item in response.json().get("data", []):
+            date_obs = item.get("date_obs")
+            result = item.get("resultat_obs")
+            if date_obs is None or result is None:
+                continue
+            try:
+                rows.append(
+                    {
+                        "date_obs": pd.to_datetime(date_obs, utc=True, errors="coerce"),
+                        "level_m": float(result) / 1000.0,
+                        "status": item.get("statut_observation"),
+                    }
+                )
+            except Exception:
+                continue
+
+        df = pd.DataFrame(rows).dropna(subset=["date_obs"])
+        if df.empty:
+            return df
+        return df.sort_values("date_obs", ascending=False).reset_index(drop=True)
+
+    def fetch_all_river_levels(self) -> Dict[str, Dict[str, object]]:
+        logging.info("Hydrometrie: recuperation niveaux de cours d'eau.")
+        out: Dict[str, Dict[str, object]] = {}
+
+        for rp in self.river_points:
+            try:
+                station_meta = self._resolve_station_for_river(rp)
+                if not station_meta:
+                    out[rp.river] = {
+                        "configured": False,
+                        "river": rp.river,
+                        "name": rp.name,
+                        "message": "Aucune station Hub'Eau resolue pour cette riviere.",
+                        "source": DataSource.VIGICRUES_HYDRO.value,
+                    }
+                    continue
+
+                station_code = str(station_meta["station_code"])
+                obs_df = self.fetch_hydrometry_for_station(station_code=station_code, hours=24)
+
+                if obs_df.empty:
+                    out[rp.river] = {
+                        "configured": True,
+                        "river": rp.river,
+                        "name": rp.name,
+                        "station_code": station_code,
+                        "station_name": station_meta.get("station_name"),
+                        "auto_selected": bool(station_meta.get("auto_selected", False)),
+                        "match_type": station_meta.get("match_type"),
+                        "message": "Aucune observation disponible sur les 24h.",
+                        "source": DataSource.VIGICRUES_HYDRO.value,
+                    }
+                    continue
+
+                latest = obs_df.iloc[0]
+                oldest = obs_df.iloc[-1]
+                dt_h = (latest["date_obs"] - oldest["date_obs"]).total_seconds() / 3600.0
+                trend_mph = (latest["level_m"] - oldest["level_m"]) / dt_h if dt_h > 0 else 0.0
+
+                out[rp.river] = {
+                    "configured": True,
+                    "river": rp.river,
+                    "name": rp.name,
+                    "station_code": station_code,
+                    "station_name": station_meta.get("station_name"),
+                    "station_latitude": station_meta.get("station_latitude"),
+                    "station_longitude": station_meta.get("station_longitude"),
+                    "distance_to_river_ref_km": station_meta.get("distance_to_river_ref_km"),
+                    "auto_selected": bool(station_meta.get("auto_selected", False)),
+                    "match_type": station_meta.get("match_type"),
+                    "last_level_m": round(float(latest["level_m"]), 3),
+                    "trend_mph": round(float(trend_mph), 3),
+                    "n_obs": int(len(obs_df)),
+                    "threshold_m": rp.threshold_m,
+                    "rapid_rise_mph": rp.rapid_rise_mph,
+                    "observations": obs_df.head(24).to_dict(orient="records"),
+                    "source": DataSource.VIGICRUES_HYDRO.value,
+                }
+
+            except Exception as exc:
+                out[rp.river] = {
+                    "configured": bool(rp.station_code),
+                    "river": rp.river,
+                    "name": rp.name,
+                    "station_code": rp.station_code,
+                    "error": str(exc),
+                    "source": DataSource.VIGICRUES_HYDRO.value,
+                }
+
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(out, os.path.join("data", f"river_levels_{ts}.json"))
+        return out
+
+    def analyze_risks(self, weather_df: pd.DataFrame, weather_notice: Optional[str], rivers: Dict[str, Dict[str, object]]) -> Dict[str, object]:
+        risks: Dict[str, object] = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "risk_level": "FAIBLE",
+            "score": 0.0,
+            "alerts": [],
+            "details": {},
+            "recommendations": [],
+            "weather_selection_notice": weather_notice,
+        }
+        factors: List[int] = []
+
+        if not weather_df.empty:
+            metric_col = "rain_24h_mm" if "rain_24h_mm" in weather_df.columns else "precipitation_mm"
+            max_rain = float(weather_df[metric_col].max())
+            mean_rain = float(weather_df[metric_col].mean())
+            zones = self._evaluate_accumulation_zones(weather_df)
+            risks["details"]["weather"] = {
+                "station_count": int(len(weather_df)),
+                "corridor_km": self.weather_corridor_km,
+                "metric": metric_col,
+                "max_mm": round(max_rain, 2),
+                "mean_mm": round(mean_rain, 2),
+                "zones": zones,
+            }
+
+            if max_rain >= self.alert_thresholds_mm["catastrophique_24h"]:
+                factors.append(4)
+                risks["alerts"].append(
+                    {
+                        "type": "PLUIE_CATASTROPHIQUE",
+                        "level": "CRITIQUE",
+                        "message": f"Cumul 24h catastrophique: {max_rain:.1f} mm",
+                    }
+                )
+                risks["recommendations"].append("Declencher inspection immediate remblais/deblais et ouvrages de drainage.")
+            elif max_rain >= self.alert_thresholds_mm["extreme_24h"]:
+                factors.append(3)
+                risks["alerts"].append({"type": "PLUIE", "level": "ELEVE", "message": f"Pluie extreme: {max_rain:.1f} mm/24h"})
+            elif max_rain >= self.alert_thresholds_mm["forte_24h"]:
+                factors.append(3)
+                risks["alerts"].append({"type": "PLUIE", "level": "ELEVE", "message": f"Pluie forte: {max_rain:.1f} mm/24h"})
+            elif max_rain >= self.alert_thresholds_mm["moderee_24h"]:
+                factors.append(3)
+                risks["alerts"].append({"type": "PLUIE", "level": "MODERE", "message": f"Pluie notable: {max_rain:.1f} mm"})
+
+            critical_stations = weather_df[weather_df.get("rain_24h_mm", weather_df["precipitation_mm"]) >= self.alert_thresholds_mm["extreme_24h"]]
+            for _, row in critical_stations.head(5).iterrows():
+                risks["alerts"].append(
+                    {
+                        "type": "STATION_CRITIQUE",
+                        "level": "ELEVE",
+                        "message": (
+                            f"Station {row.get('station_id')} ({row.get('source')}): "
+                            f"{row.get('rain_24h_mm', row.get('precipitation_mm'))} mm/24h "
+                            f"a {row.get('distance_to_lgv_km')} km de la LGV"
+                        ),
+                    }
+                )
+
+            for zone in zones:
+                if zone["vigilance"] in {"NOIR", "ROUGE", "ORANGE"}:
+                    factors.append(3 if zone["vigilance"] in {"NOIR", "ROUGE"} else 2)
+                    risks["alerts"].append(
+                        {
+                            "type": "ZONE_ACCUMULATION",
+                            "level": "ELEVE" if zone["vigilance"] in {"NOIR", "ROUGE"} else "MODERE",
+                            "message": (
+                                f"{zone['name']} ({zone['risk_type']}): vigilance {zone['vigilance']} "
+                                f"| max24h={zone['max_24h_mm']} mm | max12h={zone['max_12h_mm']} mm"
+                            ),
+                        }
+                    )
+
+        if weather_notice:
+            factors.append(1)
+            risks["alerts"].append({"type": "COUVERTURE", "level": "INFO", "message": weather_notice})
+            risks["recommendations"].append("Verifier la couverture meteo locale, fallback station active.")
+
+        for river, info in rivers.items():
+            if not isinstance(info, dict):
+                continue
+            if not info.get("configured") or info.get("last_level_m") is None:
+                risks["details"][river] = {
+                    "configured": info.get("configured", False),
+                    "message": info.get("message") or info.get("error"),
+                }
+                continue
+
+            last_level = info.get("last_level_m")
+            threshold = info.get("threshold_m")
+            trend = info.get("trend_mph")
+            rapid = info.get("rapid_rise_mph")
+
+            risks["details"][river] = {
+                "station_code": info.get("station_code"),
+                "station_name": info.get("station_name"),
+                "auto_selected": info.get("auto_selected"),
+                "match_type": info.get("match_type"),
+                "last_level_m": last_level,
+                "trend_mph": trend,
+                "threshold_m": threshold,
+                "rapid_rise_mph": rapid,
+            }
+
+            if threshold is not None and last_level is not None and last_level >= threshold:
+                factors.append(3)
+                risks["alerts"].append({"type": "CRUE", "level": "ELEVE", "message": f"{river}: {last_level:.2f} m >= seuil {threshold:.2f} m"})
+
+            if rapid is not None and trend is not None and trend >= rapid:
+                factors.append(2)
+                risks["alerts"].append({"type": "MONTEE_RAPIDE", "level": "MODERE", "message": f"{river}: {trend:.2f} m/h (seuil {rapid:.2f} m/h)"})
+
+        if factors:
+            score = sum(factors) / len(factors)
+            risks["score"] = round(score, 2)
+            if score >= 2.5:
+                risks["risk_level"] = "ELEVE"
+            elif score >= 1.5:
+                risks["risk_level"] = "MODERE"
+
+        if risks["risk_level"] == "ELEVE":
+            risks["recommendations"].append("Alerter l'astreinte et renforcer les controles OA/exutoires.")
+        elif risks["risk_level"] == "MODERE":
+            risks["recommendations"].append("Surveillance renforcee conseillee sur les zones sensibles.")
+        else:
+            risks["recommendations"].append("Surveillance normale.")
+
+        seen = set()
+        risks["recommendations"] = [r for r in risks["recommendations"] if not (r in seen or seen.add(r))]
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join("reports", f"risk_analysis_{ts}.json")
+        self._save_json(risks, report_path)
+        risks["report_path"] = report_path
+        return risks
+
+    def generate_map(self, weather_df: pd.DataFrame, rivers: Dict[str, Dict[str, object]], risks: Dict[str, object]) -> str:
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        map_path = os.path.join("reports", f"lgv_dashboard_{ts}.html")
+        latest_path = os.path.join("reports", "lgv_dashboard_latest.html")
+
+        lgv_lines = [
+            [{"lat": lat, "lon": lon} for lat, lon in line]
+            for line in self.lgv_lines_latlon
+            if len(line) >= 2
+        ]
+
+        weather_markers = []
+        if not weather_df.empty:
+            for _, row in weather_df.iterrows():
+                mode = str(row.get("selection_mode", "unknown"))
+                source = str(row.get("source", "unknown"))
+                rain24 = float(row.get("rain_24h_mm", row.get("precipitation_mm", 0.0)) or 0.0)
+                if rain24 >= self.alert_thresholds_mm["catastrophique_24h"]:
+                    marker_color = "#111111"
+                elif rain24 >= self.alert_thresholds_mm["extreme_24h"]:
+                    marker_color = "#b91c1c"
+                elif rain24 >= self.alert_thresholds_mm["forte_24h"]:
+                    marker_color = "#ea580c"
+                elif source == DataSource.OPEN_METEO.value:
+                    marker_color = "#1d4ed8"
+                elif mode == "within_1km":
+                    marker_color = "#0f766e"
+                else:
+                    marker_color = "#f59e0b"
+                popup = (
+                    f"<b>Station:</b> {html.escape(str(row.get('station_id')))}<br>"
+                    f"<b>Source:</b> {html.escape(source)}<br>"
+                    f"<b>Cumul 24h:</b> {row.get('rain_24h_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Cumul 12h:</b> {row.get('rain_12h_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Instantane:</b> {row.get('rain_instant_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Prediction:</b> {row.get('rain_forecast_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Distance LGV:</b> {row.get('distance_to_lgv_km')} km<br>"
+                    f"<b>Selection:</b> {html.escape(mode)}<br>"
+                    f"<b>Date obs:</b> {html.escape(str(row.get('date_obs_raw')))}"
+                )
+                weather_markers.append(
+                    {
+                        "lat": float(row["latitude"]),
+                        "lon": float(row["longitude"]),
+                        "color": marker_color,
+                        "popup": popup,
+                    }
+                )
+
+        river_markers = []
+        for rp in self.river_points:
+            info = rivers.get(rp.river, {})
+            lat = info.get("station_latitude") if info.get("station_latitude") is not None else rp.latitude
+            lon = info.get("station_longitude") if info.get("station_longitude") is not None else rp.longitude
+            level = info.get("last_level_m")
+            threshold = info.get("threshold_m")
+            trend = info.get("trend_mph")
+            rapid = info.get("rapid_rise_mph")
+
+            if level is not None and threshold is not None and level >= threshold:
+                color = "#dc2626"
+            elif trend is not None and rapid is not None and trend >= rapid:
+                color = "#d97706"
+            elif info.get("configured"):
+                color = "#16a34a"
+            else:
+                color = "#6b7280"
+
+            popup = (
+                f"<b>Riviere:</b> {html.escape(rp.river)}<br>"
+                f"<b>Source:</b> {html.escape(str(info.get('source', DataSource.VIGICRUES_HYDRO.value)))}<br>"
+                f"<b>Station:</b> {html.escape(str(info.get('station_code', 'n/a')))}<br>"
+                f"<b>Point mesure:</b> {round(float(lat), 5)}, {round(float(lon), 5)}<br>"
+                f"<b>Niveau:</b> {html.escape(str(level))} m<br>"
+                f"<b>Tendance:</b> {html.escape(str(trend))} m/h<br>"
+                f"<b>Seuil:</b> {html.escape(str(threshold))} m<br>"
+                f"<b>Auto-station:</b> {html.escape(str(info.get('auto_selected')))}"
+            )
+
+            river_markers.append({"lat": float(lat), "lon": float(lon), "color": color, "popup": popup})
+
+        zone_markers = []
+        weather_details = risks.get("details", {}).get("weather", {}) if isinstance(risks.get("details"), dict) else {}
+        for zone in weather_details.get("zones", []) if isinstance(weather_details, dict) else []:
+            vig = str(zone.get("vigilance", "VERT"))
+            if vig == "NOIR":
+                zcolor = "#111111"
+            elif vig == "ROUGE":
+                zcolor = "#b91c1c"
+            elif vig == "ORANGE":
+                zcolor = "#ea580c"
+            elif vig == "JAUNE":
+                zcolor = "#eab308"
+            else:
+                zcolor = "#16a34a"
+            base = next((z for z in self.accumulation_zones if z["name"] == zone.get("name")), None)
+            if not base:
+                continue
+            zone_markers.append(
+                {
+                    "name": zone.get("name"),
+                    "lat": float(base["latitude"]),
+                    "lon": float(base["longitude"]),
+                    "radius_m": int(float(base.get("radius_km", 3.0)) * 1000),
+                    "color": zcolor,
+                    "popup": (
+                        f"<b>Zone accumulation:</b> {html.escape(str(zone.get('name')))}<br>"
+                        f"<b>Type:</b> {html.escape(str(zone.get('risk_type')))}<br>"
+                        f"<b>Vigilance:</b> {html.escape(vig)}<br>"
+                        f"<b>Max 24h:</b> {html.escape(str(zone.get('max_24h_mm')))} mm<br>"
+                        f"<b>Max 12h:</b> {html.escape(str(zone.get('max_12h_mm')))} mm"
+                    ),
+                }
+            )
+
+        lgv_json = json.dumps(lgv_lines)
+        weather_json = json.dumps(weather_markers)
+        river_json = json.dumps(river_markers)
+        zones_json = json.dumps(zone_markers)
+        risk_level = html.escape(str(risks.get("risk_level")))
+        score = html.escape(str(risks.get("score")))
+        notice = html.escape(str(risks.get("weather_selection_notice") or "Aucun fallback meteo"))
+
+        html_doc = f"""<!doctype html>
+<html lang=\"fr\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>LGV SEA - Dashboard Hydrometeo</title>
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
+  <style>
+    :root {{ --bg:#f4f7f9; --panel:#ffffff; --text:#12212c; --muted:#6b7280; }}
+    body {{ margin:0; font-family:"Segoe UI",Tahoma,sans-serif; background:var(--bg); color:var(--text); }}
+    .wrap {{ display:grid; grid-template-columns:360px 1fr; min-height:100vh; }}
+    .panel {{ padding:16px; background:var(--panel); border-right:1px solid #e5e7eb; }}
+    #map {{ width:100%; height:100vh; }}
+    .badge {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e6fffa; color:#134e4a; font-weight:600; }}
+    .kpi {{ margin:10px 0; padding:12px; background:#f8fafc; border-radius:10px; border:1px solid #e5e7eb; }}
+    .muted {{ color:var(--muted); font-size:13px; }}
+    .dot {{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }}
+    .river-pin {{
+      width: 14px;
+      height: 14px;
+      transform: rotate(45deg);
+      border-radius: 2px;
+      border: 1px solid #0f172a;
+      opacity: 0.95;
+    }}
+    @media (max-width:900px) {{ .wrap {{ grid-template-columns:1fr; }} .panel {{ border-right:none; border-bottom:1px solid #e5e7eb; }} #map {{ height:70vh; }} }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <aside class=\"panel\">
+      <h2>LGV SEA Monitoring</h2>
+      <div class=\"kpi\"><span class=\"badge\">Risque: {risk_level} (score {score}/3)</span></div>
+      <div class=\"kpi\"><b>Selection meteo</b><br><span class=\"muted\">{notice}</span></div>
+      <div class=\"kpi\"><b>Objectif</b><br><span class=\"muted\">Pluviometrie le long de la LGV (Bordeaux-Tours) + niveaux d'eau des rivieres critiques.</span></div>
+      <div class=\"muted\">
+        <div><span class=\"dot\" style=\"background:#111111\"></span>Pluie catastrophique (>=120 mm/24h)</div>
+        <div><span class=\"dot\" style=\"background:#b91c1c\"></span>Pluie extreme (>=80 mm/24h)</div>
+        <div><span class=\"dot\" style=\"background:#ea580c\"></span>Pluie forte (>=50 mm/24h)</div>
+        <div><span class=\"dot\" style=\"background:#0f766e\"></span>Station meteo <= 1 km</div>
+        <div><span class=\"dot\" style=\"background:#f59e0b\"></span>Station meteo fallback</div>
+        <div><span class=\"dot\" style=\"background:#1d4ed8\"></span>Open-Meteo (grille LGV)</div>
+        <div><span class=\"dot\" style=\"background:#16a34a\"></span>Point Vigicrues normal</div>
+        <div><span class=\"dot\" style=\"background:#d97706\"></span>Point Vigicrues montee rapide</div>
+        <div><span class=\"dot\" style=\"background:#dc2626\"></span>Point Vigicrues depassement seuil</div>
+      </div>
+    </aside>
+    <section><div id=\"map\"></div></section>
+  </div>
+
+  <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+  <script>
+    const lgvLines = {lgv_json};
+    const weather = {weather_json};
+    const rivers = {river_json};
+    const zones = {zones_json};
+    const map = L.map('map');
+    L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom:18, attribution:'&copy; OpenStreetMap contributors' }}).addTo(map);
+    const lineLayers = [];
+    lgvLines.forEach(line => {{
+      const lgvLatLng = line.map(p => [p.lat, p.lon]);
+      lineLayers.push(L.polyline(lgvLatLng, {{ color:'#0b4f6c', weight:3, opacity:0.85 }}).addTo(map));
+    }});
+    weather.forEach(s => L.circleMarker([s.lat, s.lon], {{ radius:7, color:s.color, fillColor:s.color, fillOpacity:0.85 }}).addTo(map).bindPopup(s.popup));
+    rivers.forEach(r => {{
+      const icon = L.divIcon({{
+        className: '',
+        html: `<div class="river-pin" style="background:${{r.color}}"></div>`,
+        iconSize: [14, 14],
+        iconAnchor: [7, 7]
+      }});
+      L.marker([r.lat, r.lon], {{ icon }}).addTo(map).bindPopup(r.popup);
+    }});
+    zones.forEach(z => {{
+      L.circle([z.lat, z.lon], {{
+        radius: z.radius_m,
+        color: z.color,
+        fillColor: z.color,
+        fillOpacity: 0.08,
+        weight: 2
+      }}).addTo(map).bindPopup(z.popup);
+    }});
+    const allBounds = L.featureGroup(lineLayers).getBounds();
+    map.fitBounds(allBounds.pad(0.10));
+  </script>
+</body>
+</html>
+"""
+
+        with open(map_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        with open(latest_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        return latest_path
+
+    def run_cycle(self) -> None:
+        logging.info("=" * 70)
+        logging.info("Cycle LGV SEA monitoring")
+
+        weather_pack = self.fetch_pluviometry_combined()
+        rivers = self.fetch_all_river_levels()
+        risks = self.analyze_risks(weather_pack["selected"], weather_pack.get("notice"), rivers)
+        map_path = self.generate_map(weather_pack["selected"], rivers, risks)
+
+        cycle_output = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "risk_level": risks.get("risk_level"),
+            "score": risks.get("score"),
+            "alerts": risks.get("alerts"),
+            "weather_notice": weather_pack.get("notice"),
+            "map_path": map_path,
+            "risk_report_path": risks.get("report_path"),
+            "weather_summary_path": weather_pack.get("summary_path"),
+        }
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(cycle_output, os.path.join("reports", f"cycle_summary_{ts}.json"))
+        self._save_json(
+            {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "risk_level": risks.get("risk_level"),
+                "alerts_count": len(risks.get("alerts", [])),
+                "alerts": risks.get("alerts", []),
+            },
+            os.path.join("reports", f"alerts_{ts}.json"),
+        )
+
+        logging.info("RISK: %s (score %s), alerts=%s", risks["risk_level"], risks["score"], len(risks["alerts"]))
+        logging.info("Carte: %s", map_path)
+        self._print_console(weather_pack["selected"], rivers, risks, map_path)
+
+    def _print_console(self, weather_df: pd.DataFrame, rivers: Dict[str, Dict[str, object]], risks: Dict[str, object], map_path: str) -> None:
+        print("\n" + "=" * 70)
+        print(f"LGV SEA - RISQUE HYDROMETEO: {risks['risk_level']} (score {risks['score']}/3)")
+        print("=" * 70)
+
+        notice = risks.get("weather_selection_notice")
+        if notice:
+            print(f"Notice meteo: {notice}")
+
+        if not weather_df.empty:
+            print(f"Stations meteo affichees: {len(weather_df)}")
+            for _, row in weather_df.head(12).iterrows():
+                print(
+                    "  - station={sid} pluie={rain}mm dist_lgv={dist}km mode={mode}".format(
+                        sid=row.get("station_id"),
+                        rain=row.get("precipitation_mm"),
+                        dist=row.get("distance_to_lgv_km"),
+                        mode=row.get("selection_mode"),
+                    )
+                )
+
+        print("\nRivieres:")
+        for river, info in rivers.items():
+            if info.get("last_level_m") is not None:
+                print(f"  - {river}: {info['last_level_m']} m | trend {info.get('trend_mph')} m/h | thr {info.get('threshold_m')} | station {info.get('station_code')}")
+            else:
+                msg = info.get("message") or info.get("error") or "pas de donnees"
+                print(f"  - {river}: {msg}")
+
+        if risks["alerts"]:
+            print("\nAlertes:")
+            for alert in risks["alerts"]:
+                print(f"  - [{alert.get('level')}] {alert.get('type')}: {alert.get('message')}")
+        else:
+            print("\nAucune alerte active")
+
+        print(f"\nCarte HTML: {map_path}")
+        print("=" * 70 + "\n")
+
+
+def main() -> None:
+    monitor = LGVSeaMonitor()
+    monitor.run_cycle()
+    schedule.every().hour.do(monitor.run_cycle)
+    print("Monitoring actif (cycle horaire). Ctrl+C pour arreter.")
+
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+    except KeyboardInterrupt:
+        logging.info("Arret demande par l'utilisateur.")
+
+
+if __name__ == "__main__":
+    main()

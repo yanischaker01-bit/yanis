@@ -1,0 +1,18 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../Downloads/ndwi-dashboard-react"
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "vs_c",
+		"powershell.cwd": "vs_c"
+	},
+	"launch": {
+		"version": "0.2.0",
+		"configurations": []
+	}
+}
