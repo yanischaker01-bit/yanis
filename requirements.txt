@@ -1,7 +1,7 @@
-altair==4.2.2
+altair==5.5.0
 folium
 pandas
 requests
 schedule
-streamlit
+streamlit==1.54.0
 streamlit-folium

@@ -61,7 +61,7 @@ Fonctions:
 
 Sur Streamlit Cloud, l'app lit en priorite le snapshot publie par GitHub Pages:
 `https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json`.
-Le fichier `runtime.txt` force Python `3.12` pour compatibilite Streamlit.
+Le projet force `streamlit==1.54.0` et `altair==5.5.0` pour compatibilite Cloud recente.
 
 ## Fonctionnement
 
