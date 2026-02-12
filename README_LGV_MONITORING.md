@@ -48,6 +48,19 @@ Fonctions:
 - classement professionnel par commune (note GC /100)
 - tableaux d'alertes et recommandations
 
+## 6) Publier sur Streamlit Community Cloud (lien public)
+
+1. Ouvre `https://share.streamlit.io/`.
+2. Connecte ton compte GitHub.
+3. Clique `New app`.
+4. Selectionne:
+   - Repository: `yanischaker01-bit/yanis`
+   - Branch: `main`
+   - Main file path: `streamlit_lgv_pro.py`
+5. Clique `Deploy`.
+
+Au premier demarrage, l'app genere automatiquement un snapshot si aucun fichier n'existe.
+
 ## Fonctionnement
 
 - La collecte pluvio lit SYNOP Meteo-France et stocke les observations en SQLite.

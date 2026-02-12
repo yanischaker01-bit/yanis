@@ -56,6 +56,16 @@ def _find_snapshot() -> Path | None:
     return snapshots[0] if snapshots else None
 
 
+def _bootstrap_snapshot() -> Path | None:
+    try:
+        from meteo_test import LGVSeaMonitor
+
+        LGVSeaMonitor().run_cycle()
+    except Exception:
+        return None
+    return _find_snapshot()
+
+
 @st.cache_data(show_spinner=False)
 def _load_snapshot(path_str: str, mtime: float) -> Dict[str, object]:
     _ = mtime
@@ -286,7 +296,19 @@ st.caption("Suivi hydrometeo et geotechnique avec classement par commune")
 
 snapshot_path = _find_snapshot()
 if snapshot_path is None:
-    st.error("Aucun snapshot trouve. Lance d'abord: python run_once_dashboard.py")
+    if "bootstrap_attempted" not in st.session_state:
+        st.session_state["bootstrap_attempted"] = True
+        with st.spinner("Initialisation des donnees (premier demarrage)..."):
+            snapshot_path = _bootstrap_snapshot()
+
+if snapshot_path is None:
+    st.warning("Aucun snapshot disponible pour l'instant.")
+    if st.button("Generer un snapshot maintenant", use_container_width=True):
+        with st.spinner("Generation du snapshot..."):
+            snapshot_path = _bootstrap_snapshot()
+        if snapshot_path is not None:
+            st.success("Snapshot genere.")
+            st.rerun()
     st.stop()
 
 snapshot = _load_snapshot(str(snapshot_path), snapshot_path.stat().st_mtime)

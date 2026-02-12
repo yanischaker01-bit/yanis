@@ -1,3 +1,7 @@
+altair
+folium
 pandas
 requests
 schedule
+streamlit
+streamlit-folium
