@@ -59,6 +59,16 @@ def _risk_level_from_note(note_gc: float) -> str:
     return "FAIBLE"
 
 
+def _ai_level_from_probability(probability: float) -> str:
+    if probability >= 0.85:
+        return "CRITIQUE"
+    if probability >= 0.65:
+        return "ELEVE"
+    if probability >= 0.40:
+        return "MODERE"
+    return "FAIBLE"
+
+
 def _score_from_thresholds(value: float, thresholds: Tuple[float, float, float, float]) -> float:
     t1, t2, t3, t4 = thresholds
     if value >= t4:
@@ -278,11 +288,25 @@ def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.D
     df["geotech_points"] = pd.to_numeric(df.get("geotech_points", 0.0), errors="coerce").fillna(0.0)
     df["piezometers"] = pd.to_numeric(df.get("piezometers", 0.0), errors="coerce").fillna(0.0)
     df["hydro_stations"] = pd.to_numeric(df.get("hydro_stations", 0.0), errors="coerce").fillna(0.0)
+    df["ai_pred_probability"] = pd.to_numeric(df.get("ai_pred_probability", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
+    df["ai_pred_score"] = pd.to_numeric(df.get("ai_pred_score", 0.0), errors="coerce").fillna(0.0)
+    df["ai_soil_fragility"] = pd.to_numeric(df.get("ai_soil_fragility", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
+    if "ai_pred_risk_level" not in df.columns:
+        df["ai_pred_risk_level"] = df["ai_pred_probability"].map(_ai_level_from_probability)
+    df["ai_pred_risk_level"] = df["ai_pred_risk_level"].fillna("INDETERMINE").astype(str)
     df["is_critical"] = (df.get("risk_level", "") == "CRITIQUE").astype(int)
     df["is_high"] = (df.get("risk_level", "") == "ELEVE").astype(int)
     df["is_moderate"] = (df.get("risk_level", "") == "MODERE").astype(int)
-    df["is_watch"] = df.get("under_watch", False).astype(bool).astype(int)
-    df["risk_rank"] = df.get("risk_level", "").map(lambda x: _risk_rank(str(x)))
+    df["is_ai_critical"] = (df.get("ai_pred_risk_level", "") == "CRITIQUE").astype(int)
+    df["is_ai_high"] = (df.get("ai_pred_risk_level", "") == "ELEVE").astype(int)
+    if "under_watch" in df.columns:
+        df["is_watch"] = df["under_watch"].fillna(False).astype(bool).astype(int)
+    else:
+        df["is_watch"] = 0
+    if "risk_level" in df.columns:
+        df["risk_rank"] = df["risk_level"].map(lambda x: _risk_rank(str(x)))
+    else:
+        df["risk_rank"] = 0
 
     grouped = (
         df.groupby(["commune_name", "commune_code", "departement_code", "departement_name"], dropna=False)
@@ -294,6 +318,8 @@ def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.D
             critical=("is_critical", "sum"),
             high=("is_high", "sum"),
             moderate=("is_moderate", "sum"),
+            ai_critical=("is_ai_critical", "sum"),
+            ai_high=("is_ai_high", "sum"),
             watch=("is_watch", "sum"),
             avg_rain_period_mm=("rain_period_mm", "mean"),
             max_rain_period_mm=("rain_period_mm", "max"),
@@ -303,19 +329,22 @@ def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.D
             max_piezometers=("piezometers", "max"),
             avg_hydro_stations=("hydro_stations", "mean"),
             max_hydro_stations=("hydro_stations", "max"),
+            avg_ai_probability=("ai_pred_probability", "mean"),
+            max_ai_probability=("ai_pred_probability", "max"),
+            avg_ai_soil_fragility=("ai_soil_fragility", "mean"),
+            max_ai_soil_fragility=("ai_soil_fragility", "max"),
             latitude=("latitude", "mean"),
             longitude=("longitude", "mean"),
         )
         .reset_index()
     )
 
-    grouped["note_gc"] = (
+    grouped["note_gc_base"] = (
         (grouped["avg_sector_score"] / 4.0) * 68.0
         + ((grouped["critical"] * 12.0 + grouped["high"] * 6.0) / grouped["sector_count"].clip(lower=1))
         + grouped["avg_rain_period_mm"].clip(lower=0.0, upper=180.0) / 9.0
     ).clip(lower=0.0, upper=100.0)
-    grouped["note_gc"] = grouped["note_gc"].round(1)
-    grouped["commune_risk_level"] = grouped["note_gc"].map(_risk_level_from_note)
+    grouped["note_gc_base"] = grouped["note_gc_base"].round(1)
     grouped["latitude"] = pd.to_numeric(grouped.get("latitude"), errors="coerce").round(6)
     grouped["longitude"] = pd.to_numeric(grouped.get("longitude"), errors="coerce").round(6)
 
@@ -333,12 +362,26 @@ def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.D
     grouped["hydro_component_score"] = grouped["max_hydro_stations"].map(
         lambda v: _score_from_presence_count(float(v or 0.0), medium=1.0, high=2.0)
     )
+    grouped["ai_component_score"] = grouped["max_ai_probability"].map(
+        lambda v: 4.0 if float(v or 0.0) >= 0.85 else (3.0 if float(v or 0.0) >= 0.65 else (2.0 if float(v or 0.0) >= 0.40 else 1.0))
+    )
 
     grouped["weather_component_note"] = (grouped["weather_component_score"] / 4.0 * 100.0).round(1)
     grouped["geotech_component_note"] = (grouped["geotech_component_score"] / 4.0 * 100.0).round(1)
     grouped["piezo_component_note"] = (grouped["piezo_component_score"] / 4.0 * 100.0).round(1)
     grouped["hydro_component_note"] = (grouped["hydro_component_score"] / 4.0 * 100.0).round(1)
+    grouped["ai_component_note"] = (grouped["ai_component_score"] / 4.0 * 100.0).round(1)
+
+    grouped["note_gc"] = grouped["note_gc_base"]
+    has_ai_signal = grouped["max_ai_probability"] > 0.0
+    grouped.loc[has_ai_signal, "note_gc"] = (
+        grouped.loc[has_ai_signal, "note_gc_base"] * 0.72
+        + grouped.loc[has_ai_signal, "ai_component_note"] * 0.28
+    ).clip(lower=0.0, upper=100.0)
+    grouped["note_gc"] = grouped["note_gc"].round(1)
     grouped["global_gc_note"] = grouped["note_gc"]
+    grouped["commune_risk_level"] = grouped["note_gc"].map(_risk_level_from_note)
+    grouped["ai_commune_risk_level"] = grouped["max_ai_probability"].map(lambda v: _ai_level_from_probability(float(v or 0.0)))
 
     grouped["lgv_points_count"] = grouped["sector_count"]
     grouped["avg_point_score"] = grouped["avg_sector_score"]
@@ -351,16 +394,21 @@ def _build_map(
     snapshot: Dict[str, object],
     weather_df: pd.DataFrame,
     commune_df: pd.DataFrame,
+    sectors_df: pd.DataFrame,
     hydro_df: pd.DataFrame,
     piezo_df: pd.DataFrame,
     geotech_df: pd.DataFrame,
+    lgv_communes_df: pd.DataFrame,
+    fr_communes_geojson: Dict[str, object],
     rain_col_weather: str,
     min_risk: str,
     show_weather: bool,
     show_communes: bool,
+    show_sectors: bool,
     show_hydro: bool,
     show_piezo: bool,
     show_geotech: bool,
+    show_fr_layer: bool,
 ) -> folium.Map:
     m = folium.Map(location=[46.2, 0.2], zoom_start=7, tiles="CartoDB positron")
 
@@ -417,6 +465,8 @@ def _build_map(
                 f"<b>Code INSEE:</b> {row.get('commune_code', 'n/a')}<br>"
                 f"<b>Risque:</b> {lvl}<br>"
                 f"<b>Note GC:</b> {row.get('note_gc')} /100<br>"
+                f"<b>Prediction IA commune:</b> {row.get('ai_commune_risk_level', 'n/a')}<br>"
+                f"<b>Probabilite IA max:</b> {round(float(row.get('max_ai_probability', 0.0) or 0.0) * 100.0, 1)} %<br>"
                 f"<b>Cumul moyen filtre:</b> {rain_avg:.1f} mm<br>"
                 f"<b>Cumul max filtre:</b> {rain_max:.1f} mm<br>"
                 f"<b>Points LGV dans commune:</b> {lgv_points}"
@@ -432,6 +482,52 @@ def _build_map(
             ).add_to(commune_layer)
         commune_layer.add_to(m)
 
+    if show_sectors and not sectors_df.empty:
+        sectors_layer = folium.FeatureGroup(name="Secteurs IA", show=True)
+        for _, row in sectors_df.iterrows():
+            lvl = str(row.get("ai_pred_risk_level", row.get("risk_level", "INDETERMINE")))
+            if _risk_rank(lvl) < _risk_rank(min_risk):
+                continue
+            lat = pd.to_numeric(row.get("latitude"), errors="coerce")
+            lon = pd.to_numeric(row.get("longitude"), errors="coerce")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            ai_prob_raw = pd.to_numeric(row.get("ai_pred_probability"), errors="coerce")
+            ai_prob = 0.0 if pd.isna(ai_prob_raw) else float(ai_prob_raw)
+            soil_frag_raw = pd.to_numeric(row.get("ai_soil_fragility"), errors="coerce")
+            soil_frag = 0.0 if pd.isna(soil_frag_raw) else float(soil_frag_raw)
+            ai_conf_raw = pd.to_numeric(row.get("ai_confidence"), errors="coerce")
+            ai_conf = 0.0 if pd.isna(ai_conf_raw) else float(ai_conf_raw)
+            top_factors = row.get("ai_top_factors")
+            if isinstance(top_factors, list):
+                top_factors_txt = ", ".join([str(x) for x in top_factors if str(x).strip()]) or "n/a"
+            else:
+                top_factors_txt = str(top_factors or "n/a")
+            popup = (
+                f"<b>Secteur:</b> {row.get('sector_id')}<br>"
+                f"<b>Commune:</b> {row.get('commune_name', 'n/a')}<br>"
+                f"<b>Prediction IA:</b> {lvl}<br>"
+                f"<b>Probabilite IA:</b> {ai_prob * 100.0:.1f}%<br>"
+                f"<b>Score IA:</b> {row.get('ai_pred_score', 'n/a')}/4<br>"
+                f"<b>Confiance IA:</b> {ai_conf * 100.0:.1f}%<br>"
+                f"<b>Fragilite sol:</b> {soil_frag * 100.0:.1f}% ({row.get('ai_dominant_pedology', 'n/a')})<br>"
+                f"<b>Type sol dominant:</b> {row.get('ai_dominant_soil_type', 'n/a')}<br>"
+                f"<b>Pluie 24h/7j/30j:</b> {row.get('weather_max_24h_mm', 0)} / {row.get('weather_max_7d_mm', 0)} / {row.get('weather_max_30d_mm', 0)} mm<br>"
+                f"<b>Facteurs IA:</b> {top_factors_txt}"
+            )
+            radius = max(5, min(14, 5 + ai_prob * 9.0))
+            color = str(row.get("ai_pred_risk_color") or RISK_COLOR.get(lvl, "#6b7280"))
+            folium.CircleMarker(
+                [float(lat), float(lon)],
+                radius=radius,
+                color=color,
+                fill=True,
+                fill_opacity=0.45,
+                weight=2,
+                popup=folium.Popup(popup, max_width=420),
+            ).add_to(sectors_layer)
+        sectors_layer.add_to(m)
+
     if show_hydro and not hydro_df.empty:
         hydro_layer = folium.FeatureGroup(name="Hydro reseau", show=False)
         for _, row in hydro_df.iterrows():
@@ -443,6 +539,9 @@ def _build_map(
                 f"<b>Riviere:</b> {row.get('river_name')}<br>"
                 f"<b>Niveau:</b> {row.get('last_level_m')} m<br>"
                 f"<b>Tendance:</b> {row.get('trend_mph')} m/h<br>"
+                f"<b>Seuil urgence:</b> {row.get('emergency_threshold_m')} m<br>"
+                f"<b>Ratio niveau/seuil:</b> {row.get('threshold_ratio')}<br>"
+                f"<b>Depassement seuil:</b> {row.get('threshold_exceeded')}<br>"
                 f"<b>Risque:</b> {lvl}"
             )
             folium.CircleMarker(
@@ -489,6 +588,8 @@ def _build_map(
             popup = (
                 f"<b>Point:</b> {row.get('point_id')}<br>"
                 f"<b>Sol:</b> {row.get('soil_type')}<br>"
+                f"<b>Pedologie:</b> {row.get('pedology_family')}<br>"
+                f"<b>Lithologie:</b> {row.get('lithology_descr')} ({row.get('lithology_type')})<br>"
                 f"<b>RGA:</b> {row.get('rga_label')}<br>"
                 f"<b>MVT:</b> {row.get('mvt_count')}<br>"
                 f"<b>Risque:</b> {lvl}"
@@ -503,6 +604,56 @@ def _build_map(
                 popup=folium.Popup(popup, max_width=340),
             ).add_to(geo_layer)
         geo_layer.add_to(m)
+
+    if show_fr_layer:
+        fr_layer = folium.FeatureGroup(name="Couche geographique FR", show=False)
+        has_geojson = isinstance(fr_communes_geojson, dict) and isinstance(fr_communes_geojson.get("features"), list) and bool(fr_communes_geojson.get("features"))
+        if has_geojson:
+            first_props = {}
+            first_feature = fr_communes_geojson.get("features", [])[0]
+            if isinstance(first_feature, dict) and isinstance(first_feature.get("properties"), dict):
+                first_props = first_feature.get("properties") or {}
+            alias_map = {
+                "commune_name": "Commune",
+                "commune_code": "Code INSEE",
+                "departement_code": "Departement",
+                "pk_start_km": "PK debut",
+                "pk_end_km": "PK fin",
+                "traversed_km": "Traverse (km)",
+                "order_on_line": "Ordre sur ligne",
+            }
+            tooltip_fields = [f for f in ["commune_name", "commune_code", "departement_code", "pk_start_km", "pk_end_km", "traversed_km"] if f in first_props]
+            tooltip_aliases = [alias_map.get(f, f) for f in tooltip_fields]
+            tooltip = folium.GeoJsonTooltip(fields=tooltip_fields, aliases=tooltip_aliases, localize=True, sticky=False) if tooltip_fields else None
+            folium.GeoJson(
+                fr_communes_geojson,
+                name="Communes traversees",
+                style_function=lambda _: {"color": "#0f766e", "weight": 1.2, "fillColor": "#99f6e4", "fillOpacity": 0.08},
+                highlight_function=lambda _: {"weight": 2.2, "fillOpacity": 0.20},
+                tooltip=tooltip,
+            ).add_to(fr_layer)
+        elif not lgv_communes_df.empty:
+            for _, row in lgv_communes_df.iterrows():
+                lat = pd.to_numeric(row.get("centroid_latitude"), errors="coerce")
+                lon = pd.to_numeric(row.get("centroid_longitude"), errors="coerce")
+                if pd.isna(lat) or pd.isna(lon):
+                    continue
+                popup = (
+                    f"<b>Commune LGV:</b> {row.get('commune_name')}<br>"
+                    f"<b>Code INSEE:</b> {row.get('commune_code')}<br>"
+                    f"<b>Departement:</b> {row.get('departement_code')}<br>"
+                    f"<b>Traverse:</b> {row.get('traversed_km')} km"
+                )
+                folium.CircleMarker(
+                    [float(lat), float(lon)],
+                    radius=4,
+                    color="#0f766e",
+                    fill=True,
+                    fill_opacity=0.60,
+                    weight=1,
+                    popup=folium.Popup(popup, max_width=320),
+                ).add_to(fr_layer)
+        fr_layer.add_to(m)
 
     folium.LayerControl(collapsed=False).add_to(m)
     return m
@@ -538,6 +689,15 @@ hydro_df = _safe_df((snapshot.get("hydro_network") or {}).get("stations"))
 piezo_df = _safe_df((snapshot.get("piezometers") or {}).get("stations"))
 geotech_df = _safe_df((snapshot.get("geotech") or {}).get("points"))
 alerts_df = _safe_df(snapshot.get("alerts"))
+lgv_communes_obj = snapshot.get("lgv_communes") if isinstance(snapshot.get("lgv_communes"), dict) else {}
+lgv_communes_df = _safe_df((lgv_communes_obj or {}).get("communes"))
+fr_geo_obj = snapshot.get("fr_geography") if isinstance(snapshot.get("fr_geography"), dict) else {}
+fr_communes_geojson: Dict[str, object] = {}
+if isinstance(fr_geo_obj.get("communes_geojson"), dict):
+    fr_communes_geojson = fr_geo_obj.get("communes_geojson") or {}
+elif isinstance(lgv_communes_obj.get("communes_geojson"), dict):
+    fr_communes_geojson = lgv_communes_obj.get("communes_geojson") or {}
+metadata_obj = snapshot.get("metadata") if isinstance(snapshot.get("metadata"), dict) else {}
 
 if not weather_df.empty:
     for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "distance_to_lgv_km"]:
@@ -549,10 +709,64 @@ if not weather_df.empty:
     weather_df["station_commune_name"] = weather_df["station_commune_name"].fillna("Inconnue")
 
 if not sectors_df.empty:
-    for col in ["score", "weather_max_24h_mm", "weather_max_7d_mm", "weather_max_30d_mm", "weather_max_month_mm"]:
+    for col in [
+        "score",
+        "weather_max_24h_mm",
+        "weather_max_7d_mm",
+        "weather_max_30d_mm",
+        "weather_max_month_mm",
+        "ai_pred_probability",
+        "ai_pred_score",
+        "ai_confidence",
+        "ai_soil_fragility",
+    ]:
         if col in sectors_df.columns:
             sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
     sectors_df["commune_name"] = sectors_df.get("commune_name", "Inconnue").fillna("Inconnue")
+    if "ai_pred_probability" not in sectors_df.columns:
+        sectors_df["ai_pred_probability"] = (
+            pd.to_numeric(sectors_df.get("score", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0) / 4.0
+        ).clip(lower=0.0, upper=1.0)
+    else:
+        sectors_df["ai_pred_probability"] = pd.to_numeric(sectors_df["ai_pred_probability"], errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
+    if "ai_pred_score" not in sectors_df.columns:
+        sectors_df["ai_pred_score"] = (sectors_df["ai_pred_probability"] * 3.0 + 1.0).round(2)
+    if "ai_pred_risk_level" not in sectors_df.columns:
+        sectors_df["ai_pred_risk_level"] = sectors_df["ai_pred_probability"].map(lambda v: _ai_level_from_probability(float(v or 0.0)))
+    sectors_df["ai_pred_risk_level"] = sectors_df["ai_pred_risk_level"].fillna("INDETERMINE").astype(str)
+    if "ai_pred_risk_color" not in sectors_df.columns:
+        sectors_df["ai_pred_risk_color"] = sectors_df["ai_pred_risk_level"].map(lambda lvl: RISK_COLOR.get(str(lvl), "#6b7280"))
+    if "ai_soil_fragility" not in sectors_df.columns:
+        sectors_df["ai_soil_fragility"] = 0.55
+    sectors_df["ai_soil_fragility"] = pd.to_numeric(sectors_df["ai_soil_fragility"], errors="coerce").fillna(0.55).clip(lower=0.0, upper=1.0)
+    if "ai_dominant_pedology" not in sectors_df.columns:
+        sectors_df["ai_dominant_pedology"] = "Pedologie indeterminee"
+    sectors_df["ai_dominant_pedology"] = sectors_df["ai_dominant_pedology"].fillna("Pedologie indeterminee").astype(str)
+    if "ai_dominant_soil_type" not in sectors_df.columns:
+        sectors_df["ai_dominant_soil_type"] = "Sols indetermines"
+    sectors_df["ai_dominant_soil_type"] = sectors_df["ai_dominant_soil_type"].fillna("Sols indetermines").astype(str)
+    if "ai_top_factors" not in sectors_df.columns:
+        sectors_df["ai_top_factors"] = [[] for _ in range(len(sectors_df))]
+
+if not hydro_df.empty:
+    for col in ["last_level_m", "trend_mph", "emergency_threshold_m", "watch_threshold_m", "threshold_ratio", "distance_to_lgv_km"]:
+        if col in hydro_df.columns:
+            hydro_df[col] = pd.to_numeric(hydro_df[col], errors="coerce")
+    if "threshold_exceeded" not in hydro_df.columns:
+        hydro_df["threshold_exceeded"] = False
+    hydro_df["threshold_exceeded"] = hydro_df["threshold_exceeded"].fillna(False).astype(bool)
+    if "risk_level" not in hydro_df.columns:
+        hydro_df["risk_level"] = "INDETERMINE"
+
+if not geotech_df.empty:
+    if "pedology_family" not in geotech_df.columns:
+        geotech_df["pedology_family"] = "Pedologie indeterminee"
+    geotech_df["pedology_family"] = geotech_df["pedology_family"].fillna("Pedologie indeterminee")
+
+if not lgv_communes_df.empty:
+    for col in ["pk_start_km", "pk_end_km", "traversed_km", "order_on_line", "centroid_latitude", "centroid_longitude"]:
+        if col in lgv_communes_df.columns:
+            lgv_communes_df[col] = pd.to_numeric(lgv_communes_df[col], errors="coerce")
 
 if not alerts_df.empty and "level" in alerts_df.columns:
     alerts_df["rank"] = alerts_df["level"].map(lambda x: _risk_rank(str(x))).fillna(0)
@@ -567,6 +781,7 @@ with st.sidebar:
     period_label = st.selectbox("Periode pluvio", list(RAIN_PERIODS.keys()), index=0)
     rain_col_weather, commune_rain_col = RAIN_PERIODS[period_label]
     min_risk = st.selectbox("Risque minimum", ["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=1)
+    sector_risk_mode = st.selectbox("Filtre secteurs", ["IA predictive", "Operationnel"], index=0)
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
     selected_sources = st.multiselect("Sources meteo", sources, default=sources)
@@ -586,9 +801,11 @@ with st.sidebar:
     st.markdown("---")
     show_weather = st.checkbox("Layer meteo", value=True)
     show_communes = st.checkbox("Layer communes", value=True)
+    show_sectors = st.checkbox("Layer secteurs IA", value=True)
     show_hydro = st.checkbox("Layer hydro", value=True)
     show_piezo = st.checkbox("Layer piezometres", value=False)
     show_geotech = st.checkbox("Layer geotech", value=False)
+    show_fr_layer = st.checkbox("Layer geographie FR", value=False)
 
 filtered_weather = weather_df.copy()
 if not filtered_weather.empty and selected_sources:
@@ -602,7 +819,10 @@ filtered_sectors = sectors_df.copy()
 if not filtered_sectors.empty and selected_communes:
     filtered_sectors = filtered_sectors[filtered_sectors["commune_name"].astype(str).isin(selected_communes)]
 if not filtered_sectors.empty:
-    filtered_sectors = filtered_sectors[filtered_sectors["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+    sector_risk_col = "risk_level"
+    if sector_risk_mode.startswith("IA") and "ai_pred_risk_level" in filtered_sectors.columns:
+        sector_risk_col = "ai_pred_risk_level"
+    filtered_sectors = filtered_sectors[filtered_sectors[sector_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
 commune_df = _aggregate_communes(filtered_sectors, commune_rain_col)
 if not commune_df.empty:
@@ -666,12 +886,24 @@ history_clim_df = _safe_df(history_payload.get("climatology"))
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
 score = float(snapshot.get("score", 0.0) or 0.0)
 
-col1, col2, col3, col4, col5 = st.columns(5)
+hydro_exceeded_count = int(hydro_df["threshold_exceeded"].sum()) if (not hydro_df.empty and "threshold_exceeded" in hydro_df.columns) else 0
+total_lgv_communes = int(len(lgv_communes_df)) if not lgv_communes_df.empty else int(len(commune_df))
+ai_critical_count = int((filtered_sectors.get("ai_pred_risk_level", pd.Series(dtype=str)) == "CRITIQUE").sum()) if not filtered_sectors.empty else 0
+fragile_soil_count = (
+    int((pd.to_numeric(filtered_sectors.get("ai_soil_fragility", 0.0), errors="coerce").fillna(0.0) >= 0.70).sum())
+    if not filtered_sectors.empty
+    else 0
+)
+
+col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
 col1.metric("Risque global", risk_level)
 col2.metric("Score global", f"{score:.2f}/4")
 col3.metric("Stations meteo", int(len(filtered_weather)))
 col4.metric("Points LGV filtres", int(len(filtered_sectors)))
-col5.metric("Communes suivies", int(len(commune_df)))
+col5.metric("Communes traversees LGV", total_lgv_communes)
+col6.metric("Hydro seuil urgence", hydro_exceeded_count)
+col7.metric("Secteurs IA critiques", ai_critical_count)
+col8.metric("Secteurs sols fragiles", fragile_soil_count)
 
 tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes", "Metadata"])
 
@@ -705,6 +937,8 @@ with tabs[0]:
                         "geotech_component_note",
                         "piezo_component_note",
                         "hydro_component_note",
+                        "ai_component_note",
+                        "max_ai_probability",
                         "lgv_points_count",
                     ],
                 )
@@ -764,6 +998,7 @@ with tabs[0]:
             "geotech_component_note": "Risque geotechnique",
             "piezo_component_note": "Risque nappes (piezo)",
             "hydro_component_note": "Risque hydro",
+            "ai_component_note": "Risque IA pluie+sol",
             "note_gc": "Note GC globale",
         }
         comp_cols = ["commune_label"] + list(component_map.keys())
@@ -783,6 +1018,7 @@ with tabs[0]:
             "Risque geotechnique",
             "Risque nappes (piezo)",
             "Risque hydro",
+            "Risque IA pluie+sol",
             "Note GC globale",
         ]
         heatmap = (
@@ -805,6 +1041,70 @@ with tabs[0]:
             )
         )
         st.altair_chart(heatmap, use_container_width=True)
+
+    st.subheader("Predictions IA par secteur (pluie + type de sol)")
+    if filtered_sectors.empty:
+        st.info("Pas de secteur filtre pour le modele IA.")
+    else:
+        ai_view = filtered_sectors.copy()
+        ai_view["ai_pred_probability"] = pd.to_numeric(ai_view.get("ai_pred_probability", 0.0), errors="coerce").fillna(0.0).clip(lower=0.0, upper=1.0)
+        ai_view["ai_probability_pct"] = (ai_view["ai_pred_probability"] * 100.0).round(1)
+        if "ai_pred_risk_level" not in ai_view.columns:
+            ai_view["ai_pred_risk_level"] = ai_view["ai_pred_probability"].map(lambda v: _ai_level_from_probability(float(v or 0.0)))
+        ai_chart_df = ai_view.sort_values("ai_pred_probability", ascending=False).head(40).copy()
+        ai_chart_df["sector_label"] = ai_chart_df["sector_id"].astype(str) + " - " + ai_chart_df["commune_name"].astype(str)
+        ai_chart = (
+            alt.Chart(ai_chart_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("ai_probability_pct:Q", title="Probabilite IA (%)"),
+                y=alt.Y("sector_label:N", sort="-x", title="Secteur"),
+                color=alt.Color(
+                    "ai_pred_risk_level:N",
+                    scale=alt.Scale(
+                        domain=["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"],
+                        range=[RISK_COLOR["FAIBLE"], RISK_COLOR["MODERE"], RISK_COLOR["ELEVE"], RISK_COLOR["CRITIQUE"]],
+                    ),
+                    legend=alt.Legend(title="Risque IA"),
+                ),
+                tooltip=[
+                    "sector_id",
+                    "commune_name",
+                    "ai_pred_risk_level",
+                    "ai_probability_pct",
+                    "ai_soil_fragility",
+                    "ai_dominant_pedology",
+                    "ai_dominant_soil_type",
+                    "weather_max_24h_mm",
+                    "weather_max_7d_mm",
+                    "weather_max_30d_mm",
+                ],
+            )
+        )
+        st.altair_chart(ai_chart, use_container_width=True)
+
+    st.subheader("Profil pedologique LGV (points geotechniques)")
+    if geotech_df.empty or "pedology_family" not in geotech_df.columns:
+        st.info("Pedologie indisponible dans ce snapshot.")
+    else:
+        pedo = (
+            geotech_df["pedology_family"]
+            .fillna("Pedologie indeterminee")
+            .astype(str)
+            .value_counts()
+            .rename_axis("pedology_family")
+            .reset_index(name="count")
+        )
+        pedo_chart = (
+            alt.Chart(pedo)
+            .mark_bar()
+            .encode(
+                x=alt.X("count:Q", title="Nombre de points"),
+                y=alt.Y("pedology_family:N", sort="-x", title="Famille pedologique"),
+                tooltip=["pedology_family", "count"],
+            )
+        )
+        st.altair_chart(pedo_chart, use_container_width=True)
 
     st.subheader("Top stations meteo")
     if filtered_weather.empty or rain_col_weather not in filtered_weather.columns:
@@ -914,12 +1214,16 @@ with tabs[0]:
         commune_name = str(selected_commune.get("commune_name") or "Inconnue")
         commune_code = str(selected_commune.get("commune_code") or "N/A")
 
-        s1, s2, s3, s4, s5 = st.columns(5)
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
         s1.metric("Commune", commune_name)
         s2.metric("Code INSEE", commune_code)
         s3.metric("Risque commune", str(selected_commune.get("commune_risk_level", "INDETERMINE")))
         s4.metric("Note GC globale", f"{float(selected_commune.get('note_gc', 0.0)):.1f}/100")
         s5.metric("Points LGV", int(float(selected_commune.get("lgv_points_count", 0) or 0)))
+        s6.metric(
+            "Risque IA commune",
+            f"{selected_commune.get('ai_commune_risk_level', 'INDETERMINE')} ({float(selected_commune.get('max_ai_probability', 0.0) or 0.0) * 100.0:.0f}%)",
+        )
 
         nearest_weather = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
         nearest_hydro = _nearest_row(hydro_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
@@ -1007,23 +1311,28 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Carte multi-couches")
-    if commune_df.empty and filtered_weather.empty:
+    if commune_df.empty and filtered_weather.empty and filtered_sectors.empty and lgv_communes_df.empty:
         st.info("Pas de donnees cartographiques avec ces filtres.")
     else:
         m = _build_map(
             snapshot=snapshot,
             weather_df=filtered_weather,
             commune_df=commune_df,
+            sectors_df=filtered_sectors,
             hydro_df=hydro_df,
             piezo_df=piezo_df,
             geotech_df=geotech_df,
+            lgv_communes_df=lgv_communes_df,
+            fr_communes_geojson=fr_communes_geojson,
             rain_col_weather=rain_col_weather,
             min_risk=min_risk,
             show_weather=show_weather,
             show_communes=show_communes,
+            show_sectors=show_sectors,
             show_hydro=show_hydro,
             show_piezo=show_piezo,
             show_geotech=show_geotech,
+            show_fr_layer=show_fr_layer,
         )
         st_folium(m, height=680, use_container_width=True)
 
@@ -1041,15 +1350,21 @@ with tabs[2]:
                     "lgv_points_count",
                     "note_gc",
                     "commune_risk_level",
+                    "ai_commune_risk_level",
                     "weather_component_note",
                     "geotech_component_note",
                     "piezo_component_note",
                     "hydro_component_note",
+                    "ai_component_note",
+                    "avg_ai_probability",
+                    "max_ai_probability",
                     "avg_point_score",
                     "max_point_score",
                     "critical",
                     "high",
                     "moderate",
+                    "ai_critical",
+                    "ai_high",
                     "avg_rain_period_mm",
                     "max_rain_period_mm",
                 ]
@@ -1071,10 +1386,15 @@ with tabs[2]:
             "geotech_points",
             "piezometers",
             "hydro_stations",
+            "ai_pred_risk_level",
+            "ai_pred_probability",
+            "ai_soil_fragility",
+            "ai_dominant_pedology",
             "under_watch",
         ]
         present_cols = [c for c in view_cols if c in filtered_sectors.columns]
-        st.dataframe(filtered_sectors[present_cols].sort_values("score", ascending=False), use_container_width=True, hide_index=True)
+        sort_col = "ai_pred_probability" if "ai_pred_probability" in filtered_sectors.columns else "score"
+        st.dataframe(filtered_sectors[present_cols].sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
 
     st.subheader("Stations meteo filtrees (commune/station)")
     if filtered_weather.empty:
@@ -1094,6 +1414,55 @@ with tabs[2]:
         wx_cols = [c for c in wx_cols if c in filtered_weather.columns]
         st.dataframe(filtered_weather[wx_cols].sort_values("rain_24h_mm", ascending=False), use_container_width=True, hide_index=True)
 
+    st.subheader("Cours d'eau et ruisseaux - hauteurs et seuils d'urgence")
+    if hydro_df.empty:
+        st.info("Aucune station hydro reseau disponible.")
+    else:
+        hydro_view_cols = [
+            "station_code",
+            "station_name",
+            "river_name",
+            "distance_to_lgv_km",
+            "last_level_m",
+            "trend_mph",
+            "watch_threshold_m",
+            "emergency_threshold_m",
+            "threshold_ratio",
+            "threshold_exceeded",
+            "risk_level",
+            "last_obs_utc",
+        ]
+        hydro_view_cols = [c for c in hydro_view_cols if c in hydro_df.columns]
+        hydro_view = hydro_df[hydro_view_cols].copy()
+        if "threshold_ratio" in hydro_view.columns:
+            hydro_view = hydro_view.sort_values("threshold_ratio", ascending=False, na_position="last")
+        st.dataframe(hydro_view, use_container_width=True, hide_index=True)
+
+    st.subheader("Communes traversees par la LGV SEA (liste exhaustive)")
+    if lgv_communes_df.empty:
+        st.info("Liste exhaustive des communes indisponible dans ce snapshot.")
+    else:
+        lgvc_cols = [
+            "order_on_line",
+            "commune_name",
+            "commune_code",
+            "departement_code",
+            "departement_name",
+            "pk_start_km",
+            "pk_end_km",
+            "traversed_km",
+            "sample_count",
+        ]
+        lgvc_cols = [c for c in lgvc_cols if c in lgv_communes_df.columns]
+        lgv_view = lgv_communes_df[lgvc_cols].copy()
+        if "order_on_line" in lgv_view.columns:
+            lgv_view = lgv_view.sort_values("order_on_line", na_position="last")
+        st.dataframe(
+            lgv_view,
+            use_container_width=True,
+            hide_index=True,
+        )
+
     st.subheader("Alertes actives")
     if alerts_df.empty:
         st.success("Aucune alerte active.")
@@ -1109,70 +1478,90 @@ with tabs[2]:
         st.info("Pas de recommandation disponible.")
 
 with tabs[3]:
-    st.subheader("Fonctionnement general")
+    st.subheader("Resume technique")
+    line_meta = metadata_obj.get("line_monitoring", {}) if isinstance(metadata_obj.get("line_monitoring"), dict) else {}
+    st.write(
+        {
+            "line_name": line_meta.get("line_name", "LGV SEA"),
+            "line_length_km": line_meta.get("line_length_km"),
+            "communes_traversees": int(len(lgv_communes_df)) if not lgv_communes_df.empty else None,
+            "risk_level_global": snapshot.get("risk_level"),
+            "score_global": snapshot.get("score"),
+        }
+    )
+
+    st.subheader("Methodes de calcul")
+    methods_meta = metadata_obj.get("calculation_methods", {}) if isinstance(metadata_obj.get("calculation_methods"), dict) else {}
+    if methods_meta:
+        methods_df = pd.DataFrame(
+            [{"bloc": str(k), "methode": str(v)} for k, v in methods_meta.items()]
+        )
+        st.dataframe(methods_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucune metadata de methode disponible.")
+
+    st.subheader("Modele IA sectoriel")
+    sectors_obj = snapshot.get("sectors") if isinstance(snapshot.get("sectors"), dict) else {}
+    ai_model_meta = sectors_obj.get("ai_model") if isinstance(sectors_obj.get("ai_model"), dict) else {}
+    if ai_model_meta:
+        st.write(ai_model_meta)
+    else:
+        st.info("Metadata IA non disponible dans ce snapshot.")
+
+    st.subheader("Sources de donnees")
+    sources_meta = metadata_obj.get("sources", [])
+    if isinstance(sources_meta, list) and sources_meta:
+        src_df = pd.DataFrame(sources_meta)
+        cols = [c for c in ["id", "label", "usage", "url"] if c in src_df.columns]
+        st.dataframe(src_df[cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucune liste de sources structuree disponible.")
+
+    st.subheader("Frequence de mise a jour")
+    update_meta = metadata_obj.get("update_frequency", {}) if isinstance(metadata_obj.get("update_frequency"), dict) else {}
+    if update_meta:
+        st.write(update_meta)
+    else:
+        st.info("Frequence de MAJ non renseignee dans le snapshot.")
+
+    st.subheader("Couche geographique FR")
+    fr_summary = {}
+    if isinstance(fr_geo_obj.get("summary"), dict):
+        fr_summary = fr_geo_obj.get("summary") or {}
+    elif isinstance(lgv_communes_obj.get("summary"), dict):
+        fr_summary = lgv_communes_obj.get("summary") or {}
+    fr_feature_count = 0
+    if isinstance(fr_communes_geojson, dict) and isinstance(fr_communes_geojson.get("features"), list):
+        fr_feature_count = int(len(fr_communes_geojson.get("features", [])))
+    st.write(
+        {
+            "geojson_communes_count": fr_feature_count,
+            "departements_ref": lgv_communes_obj.get("departements_ref"),
+            "summary": fr_summary,
+        }
+    )
+
+    st.subheader("Sources pluviometres recommandees")
+    pluviometer_candidates = metadata_obj.get("pluviometer_sources_candidates", [])
+    if isinstance(pluviometer_candidates, list) and pluviometer_candidates:
+        psrc_df = pd.DataFrame(pluviometer_candidates)
+        cols = [c for c in ["label", "notes", "url"] if c in psrc_df.columns]
+        st.dataframe(psrc_df[cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("Aucune recommandation pluviometre disponible.")
+
+    st.subheader("Limites et hypotheses")
     st.markdown(
         """
-        Cette application est construite pour le suivi d'une ligne de **300 km**:
-        - **Niveau 1 (mesure actuelle)**: dernier etat meteo/hydro/nappes/geotech.
-        - **Niveau 2 (pilotage communal)**: agregation des points LGV par commune traversee.
-        - **Niveau 3 (vision historique)**: comparaison mensuelle multi-annees entre communes.
-        - **Niveau 4 (decision territoriale)**: note GC par commune traversee.
+        - Le chainage communal est **approximatif** (echantillonnage le long de la ligne).
+        - La pedologie BRGM est issue d'une carte **1:1 000 000** (usage macro-territorial).
+        - Les seuils hydro d'urgence dependent de la disponibilite des seuils publics par station.
+        - Le modele IA pluie/sol est un outil d'aide a la priorisation, pas une decision autonome.
+        - Les decisions travaux doivent etre confirmees par expertise terrain et inspection OA.
         """
     )
 
-    st.subheader("Logique des stations meteo")
-    st.markdown(
-        """
-        - Les points meteo sont associes au corridor LGV, avec distance a la ligne.
-        - Modele prioritaire: **Open-Meteo MeteoFrance Seamless** (maillage fin), fallback modele par defaut si indisponible.
-        - Chaque point meteo est rattache a la **commune station** (geocodage inverse) pour comparaison territoriale.
-        - Cumuls suivis: **24h**, **7 jours**, **30 jours**, **mois courant**.
-        - Historique mensuel: **5 dernieres annees** via Open-Meteo Archive, filtrable par periode.
-        """
-    )
-
-    st.subheader("Score GC et notes")
-    st.markdown(
-        """
-        - **Composantes de risque separees par commune**:
-          - `Risque pluie`: derive du cumul pluie moyen de la periode filtree.
-          - `Risque geotechnique`: derive de la densite de points geotechniques proches.
-          - `Risque nappes (piezo)`: derive de la densite de piezometres proches.
-          - `Risque hydro`: derive de la densite de stations hydro proches.
-        - **Note GC commune (0-100)**:
-          - base = `(score moyen points LGV / 4) * 68`
-          - + majoration points LGV critiques/eleves
-          - + signal pluie moyen sur la periode
-          - borne entre 0 et 100.
-        - Seuils de lecture de la note GC:
-          - `< 40`: faible
-          - `40-59`: modere
-          - `60-79`: eleve
-          - `>= 80`: critique
-        """
-    )
-
-    st.subheader("Donnees ajoutees et comparables")
-    st.markdown(
-        """
-        - Comparaison **inter-communes** des pluies mensuelles sur 5 ans.
-        - Filtre de date mensuel (debut/fin) pour isoler des saisons ou annees hydrologiques.
-        - Tableau des **dernieres mesures meteo proches** par commune comparee.
-        - Affichage des composantes de risque **separees** puis de la **note GC globale**.
-        """
-    )
-
-    st.subheader("Pistes de donnees complementaires (open data)")
-    st.markdown(
-        """
-        Donnees candidates pour renforcer encore la precision de surveillance:
-        - Vigilance pluie/inondation et orages (Meteo-France) pour anticipation operationnelle.
-        - Donnees radar precipitation (si acces disponible) pour pluie localisee tres fine.
-        - Inventaires de desordres geotechniques locaux et inspections OA terrain (SI interne).
-        """
-    )
-
-    st.subheader("Donnees et fraicheur")
+    st.subheader("Fraicheur des donnees")
     st.write(
         {
             "snapshot_timestamp_utc": snapshot.get("timestamp_utc"),
@@ -1180,6 +1569,9 @@ with tabs[3]:
             "weather_notice": snapshot.get("weather_notice"),
             "history_model": history_payload.get("model"),
             "history_models_compare": history_models,
+            "ai_model": ai_model_meta,
+            "fr_geojson_features": int(len(fr_communes_geojson.get("features", []))) if isinstance(fr_communes_geojson, dict) and isinstance(fr_communes_geojson.get("features"), list) else 0,
+            "metadata_present": bool(metadata_obj),
         }
     )
 

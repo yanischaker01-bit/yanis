@@ -44,11 +44,15 @@ streamlit run streamlit_lgv_pro.py
 
 Fonctions:
 - filtres interactifs (periode pluvio, niveau de risque, source, communes)
-- carte dynamique multicouche (LGV, meteo, secteurs, hydro, piezometres, geotech)
+- carte dynamique multicouche (LGV, meteo, secteurs IA, hydro, piezometres, geotech, couche geographique FR)
 - classement professionnel par commune (note GC /100)
+- liste exhaustive des communes traversees par la LGV SEA (ordre PK)
+- pedologie enrichie (argileux/calcaire/alluvial...) sur points geotechniques
+- prediction IA sectorielle du risque (pluie + fragilite des sols) avec probabilite par secteur
+- suivi hauteurs cours d'eau et ruisseaux avec seuils d'urgence par station (si disponibles)
 - tableaux d'alertes et recommandations
 - suivi historique meteo mensuel multi-annees par secteur
-- onglet Metadata (logique stations, scores GC, fonctionnement global)
+- onglet Metadata detaille (methodes de calcul, sources, frequence de MAJ, limites)
 - comparaison pluvio inter-secteurs avec filtre date mensuel (5 ans)
 - rattachement des stations meteo a leur commune
 
@@ -79,3 +83,4 @@ Le projet force `streamlit==1.54.0` et `altair==5.5.0` pour compatibilite Cloud 
 - Avec un filtre strict a 1 km, il peut n'y avoir aucune station SYNOP.
 - Tant que `station_code` est vide pour un cours d'eau, l'hydrometrie reste non disponible.
 - Les distances sont calculees avec une approximation plane (suffisant pour un MVP operationnel).
+- Le modele IA pluie/sol est un outil d'aide a la priorisation, a confirmer par expertise terrain.

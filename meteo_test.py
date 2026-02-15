@@ -3,19 +3,34 @@ import html
 import json
 import logging
 import math
+import numbers
 import os
+import re
 import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from io import StringIO
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
 
 import pandas as pd
 import requests
 import schedule
+
+try:
+    from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, mapping, shape
+    from shapely.strtree import STRtree
+except Exception:  # pragma: no cover - optional runtime guard
+    LineString = None
+    MultiLineString = None
+    MultiPolygon = None
+    Point = None
+    Polygon = None
+    mapping = None
+    STRtree = None
+    shape = None
 
 
 logging.basicConfig(
@@ -71,6 +86,7 @@ class LGVSeaMonitor:
         self.soil_mvt_radius_m = 3000
         self.soil_mvt_page_size = 20
         self.soil_cache_hours = 24
+        self.pedology_max_features = 1200
         self.piezometer_corridor_km = 5.0
         self.piezometer_max_stations = 25
         self.piezometer_history_days = 90
@@ -79,8 +95,24 @@ class LGVSeaMonitor:
         self.hydro_network_max_stations = 35
         self.hydro_network_hours = 48
         self.hydro_network_cache_hours = 6
+        self.hydro_threshold_cache_hours = 24
         self.sector_length_km = 25.0
         self.sector_radius_km = 10.0
+        self.lgv_commune_sample_step_km = 0.2
+        self.lgv_communes_cache_days = 30
+        self.lgv_reference_departements = ["33", "24", "16", "86", "37"]
+        self.ai_model_name = "LGV-SEA-RiskAI-v1"
+        self.ai_model_version = "2026.02"
+        self.pedology_fragility_index: Dict[str, float] = {
+            "Argileux": 0.92,
+            "Alluvial": 0.84,
+            "Limoneux": 0.71,
+            "Calcaire / marneux": 0.67,
+            "Sableux": 0.52,
+            "Rocheux cristallin": 0.38,
+            "Autres lithologies": 0.58,
+            "Pedologie indeterminee": 0.55,
+        }
 
         self.river_points: List[RiverMonitoringPoint] = [
             RiverMonitoringPoint("Dordogne", "Dordogne - secteur OA LGV", 44.90, -0.25, None, 3.0, 0.15),
@@ -115,6 +147,10 @@ class LGVSeaMonitor:
         self.hydro_network_cache_file = os.path.join("data", "hydro_network_cache.json")
         self.commune_cache_file = os.path.join("data", "commune_cache.json")
         self.commune_cache = self._load_commune_cache()
+        self.hydro_threshold_cache_file = os.path.join("data", "hydro_threshold_cache.json")
+        self.hydro_threshold_cache = self._load_hydro_threshold_cache()
+        self.lgv_communes_cache_file = os.path.join("data", "lgv_communes_cache.json")
+        self._lithology_index_cache: Optional[Dict[str, Any]] = None
 
     def _now_utc(self) -> datetime:
         return datetime.now(timezone.utc)
@@ -219,6 +255,76 @@ class LGVSeaMonitor:
                 dedup.append(points[-1])
         return dedup[:max_points]
 
+    def _representative_lgv_line(self) -> List[Tuple[float, float]]:
+        if not self.lgv_lines_latlon:
+            return list(self.default_lgv_coordinates_latlon)
+        return list(
+            max(
+                self.lgv_lines_latlon,
+                key=lambda line: self._line_length_km(line) if len(line) >= 2 else 0.0,
+            )
+        )
+
+    def _sample_line_with_chainage(
+        self,
+        line: List[Tuple[float, float]],
+        step_km: float,
+    ) -> List[Dict[str, float]]:
+        if len(line) < 2:
+            return []
+
+        vertices: List[Tuple[float, float, float]] = []
+        cumulative = 0.0
+        vertices.append((float(line[0][0]), float(line[0][1]), cumulative))
+        for idx in range(len(line) - 1):
+            a_lat, a_lon = line[idx]
+            b_lat, b_lon = line[idx + 1]
+            cumulative += self._haversine_km(float(a_lat), float(a_lon), float(b_lat), float(b_lon))
+            vertices.append((float(b_lat), float(b_lon), cumulative))
+
+        if cumulative <= 0:
+            return [{"latitude": float(line[0][0]), "longitude": float(line[0][1]), "pk_km": 0.0}]
+
+        targets: List[float] = []
+        step = max(float(step_km), 0.05)
+        cur = 0.0
+        while cur < cumulative:
+            targets.append(round(cur, 6))
+            cur += step
+        targets.append(round(cumulative, 6))
+
+        samples: List[Dict[str, float]] = []
+        seg_idx = 0
+        for target in targets:
+            while seg_idx < len(vertices) - 2 and vertices[seg_idx + 1][2] < target:
+                seg_idx += 1
+
+            lat_a, lon_a, km_a = vertices[seg_idx]
+            lat_b, lon_b, km_b = vertices[seg_idx + 1]
+            denom = max(km_b - km_a, 1e-9)
+            ratio = max(0.0, min(1.0, (target - km_a) / denom))
+            lat = lat_a + (lat_b - lat_a) * ratio
+            lon = lon_a + (lon_b - lon_a) * ratio
+            samples.append(
+                {
+                    "latitude": round(float(lat), 6),
+                    "longitude": round(float(lon), 6),
+                    "pk_km": round(float(target), 3),
+                }
+            )
+        return samples
+
+    def _lgv_lines_fingerprint(self) -> str:
+        chunks: List[str] = []
+        for line in self.lgv_lines_latlon:
+            if not isinstance(line, list):
+                continue
+            chunks.append(str(len(line)))
+            if line:
+                chunks.append(f"{line[0][0]:.5f},{line[0][1]:.5f}")
+                chunks.append(f"{line[-1][0]:.5f},{line[-1][1]:.5f}")
+        return "|".join(chunks)
+
     def _bbox_from_lgv_lines(self, pad_deg: float = 0.08) -> Tuple[float, float, float, float]:
         points = [pt for line in self.lgv_lines_latlon for pt in line]
         if not points:
@@ -249,6 +355,210 @@ class LGVSeaMonitor:
             return payload
         except Exception:
             return None
+
+    @staticmethod
+    def _pedology_family_from_lithology(descr: str, litho_type: str) -> str:
+        txt = f"{descr} {litho_type}".lower()
+        if any(k in txt for k in ["calcaire", "craie", "dolomie", "marne"]):
+            return "Calcaire / marneux"
+        if "argil" in txt:
+            return "Argileux"
+        if any(k in txt for k in ["sable", "gres"]):
+            return "Sableux"
+        if any(k in txt for k in ["limon", "loess"]):
+            return "Limoneux"
+        if any(k in txt for k in ["alluvion", "alluvial", "grave"]):
+            return "Alluvial"
+        if any(k in txt for k in ["schiste", "gneiss", "granit", "metamorph"]):
+            return "Rocheux cristallin"
+        if txt.strip():
+            return "Autres lithologies"
+        return "Pedologie indeterminee"
+
+    def _parse_brgm_polygon_from_poslist(self, pos_txt: str) -> Optional[object]:
+        if Polygon is None:
+            return None
+        try:
+            vals = [float(x) for x in str(pos_txt).split()]
+        except Exception:
+            return None
+        if len(vals) < 6 or len(vals) % 2 != 0:
+            return None
+
+        coords: List[Tuple[float, float]] = []
+        for i in range(0, len(vals), 2):
+            lat = vals[i]
+            lon = vals[i + 1]
+            coords.append((float(lon), float(lat)))
+
+        if len(coords) < 3:
+            return None
+        try:
+            geom = Polygon(coords)
+            if geom.is_empty:
+                return None
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            return geom if geom is not None and not geom.is_empty else None
+        except Exception:
+            return None
+
+    def _fetch_brgm_lithology_index(self) -> Dict[str, object]:
+        if self._lithology_index_cache is not None:
+            return self._lithology_index_cache
+        if STRtree is None or Point is None or Polygon is None or MultiPolygon is None:
+            self._lithology_index_cache = {"features": [], "tree": None, "geom_lookup": {}}
+            return self._lithology_index_cache
+
+        min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=0.12)
+        params = {
+            "SERVICE": "WFS",
+            "VERSION": "1.1.0",
+            "REQUEST": "GetFeature",
+            "TYPENAME": "ms:LITHO_1M_SIMPLIFIEE",
+            "SRSNAME": "EPSG:4326",
+            "BBOX": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+            "MAXFEATURES": str(self.pedology_max_features),
+        }
+        try:
+            response = self.session.get(
+                "https://geoservices.brgm.fr/geologie?",
+                params=params,
+                timeout=40,
+            )
+            if response.status_code != 200 or not response.text.strip():
+                self._lithology_index_cache = {"features": [], "tree": None, "geom_lookup": {}}
+                return self._lithology_index_cache
+
+            root = ET.fromstring(response.text)
+            ns = {
+                "ms": "http://mapserver.gis.umn.edu/mapserver",
+                "gml": "http://www.opengis.net/gml",
+            }
+            features: List[Dict[str, object]] = []
+            geometries: List[object] = []
+            for node in root.findall(".//gml:featureMember/ms:LITHO_1M_SIMPLIFIEE", ns):
+                descr = str(node.findtext("ms:DESCR", default="", namespaces=ns) or "").strip()
+                litho_type = str(node.findtext("ms:TYPE", default="", namespaces=ns) or "").strip()
+                code_geol = str(node.findtext("ms:CODE_GEOL", default="", namespaces=ns) or "").strip()
+
+                polys: List[object] = []
+                for pos in node.findall(".//gml:Polygon//gml:exterior/gml:LinearRing/gml:posList", ns):
+                    if pos is None or not str(pos.text or "").strip():
+                        continue
+                    poly = self._parse_brgm_polygon_from_poslist(str(pos.text))
+                    if poly is not None:
+                        polys.append(poly)
+                if not polys:
+                    continue
+
+                try:
+                    geom = polys[0] if len(polys) == 1 else MultiPolygon(polys)
+                except Exception:
+                    continue
+                if geom is None or geom.is_empty:
+                    continue
+
+                pedology_family = self._pedology_family_from_lithology(descr, litho_type)
+                geometries.append(geom)
+                features.append(
+                    {
+                        "geometry": geom,
+                        "descr": descr,
+                        "lithology_type": litho_type,
+                        "code_geol": code_geol,
+                        "pedology_family": pedology_family,
+                    }
+                )
+
+            tree = STRtree(geometries) if geometries else None
+            geom_lookup = {id(g): idx for idx, g in enumerate(geometries)}
+            self._lithology_index_cache = {
+                "features": features,
+                "tree": tree,
+                "geom_lookup": geom_lookup,
+            }
+            return self._lithology_index_cache
+        except Exception:
+            self._lithology_index_cache = {"features": [], "tree": None, "geom_lookup": {}}
+            return self._lithology_index_cache
+
+    def _lookup_pedology_for_point(
+        self,
+        lat: float,
+        lon: float,
+        lithology_index: Dict[str, object],
+    ) -> Dict[str, object]:
+        default = {
+            "pedology_family": "Pedologie indeterminee",
+            "lithology_descr": None,
+            "lithology_type": None,
+            "lithology_code_geol": None,
+        }
+
+        tree = lithology_index.get("tree")
+        features = lithology_index.get("features")
+        geom_lookup = lithology_index.get("geom_lookup")
+        if Point is None or tree is None or not isinstance(features, list):
+            return default
+
+        try:
+            pt = Point(float(lon), float(lat))
+            queried = tree.query(pt)
+        except Exception:
+            return default
+
+        candidates: List[int] = []
+        if isinstance(queried, list):
+            for item in queried:
+                if isinstance(item, numbers.Integral):
+                    candidates.append(int(item))
+                elif isinstance(geom_lookup, dict):
+                    idx = geom_lookup.get(id(item))
+                    if idx is not None:
+                        candidates.append(int(idx))
+        else:
+            try:
+                qlist = list(queried)
+            except Exception:
+                qlist = []
+            for item in qlist:
+                if isinstance(item, numbers.Integral):
+                    candidates.append(int(item))
+                elif isinstance(geom_lookup, dict):
+                    idx = geom_lookup.get(id(item))
+                    if idx is not None:
+                        candidates.append(int(idx))
+
+        best_idx: Optional[int] = None
+        best_dist = float("inf")
+        for idx in candidates:
+            if idx < 0 or idx >= len(features):
+                continue
+            geom = features[idx].get("geometry")
+            if geom is None:
+                continue
+            try:
+                if geom.contains(pt) or geom.touches(pt):
+                    best_idx = idx
+                    best_dist = 0.0
+                    break
+                dist = float(geom.distance(pt))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            except Exception:
+                continue
+
+        if best_idx is None:
+            return default
+        selected = features[best_idx]
+        return {
+            "pedology_family": selected.get("pedology_family") or "Pedologie indeterminee",
+            "lithology_descr": selected.get("descr"),
+            "lithology_type": selected.get("lithology_type"),
+            "lithology_code_geol": selected.get("code_geol"),
+        }
 
     def _fetch_rga_for_point(self, lat: float, lon: float) -> Dict[str, object]:
         try:
@@ -298,17 +608,227 @@ class LGVSeaMonitor:
             return {"risk_level": "FAIBLE", "color": "#16a34a", "score": 1}
         return {"risk_level": "INDETERMINE", "color": "#6b7280", "score": 1}
 
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def _soil_fragility_from_geotech_point(self, point: Dict[str, object]) -> float:
+        pedology = str(point.get("pedology_family") or "Pedologie indeterminee")
+        base_pedology = float(
+            self.pedology_fragility_index.get(
+                pedology,
+                self.pedology_fragility_index.get("Pedologie indeterminee", 0.55),
+            )
+        )
+
+        try:
+            rga_code = int(point.get("rga_code")) if point.get("rga_code") is not None else 0
+        except Exception:
+            rga_code = 0
+        rga_component = {3: 1.0, 2: 0.75, 1: 0.55}.get(int(rga_code), 0.40)
+
+        try:
+            risk_score = float(point.get("risk_score", 1) or 1)
+        except Exception:
+            risk_score = 1.0
+        risk_component = self._clamp01(risk_score / 4.0)
+
+        try:
+            mvt_count = float(point.get("mvt_count", 0) or 0.0)
+        except Exception:
+            mvt_count = 0.0
+        mvt_component = self._clamp01(mvt_count / 5.0)
+
+        soil_txt = f"{point.get('soil_type', '')} {pedology}".lower()
+        fragile_bonus = 0.0
+        if "argile" in soil_txt:
+            fragile_bonus += 0.12
+        if any(token in soil_txt for token in ["alluvial", "alluvion"]):
+            fragile_bonus += 0.08
+        if "limon" in soil_txt:
+            fragile_bonus += 0.04
+
+        fragility = (
+            0.36 * base_pedology
+            + 0.28 * rga_component
+            + 0.18 * risk_component
+            + 0.18 * mvt_component
+            + fragile_bonus
+        )
+        return self._clamp01(fragility)
+
+    def _build_sector_soil_context(
+        self,
+        lat: float,
+        lon: float,
+        near_geo: List[Dict[str, object]],
+        all_geo: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        selected = list(near_geo)
+        source = "local_geotech"
+        if not selected and all_geo:
+            sorted_all = sorted(
+                all_geo,
+                key=lambda g: self._haversine_km(
+                    lat,
+                    lon,
+                    float(g.get("latitude", lat) or lat),
+                    float(g.get("longitude", lon) or lon),
+                ),
+            )
+            selected = sorted_all[:3]
+            source = "nearest_geotech_fallback"
+
+        if not selected:
+            return {
+                "source": "no_geotech_data",
+                "used_points": 0,
+                "soil_fragility": 0.55,
+                "dominant_pedology": "Pedologie indeterminee",
+                "dominant_soil_type": "Sols indetermines",
+                "has_fragile_soils": False,
+            }
+
+        pedology_counts: Dict[str, int] = {}
+        soil_type_counts: Dict[str, int] = {}
+        fragilities: List[float] = []
+        for point in selected:
+            ped = str(point.get("pedology_family") or "Pedologie indeterminee")
+            pedology_counts[ped] = pedology_counts.get(ped, 0) + 1
+            soil_t = str(point.get("soil_type") or "Sols indetermines")
+            soil_type_counts[soil_t] = soil_type_counts.get(soil_t, 0) + 1
+            fragilities.append(self._soil_fragility_from_geotech_point(point))
+
+        dominant_pedology = max(pedology_counts.items(), key=lambda item: item[1])[0] if pedology_counts else "Pedologie indeterminee"
+        dominant_soil_type = max(soil_type_counts.items(), key=lambda item: item[1])[0] if soil_type_counts else "Sols indetermines"
+
+        mean_fragility = sum(fragilities) / len(fragilities)
+        max_fragility = max(fragilities)
+        fragility = self._clamp01(0.40 * mean_fragility + 0.60 * max_fragility)
+        has_fragile = bool(
+            fragility >= 0.70
+            or ("argile" in dominant_soil_type.lower())
+            or (dominant_pedology in {"Argileux", "Alluvial"})
+        )
+
+        return {
+            "source": source,
+            "used_points": int(len(selected)),
+            "soil_fragility": round(float(fragility), 4),
+            "dominant_pedology": dominant_pedology,
+            "dominant_soil_type": dominant_soil_type,
+            "has_fragile_soils": has_fragile,
+        }
+
+    def _predict_sector_ai_risk(
+        self,
+        max24_mm: float,
+        max7_mm: float,
+        max30_mm: float,
+        maxmonth_mm: float,
+        weather_score: int,
+        geotech_score: int,
+        piezo_score: int,
+        hydro_score: int,
+        soil_context: Dict[str, object],
+    ) -> Dict[str, object]:
+        rain_24h = self._clamp01(max24_mm / 120.0)
+        rain_7d = self._clamp01(max7_mm / 180.0)
+        rain_30d = self._clamp01(max30_mm / 300.0)
+        rain_month = self._clamp01(maxmonth_mm / 240.0)
+        rain_pressure = self._clamp01(0.45 * rain_24h + 0.30 * rain_7d + 0.20 * rain_30d + 0.05 * rain_month)
+
+        soil_fragility = self._clamp01(float(soil_context.get("soil_fragility", 0.55) or 0.55))
+        geotech_pressure = self._clamp01(float(geotech_score) / 4.0)
+        piezo_pressure = self._clamp01(float(piezo_score) / 4.0)
+        hydro_pressure = self._clamp01(float(hydro_score) / 4.0)
+        weather_pressure = self._clamp01(float(weather_score) / 4.0)
+        rain_soil_interaction = self._clamp01(rain_pressure * soil_fragility)
+
+        linear = (
+            -2.20
+            + 2.60 * rain_pressure
+            + 2.30 * soil_fragility
+            + 1.70 * rain_soil_interaction
+            + 0.55 * geotech_pressure
+            + 0.30 * hydro_pressure
+            + 0.22 * piezo_pressure
+            + 0.28 * weather_pressure
+        )
+        probability = 1.0 / (1.0 + math.exp(-linear))
+        probability = self._clamp01(probability)
+        score = round(1.0 + 3.0 * probability, 2)
+
+        if probability >= 0.85:
+            level = "CRITIQUE"
+            color = "#7f1d1d"
+        elif probability >= 0.65:
+            level = "ELEVE"
+            color = "#dc2626"
+        elif probability >= 0.40:
+            level = "MODERE"
+            color = "#ea580c"
+        else:
+            level = "FAIBLE"
+            color = "#16a34a"
+
+        weather_cov = 1.0 if max(max24_mm, max7_mm, max30_mm, maxmonth_mm) > 0.0 else 0.45
+        soil_source = str(soil_context.get("source") or "")
+        if soil_source == "local_geotech":
+            soil_cov = 1.0
+        elif soil_source == "nearest_geotech_fallback":
+            soil_cov = 0.72
+        else:
+            soil_cov = 0.45
+        confidence = self._clamp01(0.58 * weather_cov + 0.42 * soil_cov)
+
+        driver_values = [
+            ("pluie_24h", rain_24h),
+            ("cumul_7j", rain_7d),
+            ("fragilite_sol", soil_fragility),
+            ("interaction_pluie_sol", rain_soil_interaction),
+            ("signal_geotech", geotech_pressure),
+            ("signal_hydro", hydro_pressure),
+            ("signal_nappes", piezo_pressure),
+        ]
+        top_factors = [
+            name for name, value in sorted(driver_values, key=lambda x: x[1], reverse=True)[:3] if value >= 0.20
+        ]
+        if not top_factors:
+            top_factors = ["signal_faible"]
+
+        return {
+            "model_name": self.ai_model_name,
+            "model_version": self.ai_model_version,
+            "risk_level": level,
+            "risk_color": color,
+            "score": score,
+            "probability": round(float(probability), 4),
+            "confidence": round(float(confidence), 4),
+            "rain_pressure": round(float(rain_pressure), 4),
+            "soil_fragility": round(float(soil_fragility), 4),
+            "top_factors": top_factors,
+        }
+
     def fetch_geotechnical_context(self) -> Dict[str, object]:
         cached = self._load_fresh_cache(self.soil_cache_file, self.soil_cache_hours)
         if cached:
-            return cached
+            pts = cached.get("points")
+            if isinstance(pts, list) and pts:
+                sample = pts[0] if isinstance(pts[0], dict) else {}
+                if isinstance(sample, dict) and ("pedology_family" in sample or "lithology_descr" in sample):
+                    return cached
+            elif isinstance(cached.get("summary"), dict) and "pedology_counts" in cached.get("summary", {}):
+                return cached
 
         sampled = self._sample_points_along_lgv(self.soil_sample_step_km, self.soil_max_points)
+        lithology_index = self._fetch_brgm_lithology_index()
         points: List[Dict[str, object]] = []
 
         for idx, (lat, lon) in enumerate(sampled, start=1):
             rga = self._fetch_rga_for_point(lat, lon)
             mvt = self._fetch_mvt_for_point(lat, lon)
+            pedology = self._lookup_pedology_for_point(lat, lon, lithology_index)
 
             code_raw = rga.get("codeExposition")
             try:
@@ -350,6 +870,10 @@ class LGVSeaMonitor:
                     "rga_code": rga_code,
                     "rga_label": rga_label,
                     "soil_type": soil_type,
+                    "pedology_family": pedology.get("pedology_family"),
+                    "lithology_descr": pedology.get("lithology_descr"),
+                    "lithology_type": pedology.get("lithology_type"),
+                    "lithology_code_geol": pedology.get("lithology_code_geol"),
                     "mvt_count": int(mvt_count),
                     "mvt_strong_count": int(strong_count),
                     "mvt_top_types": top_types,
@@ -364,6 +888,10 @@ class LGVSeaMonitor:
         moderate_points = sum(1 for p in points if p["risk_level"] == "MODERE")
         low_points = sum(1 for p in points if p["risk_level"] == "FAIBLE")
         unknown_points = sum(1 for p in points if p["risk_level"] == "INDETERMINE")
+        pedology_counts: Dict[str, int] = {}
+        for p in points:
+            fam = str(p.get("pedology_family") or "Pedologie indeterminee")
+            pedology_counts[fam] = pedology_counts.get(fam, 0) + 1
 
         alerts = []
         hot = [p for p in points if p["risk_level"] in {"CRITIQUE", "ELEVE"}]
@@ -375,7 +903,7 @@ class LGVSeaMonitor:
                     "level": "ELEVE" if p["risk_level"] == "ELEVE" else "CRITIQUE",
                     "message": (
                         f"PK echantillon #{p['point_id']}: {p['soil_type']} | "
-                        f"RGA={p['rga_label']} | MVT proches={p['mvt_count']}"
+                        f"RGA={p['rga_label']} | MVT proches={p['mvt_count']} | Pedologie={p.get('pedology_family')}"
                     ),
                 }
             )
@@ -384,13 +912,14 @@ class LGVSeaMonitor:
             "timestamp_utc": self._now_utc().isoformat(),
             "sample_step_km": self.soil_sample_step_km,
             "sample_count": len(points),
-            "source": "georisques_api_v1_rga_mvt",
+            "source": "georisques_api_v1_rga_mvt + brgm_wfs_litho_1m",
             "summary": {
                 "critical_points": critical_points,
                 "high_points": high_points,
                 "moderate_points": moderate_points,
                 "low_points": low_points,
                 "unknown_points": unknown_points,
+                "pedology_counts": pedology_counts,
             },
             "alerts": alerts,
             "points": points,
@@ -602,6 +1131,124 @@ class LGVSeaMonitor:
     def _save_commune_cache(self) -> None:
         self._save_json(self.commune_cache, self.commune_cache_file)
 
+    def _load_hydro_threshold_cache(self) -> Dict[str, Dict[str, object]]:
+        if not os.path.exists(self.hydro_threshold_cache_file):
+            return {}
+        try:
+            with open(self.hydro_threshold_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_hydro_threshold_cache(self) -> None:
+        self._save_json(self.hydro_threshold_cache, self.hydro_threshold_cache_file)
+
+    def _fetch_hydroportal_thresholds(self, station_code: str) -> Dict[str, object]:
+        code = str(station_code or "").replace(" ", "")
+        if not code:
+            return {}
+
+        cached = self.hydro_threshold_cache.get(code)
+        if isinstance(cached, dict):
+            ts = pd.to_datetime(cached.get("fetched_at_utc"), utc=True, errors="coerce")
+            if not pd.isna(ts):
+                age_h = (self._now_utc() - ts.to_pydatetime()).total_seconds() / 3600.0
+                if age_h <= self.hydro_threshold_cache_hours:
+                    return cached
+
+        url = f"https://hydro.eaufrance.fr/stationhydro/{code}/seuils"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        try:
+            response = self.session.get(url, headers=headers, timeout=25)
+            if response.status_code != 200 or not response.text.strip():
+                return {}
+
+            html_txt = response.text
+            if "Aucun seuil sur cette entité" in html_txt:
+                payload = {
+                    "fetched_at_utc": self._now_utc().isoformat(),
+                    "station_code": code,
+                    "source_url": url,
+                    "threshold_values_m": [],
+                    "watch_threshold_m": None,
+                    "emergency_threshold_m": None,
+                    "has_thresholds": False,
+                }
+                self.hydro_threshold_cache[code] = payload
+                self._save_hydro_threshold_cache()
+                return payload
+
+            source_unit_h = "mm"
+            user_unit_h = "m"
+            cfg_match = re.search(r'data-config="([^"]+)"', html_txt)
+            if cfg_match:
+                try:
+                    cfg_obj = json.loads(html.unescape(cfg_match.group(1)))
+                    source_unit_h = str(cfg_obj.get("sourceUnitH") or source_unit_h).strip().lower()
+                    user_unit_h = str(cfg_obj.get("userUnitH") or user_unit_h).strip().lower()
+                except Exception:
+                    pass
+
+            factor_to_m = 1.0
+            if source_unit_h == "mm":
+                factor_to_m = 1.0 / 1000.0
+            elif source_unit_h == "cm":
+                factor_to_m = 1.0 / 100.0
+            elif source_unit_h in {"m", "meter", "metre"}:
+                factor_to_m = 1.0
+            elif source_unit_h in {"dm"}:
+                factor_to_m = 1.0 / 10.0
+
+            if user_unit_h == "m":
+                pass
+
+            values_m: List[float] = []
+            raw_matches = re.findall(r'data-threshold-values="([^"]+)"', html_txt)
+            if not raw_matches:
+                raw_matches = re.findall(r'data-thresholds-values="([^"]+)"', html_txt)
+            for raw in raw_matches:
+                try:
+                    decoded = html.unescape(raw)
+                    arr = json.loads(decoded)
+                except Exception:
+                    continue
+                if not isinstance(arr, list):
+                    continue
+                for item in arr:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("deactivationDate"):
+                        continue
+                    val = self._safe_float(item.get("value"))
+                    if val is None:
+                        continue
+                    values_m.append(round(float(val) * factor_to_m, 4))
+
+            uniq_values = sorted({float(v) for v in values_m if v is not None})
+            payload = {
+                "fetched_at_utc": self._now_utc().isoformat(),
+                "station_code": code,
+                "source_url": url,
+                "threshold_values_m": uniq_values,
+                "watch_threshold_m": min(uniq_values) if uniq_values else None,
+                "emergency_threshold_m": max(uniq_values) if uniq_values else None,
+                "has_thresholds": bool(uniq_values),
+                "source_unit_h": source_unit_h,
+                "user_unit_h": user_unit_h,
+            }
+            self.hydro_threshold_cache[code] = payload
+            self._save_hydro_threshold_cache()
+            return payload
+        except Exception:
+            return {}
+
     @staticmethod
     def _commune_cache_key(lat: float, lon: float) -> str:
         return f"{round(float(lat), 4)},{round(float(lon), 4)}"
@@ -669,6 +1316,335 @@ class LGVSeaMonitor:
             out.at[idx, "station_departement_name"] = info.get("departement_name")
         return out
 
+    def _load_communes_department_features(self, dep_code: str) -> List[Dict[str, object]]:
+        dep = str(dep_code).strip()
+        if not dep:
+            return []
+        cache_file = os.path.join("data", f"communes_dep_{dep}.json")
+        cached = self._load_fresh_cache(cache_file, self.lgv_communes_cache_days * 24)
+        if cached and isinstance(cached.get("features"), list):
+            return cached.get("features", [])
+
+        try:
+            response = self.session.get(
+                f"https://geo.api.gouv.fr/departements/{dep}/communes",
+                params={
+                    "fields": "nom,code,departement",
+                    "format": "geojson",
+                    "geometry": "contour",
+                },
+                timeout=40,
+            )
+            if response.status_code != 200 or not response.text.strip():
+                return []
+            payload = response.json()
+            features = payload.get("features", []) if isinstance(payload, dict) else []
+            if not isinstance(features, list):
+                return []
+            wrapped = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "departement_code": dep,
+                "features": features,
+            }
+            self._save_json(wrapped, cache_file)
+            return features
+        except Exception:
+            return []
+
+    def _build_lgv_communes_catalog(self) -> Dict[str, object]:
+        required_catalog_version = 2
+        cached = self._load_fresh_cache(self.lgv_communes_cache_file, self.lgv_communes_cache_days * 24)
+        current_fingerprint = self._lgv_lines_fingerprint()
+        if isinstance(cached, dict) and str(cached.get("lgv_fingerprint") or "") == current_fingerprint:
+            summary = cached.get("summary") if isinstance(cached.get("summary"), dict) else {}
+            has_geojson = False
+            geo = cached.get("communes_geojson")
+            if isinstance(geo, dict) and isinstance(geo.get("features"), list) and len(geo.get("features", [])) > 0:
+                has_geojson = True
+            cached_version = int(cached.get("catalog_version", 1) or 1)
+            if int(summary.get("commune_count", 0) or 0) > 0 and has_geojson and cached_version >= required_catalog_version:
+                return cached
+
+        if STRtree is None or Point is None or shape is None:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "shapely_non_disponible"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        line = self._representative_lgv_line()
+        samples = self._sample_line_with_chainage(line, self.lgv_commune_sample_step_km)
+        if not samples:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "ligne_lgv_vide"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        entries: List[Dict[str, object]] = []
+        geometries: List[object] = []
+        for dep in self.lgv_reference_departements:
+            for feat in self._load_communes_department_features(dep):
+                if not isinstance(feat, dict):
+                    continue
+                props = feat.get("properties") if isinstance(feat.get("properties"), dict) else {}
+                geom_raw = feat.get("geometry")
+                if not isinstance(geom_raw, dict):
+                    continue
+                try:
+                    geom = shape(geom_raw)
+                except Exception:
+                    continue
+                if geom is None or geom.is_empty:
+                    continue
+                if not geom.is_valid:
+                    try:
+                        geom = geom.buffer(0)
+                    except Exception:
+                        continue
+                if geom is None or geom.is_empty:
+                    continue
+
+                dep_meta = props.get("departement") if isinstance(props.get("departement"), dict) else {}
+                try:
+                    centroid = geom.centroid
+                    c_lat = float(centroid.y)
+                    c_lon = float(centroid.x)
+                except Exception:
+                    c_lat = None
+                    c_lon = None
+
+                entries.append(
+                    {
+                        "geometry": geom,
+                        "geometry_geojson": geom_raw if isinstance(geom_raw, dict) else None,
+                        "commune_name": str(props.get("nom") or "Inconnue"),
+                        "commune_code": str(props.get("code") or ""),
+                        "departement_code": str(dep_meta.get("code") or dep),
+                        "departement_name": str(dep_meta.get("nom") or ""),
+                        "centroid_latitude": c_lat,
+                        "centroid_longitude": c_lon,
+                    }
+                )
+                geometries.append(geom)
+
+        if not geometries:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "contours_communes_indisponibles"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        tree = STRtree(geometries)
+        geom_lookup = {id(g): idx for idx, g in enumerate(geometries)}
+        seen: Dict[str, Dict[str, object]] = {}
+        traversal_order: List[str] = []
+
+        for sample in samples:
+            lat = float(sample.get("latitude"))
+            lon = float(sample.get("longitude"))
+            pk = float(sample.get("pk_km"))
+            pt = Point(lon, lat)
+            queried = tree.query(pt)
+            candidates: List[int] = []
+            if isinstance(queried, list):
+                for item in queried:
+                    if isinstance(item, numbers.Integral):
+                        candidates.append(int(item))
+                    else:
+                        idx = geom_lookup.get(id(item))
+                        if idx is not None:
+                            candidates.append(int(idx))
+            else:
+                try:
+                    for item in list(queried):
+                        if isinstance(item, numbers.Integral):
+                            candidates.append(int(item))
+                        else:
+                            idx = geom_lookup.get(id(item))
+                            if idx is not None:
+                                candidates.append(int(idx))
+                except Exception:
+                    candidates = []
+
+            selected_idx: Optional[int] = None
+            for idx in candidates:
+                if idx < 0 or idx >= len(entries):
+                    continue
+                geom = entries[idx].get("geometry")
+                if geom is None:
+                    continue
+                try:
+                    if geom.contains(pt) or geom.touches(pt):
+                        selected_idx = idx
+                        break
+                except Exception:
+                    continue
+            if selected_idx is None:
+                continue
+
+            meta = entries[selected_idx]
+            code = str(meta.get("commune_code") or "")
+            if not code:
+                continue
+            if code not in seen:
+                seen[code] = {
+                    "commune_name": meta.get("commune_name"),
+                    "commune_code": code,
+                    "departement_code": meta.get("departement_code"),
+                    "departement_name": meta.get("departement_name"),
+                    "pk_start_km": pk,
+                    "pk_end_km": pk,
+                    "sample_count": 0,
+                    "centroid_latitude": meta.get("centroid_latitude"),
+                    "centroid_longitude": meta.get("centroid_longitude"),
+                    "geometry_geojson": meta.get("geometry_geojson"),
+                }
+                traversal_order.append(code)
+
+            row = seen[code]
+            row["pk_start_km"] = round(min(float(row["pk_start_km"]), pk), 3)
+            row["pk_end_km"] = round(max(float(row["pk_end_km"]), pk), 3)
+            row["sample_count"] = int(row.get("sample_count", 0)) + 1
+
+        line_geom = None
+        if LineString is not None and line and len(line) >= 2:
+            try:
+                line_geom = LineString([(float(lon), float(lat)) for lat, lon in line])
+            except Exception:
+                line_geom = None
+
+        if line_geom is not None:
+            for meta in entries:
+                code = str(meta.get("commune_code") or "")
+                if not code:
+                    continue
+                geom = meta.get("geometry")
+                if geom is None:
+                    continue
+                try:
+                    if not geom.intersects(line_geom):
+                        continue
+                    intersection = geom.intersection(line_geom)
+                except Exception:
+                    continue
+                if intersection is None or intersection.is_empty:
+                    continue
+
+                projected_km = self._project_geometry_on_line_km(line_geom, intersection)
+                if not projected_km:
+                    try:
+                        projected_km = self._project_geometry_on_line_km(line_geom, geom.centroid)
+                    except Exception:
+                        projected_km = []
+                if not projected_km:
+                    continue
+
+                pk_start = round(min(projected_km), 3)
+                pk_end = round(max(projected_km), 3)
+                sample_estimate = max(1, int(len(projected_km)))
+
+                if code not in seen:
+                    seen[code] = {
+                        "commune_name": meta.get("commune_name"),
+                        "commune_code": code,
+                        "departement_code": meta.get("departement_code"),
+                        "departement_name": meta.get("departement_name"),
+                        "pk_start_km": pk_start,
+                        "pk_end_km": pk_end,
+                        "sample_count": sample_estimate,
+                        "centroid_latitude": meta.get("centroid_latitude"),
+                        "centroid_longitude": meta.get("centroid_longitude"),
+                        "geometry_geojson": meta.get("geometry_geojson"),
+                    }
+                else:
+                    row = seen[code]
+                    row["pk_start_km"] = round(min(float(row.get("pk_start_km", pk_start)), pk_start), 3)
+                    row["pk_end_km"] = round(max(float(row.get("pk_end_km", pk_end)), pk_end), 3)
+                    row["sample_count"] = int(row.get("sample_count", 0)) + sample_estimate
+
+        communes_rows = sorted(seen.values(), key=lambda r: (float(r.get("pk_start_km", 0.0)), str(r.get("commune_name", ""))))
+        for idx, row in enumerate(communes_rows, start=1):
+            pk_start = float(row.get("pk_start_km") or 0.0)
+            pk_end = float(row.get("pk_end_km") or pk_start)
+            row["traversed_km"] = round(max(pk_end - pk_start, 0.0), 3)
+            row["order_on_line"] = idx
+
+        commune_features: List[Dict[str, object]] = []
+        for row in communes_rows:
+            geom_raw = row.get("geometry_geojson")
+            if not isinstance(geom_raw, dict):
+                continue
+            feature_props = {
+                "commune_name": row.get("commune_name"),
+                "commune_code": row.get("commune_code"),
+                "departement_code": row.get("departement_code"),
+                "departement_name": row.get("departement_name"),
+                "pk_start_km": row.get("pk_start_km"),
+                "pk_end_km": row.get("pk_end_km"),
+                "traversed_km": row.get("traversed_km"),
+                "order_on_line": row.get("order_on_line"),
+                "sample_count": row.get("sample_count"),
+            }
+            commune_features.append(
+                {
+                    "type": "Feature",
+                    "properties": feature_props,
+                    "geometry": geom_raw,
+                }
+            )
+        for row in communes_rows:
+            row.pop("geometry_geojson", None)
+
+        dep_counts: Dict[str, int] = {}
+        for row in communes_rows:
+            dep = str(row.get("departement_code") or "NA")
+            dep_counts[dep] = dep_counts.get(dep, 0) + 1
+
+        total_length = float(samples[-1]["pk_km"]) if samples else 0.0
+        payload = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "catalog_version": required_catalog_version,
+            "lgv_fingerprint": current_fingerprint,
+            "sample_step_km": self.lgv_commune_sample_step_km,
+            "source": "geo_api_gouv_communes",
+            "summary": {
+                "line_length_km": round(total_length, 3),
+                "commune_count": int(len(communes_rows)),
+                "departement_count": int(len(dep_counts)),
+                "departement_distribution": dep_counts,
+                "communes_geojson_count": int(len(commune_features)),
+            },
+            "communes": communes_rows,
+            "communes_geojson": {
+                "type": "FeatureCollection",
+                "features": commune_features,
+            },
+            "departements_ref": self.lgv_reference_departements,
+        }
+        self._save_json(payload, self.lgv_communes_cache_file)
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(payload, os.path.join("data", f"lgv_communes_{ts}.json"))
+        return payload
+
     @staticmethod
     def _downsample_coords(coords: List[Tuple[float, float]], max_points: int = 3500) -> List[Tuple[float, float]]:
         if len(coords) <= max_points:
@@ -686,6 +1662,54 @@ class LGVSeaMonitor:
         for i in range(len(coords) - 1):
             total += self._haversine_km(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1])
         return total
+
+    def _collect_geometry_xy_coords(self, geom_obj: object, max_points: int = 5000) -> List[Tuple[float, float]]:
+        coords: List[Tuple[float, float]] = []
+
+        def _walk(g: object) -> None:
+            nonlocal coords
+            if g is None or len(coords) >= max_points:
+                return
+            try:
+                if getattr(g, "is_empty", False):
+                    return
+            except Exception:
+                pass
+
+            if hasattr(g, "geoms"):
+                try:
+                    for sub in list(g.geoms):
+                        _walk(sub)
+                        if len(coords) >= max_points:
+                            return
+                    return
+                except Exception:
+                    pass
+
+            if hasattr(g, "coords"):
+                try:
+                    for xy in list(g.coords):
+                        if len(xy) >= 2:
+                            coords.append((float(xy[0]), float(xy[1])))
+                        if len(coords) >= max_points:
+                            return
+                except Exception:
+                    return
+
+        _walk(geom_obj)
+        return coords
+
+    def _project_geometry_on_line_km(self, line_geom: object, geom_obj: object) -> List[float]:
+        if line_geom is None or Point is None:
+            return []
+        projections: List[float] = []
+        for x, y in self._collect_geometry_xy_coords(geom_obj):
+            try:
+                km = float(line_geom.project(Point(float(x), float(y)))) / 1000.0
+                projections.append(round(km, 3))
+            except Exception:
+                continue
+        return projections
 
     def _extract_lgv_lines_from_kml_root(self, root: ET.Element) -> List[List[Tuple[float, float]]]:
         ns = {"k": "http://www.opengis.net/kml/2.2"}
@@ -1260,6 +2284,17 @@ class LGVSeaMonitor:
 
                 station_code = str(station_meta["station_code"])
                 obs_df = self.fetch_hydrometry_for_station(station_code=station_code, hours=24)
+                threshold_pack = self._fetch_hydroportal_thresholds(station_code)
+                hydro_emergency = self._safe_float(threshold_pack.get("emergency_threshold_m"))
+                hydro_watch = self._safe_float(threshold_pack.get("watch_threshold_m"))
+                configured_threshold = rp.threshold_m
+                threshold_m = configured_threshold if configured_threshold is not None else hydro_watch
+                if threshold_m is None:
+                    threshold_m = hydro_emergency
+                if configured_threshold is not None and hydro_emergency is not None:
+                    emergency_threshold_m = max(float(configured_threshold), float(hydro_emergency))
+                else:
+                    emergency_threshold_m = hydro_emergency if hydro_emergency is not None else configured_threshold
 
                 if obs_df.empty:
                     out[rp.river] = {
@@ -1271,6 +2306,9 @@ class LGVSeaMonitor:
                         "auto_selected": bool(station_meta.get("auto_selected", False)),
                         "match_type": station_meta.get("match_type"),
                         "message": "Aucune observation disponible sur les 24h.",
+                        "threshold_m": threshold_m,
+                        "emergency_threshold_m": emergency_threshold_m,
+                        "threshold_source": threshold_pack.get("source_url"),
                         "source": DataSource.VIGICRUES_HYDRO.value,
                     }
                     continue
@@ -1294,7 +2332,10 @@ class LGVSeaMonitor:
                     "last_level_m": round(float(latest["level_m"]), 3),
                     "trend_mph": round(float(trend_mph), 3),
                     "n_obs": int(len(obs_df)),
-                    "threshold_m": rp.threshold_m,
+                    "threshold_m": threshold_m,
+                    "emergency_threshold_m": emergency_threshold_m,
+                    "threshold_values_m": threshold_pack.get("threshold_values_m", []),
+                    "threshold_source": threshold_pack.get("source_url"),
                     "rapid_rise_mph": rp.rapid_rise_mph,
                     "observations": obs_df.head(24).to_dict(orient="records"),
                     "source": DataSource.VIGICRUES_HYDRO.value,
@@ -1315,21 +2356,84 @@ class LGVSeaMonitor:
         return out
 
     @staticmethod
-    def _classify_hydro_network_risk(trend_mph: Optional[float]) -> Dict[str, object]:
+    def _classify_hydro_network_risk(
+        trend_mph: Optional[float],
+        level_m: Optional[float] = None,
+        emergency_threshold_m: Optional[float] = None,
+    ) -> Dict[str, object]:
+        ratio = None
+        if level_m is not None and emergency_threshold_m is not None and emergency_threshold_m > 0:
+            ratio = float(level_m) / float(emergency_threshold_m)
+
+        if ratio is not None and ratio >= 1.0:
+            return {
+                "risk_level": "CRITIQUE",
+                "color": "#7f1d1d",
+                "score": 4,
+                "reason": "seuil_urgence_depasse",
+                "threshold_ratio": round(ratio, 3),
+            }
+        if ratio is not None and ratio >= 0.9:
+            return {
+                "risk_level": "ELEVE",
+                "color": "#dc2626",
+                "score": 3,
+                "reason": "proche_seuil_urgence",
+                "threshold_ratio": round(ratio, 3),
+            }
+
         if trend_mph is None:
-            return {"risk_level": "INDETERMINE", "color": "#6b7280", "score": 1}
+            return {
+                "risk_level": "INDETERMINE",
+                "color": "#6b7280",
+                "score": 1,
+                "reason": "trend_indetermine",
+                "threshold_ratio": ratio,
+            }
         if trend_mph >= 0.12:
-            return {"risk_level": "CRITIQUE", "color": "#7f1d1d", "score": 4}
+            return {
+                "risk_level": "CRITIQUE",
+                "color": "#7f1d1d",
+                "score": 4,
+                "reason": "montee_rapide_critique",
+                "threshold_ratio": ratio,
+            }
         if trend_mph >= 0.08:
-            return {"risk_level": "ELEVE", "color": "#dc2626", "score": 3}
+            return {
+                "risk_level": "ELEVE",
+                "color": "#dc2626",
+                "score": 3,
+                "reason": "montee_rapide_elevee",
+                "threshold_ratio": ratio,
+            }
         if trend_mph >= 0.04:
-            return {"risk_level": "MODERE", "color": "#ea580c", "score": 2}
-        return {"risk_level": "FAIBLE", "color": "#16a34a", "score": 1}
+            return {
+                "risk_level": "MODERE",
+                "color": "#ea580c",
+                "score": 2,
+                "reason": "montee_rapide_moderee",
+                "threshold_ratio": ratio,
+            }
+        return {
+            "risk_level": "FAIBLE",
+            "color": "#16a34a",
+            "score": 1,
+            "reason": "stable",
+            "threshold_ratio": ratio,
+        }
 
     def fetch_hydro_network_near_lgv(self) -> Dict[str, object]:
         cached = self._load_fresh_cache(self.hydro_network_cache_file, self.hydro_network_cache_hours)
         if cached:
-            return cached
+            stations_cached = cached.get("stations")
+            if isinstance(stations_cached, list) and stations_cached:
+                sample = stations_cached[0] if isinstance(stations_cached[0], dict) else {}
+                if isinstance(sample, dict) and (
+                    "emergency_threshold_m" in sample or "threshold_ratio" in sample
+                ):
+                    return cached
+            elif isinstance(stations_cached, list):
+                return cached
 
         min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=0.1)
         response = self.session.get(
@@ -1391,13 +2495,32 @@ class LGVSeaMonitor:
             old = obs_df.iloc[old_idx]
             dt_h = max((latest["date_obs"] - old["date_obs"]).total_seconds() / 3600.0, 0.0)
             trend_mph = (float(latest["level_m"]) - float(old["level_m"])) / dt_h if dt_h > 0 else None
-            cls = self._classify_hydro_network_risk(trend_mph)
+            latest_level = round(float(latest["level_m"]), 3)
+            threshold_pack = self._fetch_hydroportal_thresholds(st["station_code"])
+            watch_threshold = self._safe_float(threshold_pack.get("watch_threshold_m"))
+            emergency_threshold = self._safe_float(threshold_pack.get("emergency_threshold_m"))
+            cls = self._classify_hydro_network_risk(
+                trend_mph=trend_mph,
+                level_m=latest_level,
+                emergency_threshold_m=emergency_threshold,
+            )
+            threshold_ratio = cls.get("threshold_ratio")
+            exceeded = (
+                emergency_threshold is not None and latest_level is not None and latest_level >= float(emergency_threshold)
+            )
             item = {
                 **st,
                 "last_obs_utc": latest["date_obs"].isoformat(),
-                "last_level_m": round(float(latest["level_m"]), 3),
+                "last_level_m": latest_level,
                 "trend_mph": None if trend_mph is None else round(float(trend_mph), 3),
                 "n_obs": int(len(obs_df)),
+                "watch_threshold_m": watch_threshold,
+                "emergency_threshold_m": emergency_threshold,
+                "threshold_values_m": threshold_pack.get("threshold_values_m", []),
+                "threshold_source": threshold_pack.get("source_url"),
+                "threshold_ratio": None if threshold_ratio is None else round(float(threshold_ratio), 3),
+                "threshold_exceeded": bool(exceeded),
+                "risk_reason": cls.get("reason"),
                 "risk_level": cls["risk_level"],
                 "risk_color": cls["color"],
                 "risk_score": cls["score"],
@@ -1405,6 +2528,12 @@ class LGVSeaMonitor:
             }
             stations.append(item)
             if item["risk_level"] in {"CRITIQUE", "ELEVE"}:
+                ratio_txt = ""
+                if item.get("threshold_ratio") is not None:
+                    ratio_txt = f" | ratio_seuil={item.get('threshold_ratio')}"
+                thr_txt = ""
+                if item.get("emergency_threshold_m") is not None:
+                    thr_txt = f" | seuil_urgence={item.get('emergency_threshold_m')} m"
                 alerts.append(
                     {
                         "type": "HYDRO_RESEAU",
@@ -1412,6 +2541,7 @@ class LGVSeaMonitor:
                         "message": (
                             f"{item['station_code']} ({item['river_name']}): "
                             f"trend={item['trend_mph']} m/h | niveau={item['last_level_m']} m"
+                            f"{thr_txt}{ratio_txt}"
                         ),
                     }
                 )
@@ -1422,6 +2552,8 @@ class LGVSeaMonitor:
             "critical_stations": int(sum(1 for s in stations if s["risk_level"] == "CRITIQUE")),
             "high_stations": int(sum(1 for s in stations if s["risk_level"] == "ELEVE")),
             "moderate_stations": int(sum(1 for s in stations if s["risk_level"] == "MODERE")),
+            "stations_with_threshold": int(sum(1 for s in stations if s.get("emergency_threshold_m") is not None)),
+            "threshold_exceeded_stations": int(sum(1 for s in stations if bool(s.get("threshold_exceeded")))),
         }
         payload = {
             "timestamp_utc": self._now_utc().isoformat(),
@@ -1455,6 +2587,7 @@ class LGVSeaMonitor:
         rain_score_map = {"NORMAL": 1, "VIGILANCE": 2, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
         piezo_score_map = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "TRES_ELEVE": 4}
         hydro_score_map = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
+        ai_risk_color = {"FAIBLE": "#16a34a", "MODERE": "#ea580c", "ELEVE": "#dc2626", "CRITIQUE": "#7f1d1d"}
 
         for idx, (lat, lon) in enumerate(centers, start=1):
             near_weather = [
@@ -1489,6 +2622,19 @@ class LGVSeaMonitor:
             geotech_score = max((int(g.get("risk_score", 1) or 1) for g in near_geo), default=1)
             piezo_score = max((piezo_score_map.get(str(p.get("risk_level")), 1) for p in near_piezo), default=1)
             hydro_score = max((hydro_score_map.get(str(h.get("risk_level")), 1) for h in near_hydro), default=1)
+            soil_context = self._build_sector_soil_context(lat, lon, near_geo, geotech_points)
+            ai_pred = self._predict_sector_ai_risk(
+                max24_mm=max24,
+                max7_mm=max7,
+                max30_mm=max30,
+                maxmonth_mm=maxmonth,
+                weather_score=weather_score,
+                geotech_score=geotech_score,
+                piezo_score=piezo_score,
+                hydro_score=hydro_score,
+                soil_context=soil_context,
+            )
+            ai_level = str(ai_pred.get("risk_level", "INDETERMINE"))
 
             component_scores = [weather_score, geotech_score, piezo_score, hydro_score]
             avg_score = sum(component_scores) / len(component_scores)
@@ -1527,7 +2673,21 @@ class LGVSeaMonitor:
                 "geotech_points": int(len(near_geo)),
                 "piezometers": int(len(near_piezo)),
                 "hydro_stations": int(len(near_hydro)),
-                "under_watch": bool(risk_level in {"CRITIQUE", "ELEVE", "MODERE"}),
+                "ai_model_name": str(ai_pred.get("model_name", self.ai_model_name)),
+                "ai_model_version": str(ai_pred.get("model_version", self.ai_model_version)),
+                "ai_pred_risk_level": ai_level,
+                "ai_pred_risk_color": ai_risk_color.get(ai_level, "#6b7280"),
+                "ai_pred_score": round(float(ai_pred.get("score", 1.0) or 1.0), 2),
+                "ai_pred_probability": round(float(ai_pred.get("probability", 0.0) or 0.0), 4),
+                "ai_confidence": round(float(ai_pred.get("confidence", 0.0) or 0.0), 4),
+                "ai_rain_pressure": round(float(ai_pred.get("rain_pressure", 0.0) or 0.0), 4),
+                "ai_soil_fragility": round(float(ai_pred.get("soil_fragility", 0.0) or 0.0), 4),
+                "ai_dominant_pedology": soil_context.get("dominant_pedology"),
+                "ai_dominant_soil_type": soil_context.get("dominant_soil_type"),
+                "ai_soil_source": soil_context.get("source"),
+                "ai_has_fragile_soils": bool(soil_context.get("has_fragile_soils")),
+                "ai_top_factors": ai_pred.get("top_factors", []),
+                "under_watch": bool(risk_level in {"CRITIQUE", "ELEVE", "MODERE"} or ai_level in {"CRITIQUE", "ELEVE"}),
             }
             sectors.append(sector)
             if sector["risk_level"] in {"CRITIQUE", "ELEVE"}:
@@ -1537,7 +2697,20 @@ class LGVSeaMonitor:
                         "level": "CRITIQUE" if sector["risk_level"] == "CRITIQUE" else "ELEVE",
                         "message": (
                             f"{sector['sector_id']}: score={sector['score']} | pluie24h={sector['weather_max_24h_mm']} mm "
-                            f"| geotech={sector['geotech_points']} | piezo={sector['piezometers']} | hydro={sector['hydro_stations']}"
+                            f"| geotech={sector['geotech_points']} | piezo={sector['piezometers']} | hydro={sector['hydro_stations']} "
+                            f"| ia={sector['ai_pred_risk_level']} ({int(float(sector['ai_pred_probability']) * 100)}%)"
+                        ),
+                    }
+                )
+            if sector["ai_pred_risk_level"] in {"CRITIQUE", "ELEVE"} and sector["risk_level"] not in {"CRITIQUE", "ELEVE"}:
+                alerts.append(
+                    {
+                        "type": "SECTEUR_IA",
+                        "level": "CRITIQUE" if sector["ai_pred_risk_level"] == "CRITIQUE" else "ELEVE",
+                        "message": (
+                            f"{sector['sector_id']}: prediction IA={sector['ai_pred_risk_level']} "
+                            f"({int(float(sector['ai_pred_probability']) * 100)}%) | "
+                            f"sol={sector.get('ai_dominant_pedology')} | pluie24h={sector['weather_max_24h_mm']} mm"
                         ),
                     }
                 )
@@ -1548,6 +2721,14 @@ class LGVSeaMonitor:
             "high": int(sum(1 for s in sectors if s["risk_level"] == "ELEVE")),
             "moderate": int(sum(1 for s in sectors if s["risk_level"] == "MODERE")),
             "watch": int(sum(1 for s in sectors if s["under_watch"])),
+            "ai_critical": int(sum(1 for s in sectors if s.get("ai_pred_risk_level") == "CRITIQUE")),
+            "ai_high": int(sum(1 for s in sectors if s.get("ai_pred_risk_level") == "ELEVE")),
+            "ai_moderate": int(sum(1 for s in sectors if s.get("ai_pred_risk_level") == "MODERE")),
+            "ai_mean_probability": round(
+                float(sum(float(s.get("ai_pred_probability", 0.0) or 0.0) for s in sectors) / max(len(sectors), 1)),
+                4,
+            ),
+            "fragile_soil_sectors": int(sum(1 for s in sectors if float(s.get("ai_soil_fragility", 0.0) or 0.0) >= 0.70)),
         }
 
         risk_rank = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
@@ -1571,6 +2752,11 @@ class LGVSeaMonitor:
                     "moderate": 0,
                     "watch": 0,
                     "avg_risk_rank": 0.0,
+                    "ai_sum_probability": 0.0,
+                    "ai_max_probability": 0.0,
+                    "ai_critical": 0,
+                    "ai_high": 0,
+                    "ai_soil_fragility_sum": 0.0,
                 }
             row = by_commune[name]
             row["sector_count"] = int(row["sector_count"]) + 1
@@ -1581,13 +2767,32 @@ class LGVSeaMonitor:
             row["moderate"] = int(row["moderate"]) + (1 if sec.get("risk_level") == "MODERE" else 0)
             row["watch"] = int(row["watch"]) + (1 if sec.get("under_watch") else 0)
             row["avg_risk_rank"] = float(row["avg_risk_rank"]) + float(risk_rank.get(str(sec.get("risk_level")), 1))
+            ai_prob = float(sec.get("ai_pred_probability", 0.0) or 0.0)
+            row["ai_sum_probability"] = float(row["ai_sum_probability"]) + ai_prob
+            row["ai_max_probability"] = max(float(row["ai_max_probability"]), ai_prob)
+            row["ai_critical"] = int(row["ai_critical"]) + (1 if sec.get("ai_pred_risk_level") == "CRITIQUE" else 0)
+            row["ai_high"] = int(row["ai_high"]) + (1 if sec.get("ai_pred_risk_level") == "ELEVE" else 0)
+            row["ai_soil_fragility_sum"] = float(row["ai_soil_fragility_sum"]) + float(sec.get("ai_soil_fragility", 0.0) or 0.0)
 
         commune_rows: List[Dict[str, object]] = []
         for _, row in by_commune.items():
             n = max(int(row["sector_count"]), 1)
             avg_score = float(row["sum_score"]) / n
             avg_rank = float(row["avg_risk_rank"]) / n
-            note = min(100.0, max(0.0, (avg_score / 4.0) * 100.0 + 8.0 * int(row["critical"]) + 4.0 * int(row["high"])))
+            ai_avg_probability = float(row["ai_sum_probability"]) / n
+            ai_max_probability = float(row["ai_max_probability"])
+            ai_soil_fragility = float(row["ai_soil_fragility_sum"]) / n
+            base_note = min(100.0, max(0.0, (avg_score / 4.0) * 100.0 + 8.0 * int(row["critical"]) + 4.0 * int(row["high"])))
+            ai_note = min(100.0, max(0.0, ai_max_probability * 100.0))
+            note = min(100.0, max(0.0, 0.72 * base_note + 0.28 * ai_note))
+            if ai_max_probability >= 0.85 or int(row["ai_critical"]) > 0:
+                ai_commune_level = "CRITIQUE"
+            elif ai_max_probability >= 0.65 or int(row["ai_high"]) > 0:
+                ai_commune_level = "ELEVE"
+            elif ai_max_probability >= 0.40:
+                ai_commune_level = "MODERE"
+            else:
+                ai_commune_level = "FAIBLE"
             if note >= 80:
                 commune_level = "CRITIQUE"
             elif note >= 60:
@@ -1612,6 +2817,12 @@ class LGVSeaMonitor:
                     "watch": int(row["watch"]),
                     "commune_note": round(note, 1),
                     "commune_risk_level": commune_level,
+                    "ai_avg_probability": round(ai_avg_probability, 4),
+                    "ai_max_probability": round(ai_max_probability, 4),
+                    "ai_critical": int(row["ai_critical"]),
+                    "ai_high": int(row["ai_high"]),
+                    "ai_avg_soil_fragility": round(ai_soil_fragility, 4),
+                    "ai_commune_risk_level": ai_commune_level,
                 }
             )
 
@@ -1623,6 +2834,11 @@ class LGVSeaMonitor:
             "summary": summary,
             "commune_summary": commune_rows,
             "alerts": alerts[:12],
+            "ai_model": {
+                "name": self.ai_model_name,
+                "version": self.ai_model_version,
+                "description": "Modele predictif pluie + fragilite des sols (argiles/pedologie) applique sur chaque secteur LGV.",
+            },
             "sectors": sectors,
         }
         ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
@@ -1811,10 +3027,13 @@ class LGVSeaMonitor:
                 "critical_stations": summary.get("critical_stations", 0),
                 "high_stations": summary.get("high_stations", 0),
                 "moderate_stations": summary.get("moderate_stations", 0),
+                "stations_with_threshold": summary.get("stations_with_threshold", 0),
+                "threshold_exceeded_stations": summary.get("threshold_exceeded_stations", 0),
                 "source": hydro_network.get("source"),
             }
             critical = int(summary.get("critical_stations", 0) or 0)
             high = int(summary.get("high_stations", 0) or 0)
+            exceeded = int(summary.get("threshold_exceeded_stations", 0) or 0)
             if critical > 0:
                 factors.append(3)
                 risks["alerts"].append(
@@ -1833,6 +3052,15 @@ class LGVSeaMonitor:
                         "message": f"{high} station(s) hydro reseau en montee elevee.",
                     }
                 )
+            if exceeded > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "HYDRO_SEUIL_URGENCE",
+                        "level": "CRITIQUE",
+                        "message": f"{exceeded} station(s) hydro reseau avec depassement du seuil d'urgence.",
+                    }
+                )
             for alert in (hydro_network.get("alerts") or [])[:8]:
                 if isinstance(alert, dict):
                     risks["alerts"].append(alert)
@@ -1848,9 +3076,17 @@ class LGVSeaMonitor:
                 "high": summary.get("high", 0),
                 "moderate": summary.get("moderate", 0),
                 "watch": summary.get("watch", 0),
+                "ai_critical": summary.get("ai_critical", 0),
+                "ai_high": summary.get("ai_high", 0),
+                "ai_moderate": summary.get("ai_moderate", 0),
+                "ai_mean_probability": summary.get("ai_mean_probability", 0.0),
+                "fragile_soil_sectors": summary.get("fragile_soil_sectors", 0),
             }
             critical = int(summary.get("critical", 0) or 0)
             high = int(summary.get("high", 0) or 0)
+            ai_critical = int(summary.get("ai_critical", 0) or 0)
+            ai_high = int(summary.get("ai_high", 0) or 0)
+            fragile_soils = int(summary.get("fragile_soil_sectors", 0) or 0)
             if critical > 0:
                 factors.append(3)
                 risks["alerts"].append(
@@ -1869,11 +3105,40 @@ class LGVSeaMonitor:
                         "message": f"{high} secteur(s) de surveillance en risque eleve.",
                     }
                 )
+            if ai_critical > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "SECTEURS_IA_CRITIQUES",
+                        "level": "CRITIQUE",
+                        "message": f"{ai_critical} secteur(s) predicts CRITIQUE par le modele IA pluie/sol.",
+                    }
+                )
+            elif ai_high > 0:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "SECTEURS_IA_ELEVES",
+                        "level": "ELEVE",
+                        "message": f"{ai_high} secteur(s) predicts ELEVE par le modele IA pluie/sol.",
+                    }
+                )
+            if fragile_soils > 0:
+                risks["alerts"].append(
+                    {
+                        "type": "SOLS_FRAGILES",
+                        "level": "MODERE",
+                        "message": f"{fragile_soils} secteur(s) presentent une fragilite pedologique marquee.",
+                    }
+                )
             for alert in (sectors.get("alerts") or [])[:8]:
                 if isinstance(alert, dict):
                     risks["alerts"].append(alert)
             risks["recommendations"].append(
                 "Piloter la surveillance terrain par secteurs (priorite CRITIQUE/ELEVE) sur l'axe 300 km."
+            )
+            risks["recommendations"].append(
+                "Prioriser les inspections apres pluie sur les secteurs IA eleves avec sols argileux/alluviaux."
             )
 
         for river, info in rivers.items():
@@ -1888,6 +3153,7 @@ class LGVSeaMonitor:
 
             last_level = info.get("last_level_m")
             threshold = info.get("threshold_m")
+            emergency_threshold = info.get("emergency_threshold_m")
             trend = info.get("trend_mph")
             rapid = info.get("rapid_rise_mph")
 
@@ -1899,12 +3165,21 @@ class LGVSeaMonitor:
                 "last_level_m": last_level,
                 "trend_mph": trend,
                 "threshold_m": threshold,
+                "emergency_threshold_m": emergency_threshold,
                 "rapid_rise_mph": rapid,
+                "threshold_source": info.get("threshold_source"),
             }
 
-            if threshold is not None and last_level is not None and last_level >= threshold:
+            alert_threshold = emergency_threshold if emergency_threshold is not None else threshold
+            if alert_threshold is not None and last_level is not None and last_level >= alert_threshold:
                 factors.append(3)
-                risks["alerts"].append({"type": "CRUE", "level": "ELEVE", "message": f"{river}: {last_level:.2f} m >= seuil {threshold:.2f} m"})
+                risks["alerts"].append(
+                    {
+                        "type": "CRUE",
+                        "level": "CRITIQUE",
+                        "message": f"{river}: {last_level:.2f} m >= seuil urgence {alert_threshold:.2f} m",
+                    }
+                )
 
             if rapid is not None and trend is not None and trend >= rapid:
                 factors.append(2)
@@ -2004,10 +3279,19 @@ class LGVSeaMonitor:
             lon = info.get("station_longitude") if info.get("station_longitude") is not None else rp.longitude
             level = info.get("last_level_m")
             threshold = info.get("threshold_m")
+            emergency_threshold = info.get("emergency_threshold_m")
             trend = info.get("trend_mph")
             rapid = info.get("rapid_rise_mph")
 
-            if level is not None and threshold is not None and level >= threshold:
+            alert_threshold = emergency_threshold if emergency_threshold is not None else threshold
+            threshold_ratio = None
+            if level is not None and alert_threshold is not None and float(alert_threshold) > 0:
+                threshold_ratio = round(float(level) / float(alert_threshold), 3)
+
+            if level is not None and alert_threshold is not None and level >= alert_threshold:
+                color = "#7f1d1d"
+                risk_level = "CRITIQUE"
+            elif level is not None and threshold is not None and level >= threshold:
                 color = "#dc2626"
                 risk_level = "ELEVE"
             elif trend is not None and rapid is not None and trend >= rapid:
@@ -2027,8 +3311,11 @@ class LGVSeaMonitor:
                 f"<b>Point mesure:</b> {round(float(lat), 5)}, {round(float(lon), 5)}<br>"
                 f"<b>Niveau:</b> {html.escape(str(level))} m<br>"
                 f"<b>Tendance:</b> {html.escape(str(trend))} m/h<br>"
-                f"<b>Seuil:</b> {html.escape(str(threshold))} m<br>"
+                f"<b>Seuil vigilance:</b> {html.escape(str(threshold))} m<br>"
+                f"<b>Seuil urgence:</b> {html.escape(str(emergency_threshold))} m<br>"
+                f"<b>Ratio niveau/seuil urgence:</b> {html.escape(str(threshold_ratio))}<br>"
                 f"<b>Auto-station:</b> {html.escape(str(info.get('auto_selected')))}<br>"
+                f"<b>Source seuil:</b> {html.escape(str(info.get('threshold_source')))}<br>"
                 f"<b>Risque:</b> {risk_level}"
             )
             river_markers.append({"lat": float(lat), "lon": float(lon), "color": color, "risk_level": risk_level, "popup": popup})
@@ -2043,6 +3330,8 @@ class LGVSeaMonitor:
                     f"<b>Point LGV:</b> {point.get('point_id')}<br>"
                     f"<b>Risque geotechnique:</b> {html.escape(str(point.get('risk_level')))}<br>"
                     f"<b>Sol:</b> {html.escape(str(point.get('soil_type')))}<br>"
+                    f"<b>Pedologie:</b> {html.escape(str(point.get('pedology_family')))}<br>"
+                    f"<b>Lithologie BRGM:</b> {html.escape(str(point.get('lithology_descr')))} ({html.escape(str(point.get('lithology_type')))} )<br>"
                     f"<b>RGA:</b> {html.escape(str(point.get('rga_label')))}<br>"
                     f"<b>MVT proches:</b> {html.escape(str(point.get('mvt_count')))}"
                 )
@@ -2097,6 +3386,8 @@ class LGVSeaMonitor:
                     f"<b>Cours d'eau:</b> {html.escape(str(st.get('river_name')))}<br>"
                     f"<b>Niveau:</b> {html.escape(str(st.get('last_level_m')))} m<br>"
                     f"<b>Tendance:</b> {html.escape(str(st.get('trend_mph')))} m/h<br>"
+                    f"<b>Seuil urgence:</b> {html.escape(str(st.get('emergency_threshold_m')))} m<br>"
+                    f"<b>Ratio niveau/seuil:</b> {html.escape(str(st.get('threshold_ratio')))}<br>"
                     f"<b>Distance LGV:</b> {html.escape(str(st.get('distance_to_lgv_km')))} km<br>"
                     f"<b>Risque:</b> {html.escape(str(st.get('risk_level')))}"
                 )
@@ -2119,10 +3410,14 @@ class LGVSeaMonitor:
                 popup = (
                     f"<b>Secteur:</b> {html.escape(str(sec.get('sector_id')))}<br>"
                     f"<b>Risque:</b> {html.escape(str(sec.get('risk_level')))}<br>"
+                    f"<b>Prediction IA:</b> {html.escape(str(sec.get('ai_pred_risk_level')))} "
+                    f"({round(float(sec.get('ai_pred_probability', 0.0) or 0.0) * 100, 1)}%)<br>"
                     f"<b>Score:</b> {html.escape(str(sec.get('score')))}<br>"
                     f"<b>Pluie 24h:</b> {html.escape(str(sec.get('weather_max_24h_mm')))} mm<br>"
                     f"<b>Pluie 7j:</b> {html.escape(str(sec.get('weather_max_7d_mm')))} mm<br>"
                     f"<b>Pluie 30j:</b> {html.escape(str(sec.get('weather_max_30d_mm')))} mm<br>"
+                    f"<b>Sol dominant:</b> {html.escape(str(sec.get('ai_dominant_pedology')))}<br>"
+                    f"<b>Fragilite sol IA:</b> {round(float(sec.get('ai_soil_fragility', 0.0) or 0.0) * 100, 1)}%<br>"
                     f"<b>Geo/Piezo/Hydro:</b> {sec.get('geotech_points')}/{sec.get('piezometers')}/{sec.get('hydro_stations')}"
                 )
                 sector_markers.append(
@@ -2137,7 +3432,8 @@ class LGVSeaMonitor:
 
         geotech_kpi = (
             f"Pts geotech {len(soil_markers)} | critique={geotech_summary.get('critical_points', 0)} "
-            f"| eleve={geotech_summary.get('high_points', 0)} | modere={geotech_summary.get('moderate_points', 0)}"
+            f"| eleve={geotech_summary.get('high_points', 0)} | modere={geotech_summary.get('moderate_points', 0)} "
+            f"| pedologie={geotech_summary.get('pedology_counts', {})}"
             if soil_markers
             else "Contexte geotechnique non disponible"
         )
@@ -2149,7 +3445,7 @@ class LGVSeaMonitor:
         )
         hydro_kpi = (
             f"Stations hydro reseau={hydro_summary.get('stations_with_data', 0)} | critiques={hydro_summary.get('critical_stations', 0)} "
-            f"| elevees={hydro_summary.get('high_stations', 0)}"
+            f"| elevees={hydro_summary.get('high_stations', 0)} | depassement seuil urgence={hydro_summary.get('threshold_exceeded_stations', 0)}"
             if hydro_net_markers
             else "Reseau Vigicrues etendu non disponible"
         )
@@ -2459,6 +3755,7 @@ class LGVSeaMonitor:
         piezometers: Optional[Dict[str, object]],
         hydro_network: Optional[Dict[str, object]],
         sectors: Optional[Dict[str, object]],
+        lgv_communes: Optional[Dict[str, object]],
         risks: Dict[str, object],
         map_path: str,
     ) -> str:
@@ -2482,6 +3779,113 @@ class LGVSeaMonitor:
             for line in self.lgv_lines_latlon
             if len(line) >= 2
         ]
+        line_ref = self._representative_lgv_line()
+        line_length_km = self._line_length_km(line_ref) if line_ref else 0.0
+        metadata = {
+            "line_monitoring": {
+                "line_name": "LGV SEA Bordeaux-Tours",
+                "line_length_km": round(float(line_length_km), 2),
+                "corridor_weather_km": self.weather_corridor_km,
+                "corridor_hydro_km": self.hydro_network_corridor_km,
+                "corridor_piezometer_km": self.piezometer_corridor_km,
+            },
+            "calculation_methods": {
+                "pluviometrie": (
+                    "Fusion SYNOP + Open-Meteo. Classe pluie par seuils 24h/7j/30j, "
+                    "distance a la LGV par projection segmentaire."
+                ),
+                "hydrometrie": (
+                    "Niveaux Hub'Eau (grandeur H), tendance m/h sur fenetre 48h. "
+                    "Alerte urgence si niveau >= seuil urgence HydroPortail."
+                ),
+                "pedologie_geotechnique": (
+                    "Risque geotechnique = RGA Georisques + mouvements de terrain. "
+                    "Pedologie additionnelle via BRGM LITHO 1M simplifiee (argileux, calcaire, alluvial, etc.)."
+                ),
+                "communes_traversees": (
+                    "Intersection de la trace LGV avec contours communaux Geo API Gouv, "
+                    "avec chainage PK approximatif par echantillonnage de la ligne."
+                ),
+                "note_gc_commune": (
+                    "Note /100 issue des composantes pluie, geotech, nappes, hydro et de la criticite des points LGV."
+                ),
+                "modele_ia_sectoriel": (
+                    "Modele IA LGV-SEA-RiskAI-v1: prediction sectorielle via combinaison non lineaire "
+                    "pluie 24h/7j/30j + fragilite pedologique (argiles, alluvions, RGA, MVT) + signaux hydro/nappes."
+                ),
+            },
+            "update_frequency": {
+                "pipeline_target": "horaire (cron GitHub Actions)",
+                "weather_cycle": "a chaque cycle",
+                "hydro_network_cache_hours": self.hydro_network_cache_hours,
+                "piezometer_cache_hours": self.piezometer_cache_hours,
+                "geotech_cache_hours": self.soil_cache_hours,
+                "hydro_threshold_cache_hours": self.hydro_threshold_cache_hours,
+                "communes_cache_days": self.lgv_communes_cache_days,
+            },
+            "sources": [
+                {
+                    "id": "hubeau_hydrometrie",
+                    "label": "Hub'Eau Hydrometrie (hauteurs d'eau)",
+                    "url": "https://hubeau.eaufrance.fr/api/v2/hydrometrie",
+                    "usage": "niveaux, tendances, stations hydro",
+                },
+                {
+                    "id": "hydroportail_seuils",
+                    "label": "HydroPortail seuils station",
+                    "url": "https://hydro.eaufrance.fr/",
+                    "usage": "seuils vigilance/urgence par station",
+                },
+                {
+                    "id": "hubeau_nappes",
+                    "label": "Hub'Eau Niveaux de nappes",
+                    "url": "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes",
+                    "usage": "piezometrie et tendances de nappes",
+                },
+                {
+                    "id": "georisques_rga_mvt",
+                    "label": "Georisques API RGA + MVT",
+                    "url": "https://www.georisques.gouv.fr/doc-api",
+                    "usage": "susceptibilite argiles et mouvements de terrain",
+                },
+                {
+                    "id": "brgm_lithologie",
+                    "label": "BRGM WFS LITHO_1M_SIMPLIFIEE",
+                    "url": "https://geoservices.brgm.fr/geologie?",
+                    "usage": "classification pedologique (argileux, calcaire, etc.)",
+                },
+                {
+                    "id": "geo_api_communes",
+                    "label": "Geo API Gouv Communes",
+                    "url": "https://geo.api.gouv.fr/",
+                    "usage": "contours communaux et codes INSEE",
+                },
+                {
+                    "id": "meteo_france_synop",
+                    "label": "Meteo-France SYNOP open data",
+                    "url": "https://donneespubliques.meteofrance.fr/",
+                    "usage": "pluviometrie observationnelle",
+                },
+                {
+                    "id": "open_meteo",
+                    "label": "Open-Meteo archive/forecast",
+                    "url": "https://open-meteo.com/",
+                    "usage": "pluie maillee et historique mensuel",
+                },
+            ],
+            "pluviometer_sources_candidates": [
+                {
+                    "label": "Meteo-France API Hub (observations de stations)",
+                    "url": "https://portail-api.meteofrance.fr/",
+                    "notes": "source recommandee pour densifier les pluviometres officiels",
+                },
+                {
+                    "label": "Meteo-France SYNOP",
+                    "url": "https://donneespubliques.meteofrance.fr/",
+                    "notes": "couverture nationale, resolution synoptique",
+                },
+            ],
+        }
 
         payload: Dict[str, object] = {
             "timestamp_utc": self._now_utc().isoformat(),
@@ -2499,6 +3903,17 @@ class LGVSeaMonitor:
             "piezometers": piezometers if isinstance(piezometers, dict) else {},
             "hydro_network": hydro_network if isinstance(hydro_network, dict) else {},
             "sectors": sectors if isinstance(sectors, dict) else {},
+            "lgv_communes": lgv_communes if isinstance(lgv_communes, dict) else {},
+            "fr_geography": (
+                {
+                    "communes_geojson": lgv_communes.get("communes_geojson"),
+                    "departements_ref": lgv_communes.get("departements_ref"),
+                    "summary": lgv_communes.get("summary"),
+                }
+                if isinstance(lgv_communes, dict)
+                else {}
+            ),
+            "metadata": metadata,
             "commune_ranking": (
                 sectors.get("commune_summary", [])
                 if isinstance(sectors, dict) and isinstance(sectors.get("commune_summary"), list)
@@ -2519,6 +3934,7 @@ class LGVSeaMonitor:
         geotech = self.fetch_geotechnical_context()
         piezometers = self.fetch_piezometers_near_lgv()
         hydro_network = self.fetch_hydro_network_near_lgv()
+        lgv_communes = self._build_lgv_communes_catalog()
         sectors = self.build_surveillance_sectors(weather_pack["selected"], geotech, piezometers, hydro_network)
         risks = self.analyze_risks(
             weather_pack["selected"],
@@ -2538,6 +3954,7 @@ class LGVSeaMonitor:
             piezometers,
             hydro_network,
             sectors,
+            lgv_communes,
             risks,
             map_path,
         )
@@ -2551,6 +3968,7 @@ class LGVSeaMonitor:
             "geotech_summary": geotech.get("summary") if isinstance(geotech, dict) else None,
             "piezometer_summary": piezometers.get("summary") if isinstance(piezometers, dict) else None,
             "hydro_network_summary": hydro_network.get("summary") if isinstance(hydro_network, dict) else None,
+            "lgv_communes_summary": lgv_communes.get("summary") if isinstance(lgv_communes, dict) else None,
             "sector_summary": sectors.get("summary") if isinstance(sectors, dict) else None,
             "map_path": map_path,
             "risk_report_path": risks.get("report_path"),
@@ -2597,7 +4015,11 @@ class LGVSeaMonitor:
         print("\nRivieres:")
         for river, info in rivers.items():
             if info.get("last_level_m") is not None:
-                print(f"  - {river}: {info['last_level_m']} m | trend {info.get('trend_mph')} m/h | thr {info.get('threshold_m')} | station {info.get('station_code')}")
+                print(
+                    f"  - {river}: {info['last_level_m']} m | trend {info.get('trend_mph')} m/h "
+                    f"| thr {info.get('threshold_m')} | thr_urgence {info.get('emergency_threshold_m')} "
+                    f"| station {info.get('station_code')}"
+                )
             else:
                 msg = info.get("message") or info.get("error") or "pas de donnees"
                 print(f"  - {river}: {msg}")

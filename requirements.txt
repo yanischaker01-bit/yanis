@@ -3,5 +3,6 @@ folium
 pandas
 requests
 schedule
+shapely
 streamlit==1.54.0
 streamlit-folium
