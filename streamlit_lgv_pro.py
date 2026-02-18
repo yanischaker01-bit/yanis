@@ -301,6 +301,92 @@ def _build_multi_commune_history(commune_rows: List[Dict[str, object]], years_ba
     return out.sort_values(["ym", "commune_label"]), model_by_commune
 
 
+def _season_totals_from_monthly(monthly_df: pd.DataFrame) -> Tuple[float | None, float | None, int | None]:
+    if monthly_df.empty:
+        return None, None, None
+    work = monthly_df.copy()
+    work["year"] = pd.to_numeric(work.get("year"), errors="coerce")
+    work["month"] = pd.to_numeric(work.get("month"), errors="coerce")
+    work["monthly_precip_mm"] = pd.to_numeric(work.get("monthly_precip_mm"), errors="coerce")
+    work = work.dropna(subset=["year", "month", "monthly_precip_mm"])
+    if work.empty:
+        return None, None, None
+    work["year"] = work["year"].astype(int)
+    work["month"] = work["month"].astype(int)
+    latest_year = int(work["year"].max())
+
+    winter_mask = ((work["year"] == latest_year - 1) & (work["month"] == 12)) | (
+        (work["year"] == latest_year) & (work["month"].isin([1, 2]))
+    )
+    spring_mask = (work["year"] == latest_year) & (work["month"].isin([3, 4, 5]))
+
+    winter_val = pd.to_numeric(work.loc[winter_mask, "monthly_precip_mm"], errors="coerce").sum(min_count=1)
+    spring_val = pd.to_numeric(work.loc[spring_mask, "monthly_precip_mm"], errors="coerce").sum(min_count=1)
+    winter = None if pd.isna(winter_val) else round(float(winter_val), 1)
+    spring = None if pd.isna(spring_val) else round(float(spring_val), 1)
+    return winter, spring, latest_year
+
+
+def _build_pluvio_ranking(
+    commune_rows: List[Dict[str, object]],
+    weather_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+) -> pd.DataFrame:
+    if not commune_rows:
+        return pd.DataFrame()
+
+    hist = history_df.copy() if isinstance(history_df, pd.DataFrame) else pd.DataFrame()
+    if not hist.empty:
+        hist["commune_label"] = hist.get("commune_label", "").astype(str)
+
+    rows: List[Dict[str, object]] = []
+    for com in commune_rows:
+        cname = str(com.get("commune_name") or "Inconnue")
+        ccode = str(com.get("commune_code") or "")
+        label = f"{cname} ({ccode})" if ccode else cname
+        try:
+            lat = float(com.get("latitude"))
+            lon = float(com.get("longitude"))
+        except (TypeError, ValueError):
+            continue
+
+        wx = _nearest_row(weather_df, lat, lon) if isinstance(weather_df, pd.DataFrame) else {}
+        r1j = pd.to_numeric(wx.get("rain_24h_mm"), errors="coerce")
+        r7j = pd.to_numeric(wx.get("rain_7d_mm"), errors="coerce")
+        r1m = pd.to_numeric(wx.get("rain_month_mm"), errors="coerce")
+
+        winter = None
+        spring = None
+        season_year = None
+        if not hist.empty:
+            h = hist[hist["commune_label"] == label]
+            winter, spring, season_year = _season_totals_from_monthly(h)
+
+        rows.append(
+            {
+                "commune_label": label,
+                "commune_name": cname,
+                "commune_code": ccode,
+                "cum_1j_mm": None if pd.isna(r1j) else round(float(r1j), 1),
+                "cum_1_semaine_mm": None if pd.isna(r7j) else round(float(r7j), 1),
+                "cum_1_mois_mm": None if pd.isna(r1m) else round(float(r1m), 1),
+                "cum_hiver_mm": winter,
+                "cum_printemps_mm": spring,
+                "annee_saison_ref": season_year,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    metric_cols = ["cum_1j_mm", "cum_1_semaine_mm", "cum_1_mois_mm", "cum_hiver_mm", "cum_printemps_mm"]
+    for col in metric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+        out[f"rang_{col.replace('cum_', '').replace('_mm', '')}"] = out[col].rank(method="min", ascending=False).astype("Int64")
+    return out.sort_values(["cum_1_mois_mm", "cum_1_semaine_mm", "cum_1j_mm"], ascending=False, na_position="last")
+
+
 def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.DataFrame:
     if sectors_df.empty:
         return pd.DataFrame()
@@ -812,7 +898,12 @@ with st.sidebar:
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
     selected_sources = _multiselect_with_all("Sources meteo", sources, key="flt_sources")
 
-    communes = sorted(sectors_df["commune_name"].dropna().astype(str).unique().tolist()) if "commune_name" in sectors_df.columns else []
+    commune_values: List[str] = []
+    if "commune_name" in sectors_df.columns:
+        commune_values.extend(sectors_df["commune_name"].dropna().astype(str).unique().tolist())
+    if "commune_name" in lgv_communes_df.columns:
+        commune_values.extend(lgv_communes_df["commune_name"].dropna().astype(str).unique().tolist())
+    communes = sorted(_unique_text_values(commune_values))
     selected_communes = _multiselect_with_all("Communes", communes, key="flt_communes")
 
     station_communes = (
@@ -887,10 +978,63 @@ if not commune_df.empty:
     )
 
 commune_pool = commune_df.copy()
+if not lgv_communes_df.empty:
+    lgv_pool = lgv_communes_df.copy()
+    lgv_pool["commune_name"] = lgv_pool.get("commune_name", "Inconnue").fillna("Inconnue").astype(str)
+    lgv_pool["commune_code"] = lgv_pool.get("commune_code", "").fillna("").astype(str)
+    if "departement_code" not in lgv_pool.columns:
+        lgv_pool["departement_code"] = ""
+    if "departement_name" not in lgv_pool.columns:
+        lgv_pool["departement_name"] = ""
+    lgv_pool["latitude"] = pd.to_numeric(lgv_pool.get("centroid_latitude"), errors="coerce")
+    lgv_pool["longitude"] = pd.to_numeric(lgv_pool.get("centroid_longitude"), errors="coerce")
+    lgv_pool = lgv_pool[
+        ["commune_name", "commune_code", "departement_code", "departement_name", "latitude", "longitude"]
+    ].drop_duplicates(subset=["commune_code", "commune_name"], keep="first")
+
+    if commune_pool.empty:
+        commune_pool = lgv_pool.copy()
+    else:
+        existing_codes = set(commune_pool.get("commune_code", pd.Series(dtype=str)).fillna("").astype(str).tolist())
+        existing_names = set(commune_pool.get("commune_name", pd.Series(dtype=str)).fillna("").astype(str).tolist())
+        missing_rows = lgv_pool[
+            ~lgv_pool.apply(
+                lambda r: (str(r.get("commune_code") or "") in existing_codes and str(r.get("commune_code") or "").strip() != "")
+                or (str(r.get("commune_name") or "") in existing_names),
+                axis=1,
+            )
+        ]
+        if not missing_rows.empty:
+            commune_pool = pd.concat([commune_pool, missing_rows], ignore_index=True, sort=False)
+
+if not commune_pool.empty:
+    defaults = {
+        "commune_risk_level": "INDETERMINE",
+        "note_gc": 0.0,
+        "lgv_points_count": 0,
+        "ai_commune_risk_level": "INDETERMINE",
+        "max_ai_probability": 0.0,
+    }
+    for col, default in defaults.items():
+        if col not in commune_pool.columns:
+            commune_pool[col] = default
+        else:
+            commune_pool[col] = commune_pool[col].fillna(default)
+    commune_pool["commune_code"] = commune_pool.get("commune_code", "").fillna("").astype(str)
+    commune_pool["commune_label"] = commune_pool.apply(
+        lambda r: f"{str(r.get('commune_name') or 'Inconnue')} ({str(r.get('commune_code') or '')})"
+        if str(r.get("commune_code") or "").strip()
+        else str(r.get("commune_name") or "Inconnue"),
+        axis=1,
+    )
+
 selected_commune: Dict[str, object] = {}
 history_years = 5
+history_fetch_limit = 60
 selected_compare_commune_labels: List[str] = []
+compare_commune_rows: List[Dict[str, object]] = []
 compare_history_df = pd.DataFrame()
+compare_history_full_df = pd.DataFrame()
 history_models: Dict[str, str] = {}
 if not commune_pool.empty:
     with st.sidebar:
@@ -898,20 +1042,22 @@ if not commune_pool.empty:
         st.subheader("Analyse commune")
         commune_labels = commune_pool["commune_label"].astype(str).tolist()
         chosen_commune_label = st.selectbox("Commune detail", commune_labels, index=0)
-        selected_compare_commune_labels = st.multiselect(
+        selected_compare_commune_labels = _multiselect_with_all(
             "Communes a comparer",
             commune_labels,
-            default=commune_labels[: min(8, len(commune_labels))],
+            key="analysis_compare_communes",
         )
-        history_years = st.slider("Historique mensuel (ans)", min_value=2, max_value=5, value=5, step=1)
+        history_years = st.slider("Historique mensuel (ans)", min_value=2, max_value=10, value=5, step=1)
+        history_fetch_limit = st.slider("Max communes historique", min_value=10, max_value=120, value=60, step=10)
     selected_commune = commune_pool[commune_pool["commune_label"].astype(str) == chosen_commune_label].iloc[0].to_dict()
 
-    compare_commune_rows: List[Dict[str, object]] = []
     for label in selected_compare_commune_labels:
         hit = commune_pool[commune_pool["commune_label"].astype(str) == str(label)]
         if not hit.empty:
             compare_commune_rows.append(hit.iloc[0].to_dict())
-    compare_history_df, history_models = _build_multi_commune_history(compare_commune_rows, int(history_years))
+    compare_history_targets = compare_commune_rows[: int(history_fetch_limit)]
+    compare_history_df, history_models = _build_multi_commune_history(compare_history_targets, int(history_years))
+    compare_history_full_df = compare_history_df.copy()
 
     if not compare_history_df.empty:
         ym_options = sorted(compare_history_df["ym"].astype(str).unique().tolist())
@@ -935,6 +1081,11 @@ if selected_commune:
     )
 history_monthly_df = _safe_df(history_payload.get("monthly"))
 history_clim_df = _safe_df(history_payload.get("climatology"))
+pluvio_ranking_df = _build_pluvio_ranking(
+    commune_pool.to_dict(orient="records") if not commune_pool.empty else compare_commune_rows,
+    filtered_weather if not filtered_weather.empty else weather_df,
+    compare_history_full_df,
+)
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
 score = float(snapshot.get("score", 0.0) or 0.0)
 
@@ -1189,6 +1340,11 @@ with tabs[0]:
         st.altair_chart(chart_st, use_container_width=True)
 
     st.subheader("Comparaison pluvio entre communes (5 dernieres annees)")
+    if len(selected_compare_commune_labels) > int(history_fetch_limit):
+        st.info(
+            f"Historique calcule sur {history_fetch_limit} communes max pour performance "
+            f"(selection actuelle: {len(selected_compare_commune_labels)})."
+        )
     if compare_history_df.empty:
         st.info("Selectionne des communes avec historique disponible pour comparer les pluies mensuelles.")
     else:
@@ -1262,6 +1418,93 @@ with tabs[0]:
         if latest_rows:
             st.markdown("**Dernieres mesures meteo par commune comparee**")
             st.dataframe(pd.DataFrame(latest_rows), use_container_width=True, hide_index=True)
+
+    st.subheader("Classement cumuls pluvio (1J / 1 semaine / 1 mois / hiver / printemps)")
+    if pluvio_ranking_df.empty:
+        st.info("Classement indisponible: selectionne des communes avec mesures meteo et historique.")
+    else:
+        period_options = ["1J", "1 semaine", "1 mois", "Hiver", "Printemps", "Années"]
+        selected_periods = st.multiselect(
+            "Filtres periodes classement",
+            period_options,
+            default=period_options,
+            key="pluvio_period_filter",
+        )
+        ranking_sort_options = {
+            "1J": "cum_1j_mm",
+            "1 semaine": "cum_1_semaine_mm",
+            "1 mois": "cum_1_mois_mm",
+            "Hiver": "cum_hiver_mm",
+            "Printemps": "cum_printemps_mm",
+            "Années": "cum_annees_mm",
+        }
+        ranking_df = pluvio_ranking_df.copy()
+        selected_years: List[int] = []
+        if "Années" in selected_periods and not compare_history_full_df.empty:
+            year_vals = sorted(pd.to_numeric(compare_history_full_df.get("year"), errors="coerce").dropna().astype(int).unique().tolist())
+            if year_vals:
+                selected_years = st.multiselect(
+                    "Filtre années (historique)",
+                    year_vals,
+                    default=year_vals[-min(5, len(year_vals)):],
+                    key="pluvio_year_filter",
+                )
+                year_work = compare_history_full_df.copy()
+                year_work["year"] = pd.to_numeric(year_work.get("year"), errors="coerce")
+                if selected_years:
+                    year_work = year_work[year_work["year"].isin(selected_years)]
+                annual = (
+                    year_work.groupby("commune_label", as_index=False)["monthly_precip_mm"]
+                    .sum()
+                    .rename(columns={"monthly_precip_mm": "cum_annees_mm"})
+                )
+                annual["cum_annees_mm"] = pd.to_numeric(annual["cum_annees_mm"], errors="coerce").round(1)
+                ranking_df = ranking_df.merge(annual, on="commune_label", how="left")
+                ranking_df["rang_annees"] = ranking_df["cum_annees_mm"].rank(method="min", ascending=False).astype("Int64")
+            else:
+                ranking_df["cum_annees_mm"] = pd.NA
+                ranking_df["rang_annees"] = pd.Series(dtype="Int64")
+        else:
+            ranking_df["cum_annees_mm"] = pd.NA
+            ranking_df["rang_annees"] = pd.Series(dtype="Int64")
+
+        active_sort_options = {k: v for k, v in ranking_sort_options.items() if k in selected_periods} or {"1 mois": "cum_1_mois_mm"}
+        ranking_sort_label = st.selectbox(
+            "Classement principal",
+            list(active_sort_options.keys()),
+            index=min(2, max(0, len(active_sort_options) - 1)),
+            key="pluvio_ranking_sort",
+        )
+        ranking_sort_col = active_sort_options[ranking_sort_label]
+        ranking_df = ranking_df.sort_values(ranking_sort_col, ascending=False, na_position="last").copy()
+
+        col_map = {
+            "1J": ["cum_1j_mm", "rang_1j"],
+            "1 semaine": ["cum_1_semaine_mm", "rang_1_semaine"],
+            "1 mois": ["cum_1_mois_mm", "rang_1_mois"],
+            "Hiver": ["cum_hiver_mm", "rang_hiver"],
+            "Printemps": ["cum_printemps_mm", "rang_printemps"],
+            "Années": ["cum_annees_mm", "rang_annees"],
+        }
+        ranking_cols = ["commune_label"]
+        for p in selected_periods:
+            ranking_cols.extend(col_map.get(p, []))
+        if any(p in selected_periods for p in ["Hiver", "Printemps"]):
+            ranking_cols.append("annee_saison_ref")
+        ranking_cols = [c for c in ranking_cols if c in ranking_df.columns]
+        st.dataframe(ranking_df[ranking_cols], use_container_width=True, hide_index=True)
+
+        top_rank = ranking_df.head(25).copy()
+        bar_rank = (
+            alt.Chart(top_rank)
+            .mark_bar()
+            .encode(
+                x=alt.X(f"{ranking_sort_col}:Q", title=f"Cumul {ranking_sort_label} (mm)"),
+                y=alt.Y("commune_label:N", sort="-x", title="Commune"),
+                tooltip=[c for c in ranking_cols if c in top_rank.columns],
+            )
+        )
+        st.altair_chart(bar_rank, use_container_width=True)
 
     st.subheader("Analyse detaillee commune")
     if not selected_commune:

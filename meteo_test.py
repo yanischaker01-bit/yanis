@@ -91,9 +91,12 @@ class LGVSeaMonitor:
         self.piezometer_max_stations = 25
         self.piezometer_history_days = 90
         self.piezometer_cache_hours = 6
-        self.hydro_network_corridor_km = 8.0
-        self.hydro_network_max_stations = 35
-        self.hydro_network_hours = 48
+        self.hydro_network_corridor_km = 12.0
+        self.hydro_network_max_stations = 45
+        self.hydro_network_hours = 120
+        self.hydro_network_page_size = 2000
+        self.hydro_network_max_pages = 6
+        self.hydro_network_scan_multiplier = 1
         self.hydro_network_cache_hours = 6
         self.hydro_threshold_cache_hours = 24
         self.sector_length_km = 25.0
@@ -1391,7 +1394,7 @@ class LGVSeaMonitor:
         return deps
 
     def _build_lgv_communes_catalog(self) -> Dict[str, object]:
-        required_catalog_version = 3
+        required_catalog_version = 5
         cached = self._load_fresh_cache(self.lgv_communes_cache_file, self.lgv_communes_cache_days * 24)
         current_fingerprint = self._lgv_lines_fingerprint()
         if isinstance(cached, dict) and str(cached.get("lgv_fingerprint") or "") == current_fingerprint:
@@ -2345,7 +2348,7 @@ class LGVSeaMonitor:
         }
 
         response = self.session.get(url, params=params, timeout=30)
-        if response.status_code != 200:
+        if response.status_code not in (200, 206):
             raise RuntimeError(f"Hub'Eau observations_tr HTTP {response.status_code}")
 
         rows = []
@@ -2528,39 +2531,66 @@ class LGVSeaMonitor:
         }
 
     def fetch_hydro_network_near_lgv(self) -> Dict[str, object]:
+        required_catalog_version = 4
         cached = self._load_fresh_cache(self.hydro_network_cache_file, self.hydro_network_cache_hours)
         if cached:
+            cached_version = int(cached.get("catalog_version", 1) or 1)
             stations_cached = cached.get("stations")
-            if isinstance(stations_cached, list) and stations_cached:
+            if cached_version >= required_catalog_version and isinstance(stations_cached, list) and stations_cached:
                 sample = stations_cached[0] if isinstance(stations_cached[0], dict) else {}
                 if isinstance(sample, dict) and (
                     "emergency_threshold_m" in sample or "threshold_ratio" in sample
                 ):
                     return cached
-            elif isinstance(stations_cached, list):
+            elif cached_version >= required_catalog_version and isinstance(stations_cached, list):
                 return cached
 
-        min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=0.1)
-        response = self.session.get(
-            f"{self.hubeau_base}{self.hubeau_endpoints['stations']}",
-            params={"size": 2000, "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}"},
-            timeout=30,
-        )
-        if response.status_code != 200:
-            payload = {
-                "timestamp_utc": self._now_utc().isoformat(),
-                "source": DataSource.HUBEAU_HYDRO.value,
-                "summary": {"error": f"Hub'Eau stations HTTP {response.status_code}"},
-                "alerts": [],
-                "stations": [],
-            }
-            self._save_json(payload, self.hydro_network_cache_file)
-            return payload
+        try:
+            pad_deg = max(0.1, (float(self.hydro_network_corridor_km) + 2.0) / 111.0)
+        except Exception:
+            pad_deg = 0.1
+        min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=pad_deg)
 
-        rows = response.json().get("data", [])
+        rows: List[Dict[str, object]] = []
+        page_size = max(int(self.hydro_network_page_size), 100)
+        max_pages = max(int(self.hydro_network_max_pages), 1)
+        for page in range(1, max_pages + 1):
+            response = self.session.get(
+                f"{self.hubeau_base}{self.hubeau_endpoints['stations']}",
+                params={
+                    "size": page_size,
+                    "page": page,
+                    "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+                },
+                timeout=30,
+            )
+            if response.status_code != 200:
+                if page == 1:
+                    payload = {
+                        "timestamp_utc": self._now_utc().isoformat(),
+                        "catalog_version": required_catalog_version,
+                        "source": DataSource.HUBEAU_HYDRO.value,
+                        "summary": {"error": f"Hub'Eau stations HTTP {response.status_code}"},
+                        "alerts": [],
+                        "stations": [],
+                    }
+                    self._save_json(payload, self.hydro_network_cache_file)
+                    return payload
+                break
+
+            data_page = response.json().get("data", [])
+            if not isinstance(data_page, list) or not data_page:
+                break
+            rows.extend(data_page)
+            if len(data_page) < page_size:
+                break
+
         candidates: List[Dict[str, object]] = []
         seen_codes = set()
         for st in rows:
+            closed_at = st.get("date_fermeture_station") or st.get("date_desactivation")
+            if closed_at:
+                continue
             code = st.get("code_station") or st.get("code_entite") or st.get("code_site")
             lat = self._safe_float(st.get("latitude_station") or st.get("latitude"))
             lon = self._safe_float(st.get("longitude_station") or st.get("longitude"))
@@ -2584,10 +2614,14 @@ class LGVSeaMonitor:
                 }
             )
 
-        candidates = sorted(candidates, key=lambda x: x["distance_to_lgv_km"])[: self.hydro_network_max_stations]
+        candidates = sorted(candidates, key=lambda x: x["distance_to_lgv_km"])
+        scan_limit = min(
+            len(candidates),
+            max(1, int(self.hydro_network_max_stations)) * max(1, int(self.hydro_network_scan_multiplier)),
+        )
         stations: List[Dict[str, object]] = []
         alerts: List[Dict[str, object]] = []
-        for st in candidates:
+        for st in candidates[:scan_limit]:
             try:
                 obs_df = self.fetch_hydrometry_for_station(st["station_code"], hours=self.hydro_network_hours)
             except Exception:
@@ -2632,6 +2666,8 @@ class LGVSeaMonitor:
                 "source": DataSource.HUBEAU_HYDRO.value,
             }
             stations.append(item)
+            if len(stations) >= int(self.hydro_network_max_stations):
+                break
             if item["risk_level"] in {"CRITIQUE", "ELEVE"}:
                 ratio_txt = ""
                 if item.get("threshold_ratio") is not None:
@@ -2652,7 +2688,9 @@ class LGVSeaMonitor:
                 )
 
         summary = {
+            "raw_stations_bbox": int(len(rows)),
             "candidate_stations": int(len(candidates)),
+            "scanned_candidates": int(min(scan_limit, len(candidates))),
             "stations_with_data": int(len(stations)),
             "critical_stations": int(sum(1 for s in stations if s["risk_level"] == "CRITIQUE")),
             "high_stations": int(sum(1 for s in stations if s["risk_level"] == "ELEVE")),
@@ -2662,6 +2700,7 @@ class LGVSeaMonitor:
         }
         payload = {
             "timestamp_utc": self._now_utc().isoformat(),
+            "catalog_version": required_catalog_version,
             "source": DataSource.HUBEAU_HYDRO.value,
             "corridor_km": self.hydro_network_corridor_km,
             "summary": summary,
