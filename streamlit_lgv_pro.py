@@ -144,6 +144,32 @@ def _safe_df(records: object) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _unique_text_values(values: List[object]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for val in values:
+        txt = str(val).strip()
+        if not txt or txt.lower() == "nan":
+            continue
+        if txt in seen:
+            continue
+        seen.add(txt)
+        out.append(txt)
+    return out
+
+
+def _multiselect_with_all(label: str, options: List[str], key: str) -> List[str]:
+    clean_options = _unique_text_values(options)
+    if not clean_options:
+        st.multiselect(label, ["Tout"], default=["Tout"], key=key, disabled=True)
+        return []
+    ui_options = ["Tout"] + clean_options
+    selected = st.multiselect(label, ui_options, default=["Tout"], key=key)
+    if not selected or "Tout" in selected:
+        return clean_options
+    return [opt for opt in clean_options if opt in selected]
+
+
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     import math
 
@@ -464,7 +490,7 @@ def _build_map(
                 f"<b>Commune:</b> {row.get('commune_name')}<br>"
                 f"<b>Code INSEE:</b> {row.get('commune_code', 'n/a')}<br>"
                 f"<b>Risque:</b> {lvl}<br>"
-                f"<b>Note GC:</b> {row.get('note_gc')} /100<br>"
+                f"<b>Score risque global:</b> {row.get('note_gc')} /100<br>"
                 f"<b>Prediction IA commune:</b> {row.get('ai_commune_risk_level', 'n/a')}<br>"
                 f"<b>Probabilite IA max:</b> {round(float(row.get('max_ai_probability', 0.0) or 0.0) * 100.0, 1)} %<br>"
                 f"<b>Cumul moyen filtre:</b> {rain_avg:.1f} mm<br>"
@@ -780,21 +806,33 @@ with st.sidebar:
 
     period_label = st.selectbox("Periode pluvio", list(RAIN_PERIODS.keys()), index=0)
     rain_col_weather, commune_rain_col = RAIN_PERIODS[period_label]
-    min_risk = st.selectbox("Risque minimum", ["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=1)
+    min_risk = st.selectbox("Risque minimum", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=2)
     sector_risk_mode = st.selectbox("Filtre secteurs", ["IA predictive", "Operationnel"], index=0)
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
-    selected_sources = st.multiselect("Sources meteo", sources, default=sources)
+    selected_sources = _multiselect_with_all("Sources meteo", sources, key="flt_sources")
 
     communes = sorted(sectors_df["commune_name"].dropna().astype(str).unique().tolist()) if "commune_name" in sectors_df.columns else []
-    selected_communes = st.multiselect("Communes", communes, default=communes)
+    selected_communes = _multiselect_with_all("Communes", communes, key="flt_communes")
 
     station_communes = (
         sorted(weather_df["station_commune_name"].dropna().astype(str).unique().tolist())
         if "station_commune_name" in weather_df.columns
         else []
     )
-    selected_station_communes = st.multiselect("Communes des stations meteo", station_communes, default=station_communes)
+    selected_station_communes = _multiselect_with_all(
+        "Communes des stations meteo",
+        station_communes,
+        key="flt_station_communes",
+    )
+
+    hydro_sources = sorted(hydro_df["source"].dropna().astype(str).unique().tolist()) if "source" in hydro_df.columns else []
+    selected_hydro_sources = _multiselect_with_all("Sources hydro", hydro_sources, key="flt_hydro_sources")
+
+    hydro_rivers = sorted(hydro_df["river_name"].dropna().astype(str).unique().tolist()) if "river_name" in hydro_df.columns else []
+    selected_hydro_rivers = _multiselect_with_all("Cours d'eau / ruisseaux", hydro_rivers, key="flt_hydro_rivers")
+    hydro_risk_filter = st.selectbox("Risque hydro", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=0)
+    hydro_only_exceeded = st.checkbox("Hydro: uniquement seuil urgence depasse", value=False)
 
     st.caption("Toutes les communes filtrees sont affichees (pas de limite a 25).")
 
@@ -812,17 +850,31 @@ if not filtered_weather.empty and selected_sources:
     filtered_weather = filtered_weather[filtered_weather["source"].astype(str).isin(selected_sources)]
 if not filtered_weather.empty and selected_station_communes:
     filtered_weather = filtered_weather[filtered_weather["station_commune_name"].astype(str).isin(selected_station_communes)]
-if not filtered_weather.empty:
+if not filtered_weather.empty and str(min_risk).upper() != "TOUT":
     filtered_weather = filtered_weather[filtered_weather["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
 filtered_sectors = sectors_df.copy()
 if not filtered_sectors.empty and selected_communes:
     filtered_sectors = filtered_sectors[filtered_sectors["commune_name"].astype(str).isin(selected_communes)]
-if not filtered_sectors.empty:
+if not filtered_sectors.empty and str(min_risk).upper() != "TOUT":
     sector_risk_col = "risk_level"
     if sector_risk_mode.startswith("IA") and "ai_pred_risk_level" in filtered_sectors.columns:
         sector_risk_col = "ai_pred_risk_level"
     filtered_sectors = filtered_sectors[filtered_sectors[sector_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+
+filtered_hydro = hydro_df.copy()
+if not filtered_hydro.empty and selected_hydro_sources and "source" in filtered_hydro.columns:
+    filtered_hydro = filtered_hydro[filtered_hydro["source"].astype(str).isin(selected_hydro_sources)]
+if not filtered_hydro.empty and selected_hydro_rivers and "river_name" in filtered_hydro.columns:
+    filtered_hydro = filtered_hydro[filtered_hydro["river_name"].astype(str).isin(selected_hydro_rivers)]
+if not filtered_hydro.empty and str(hydro_risk_filter).upper() != "TOUT" and "risk_level" in filtered_hydro.columns:
+    filtered_hydro = filtered_hydro[
+        filtered_hydro["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(str(hydro_risk_filter).upper())
+    ]
+if not filtered_hydro.empty and hydro_only_exceeded and "threshold_exceeded" in filtered_hydro.columns:
+    filtered_hydro = filtered_hydro[filtered_hydro["threshold_exceeded"].fillna(False).astype(bool)]
+if not filtered_hydro.empty and str(min_risk).upper() != "TOUT" and "risk_level" in filtered_hydro.columns:
+    filtered_hydro = filtered_hydro[filtered_hydro["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
 commune_df = _aggregate_communes(filtered_sectors, commune_rain_col)
 if not commune_df.empty:
@@ -886,7 +938,11 @@ history_clim_df = _safe_df(history_payload.get("climatology"))
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
 score = float(snapshot.get("score", 0.0) or 0.0)
 
-hydro_exceeded_count = int(hydro_df["threshold_exceeded"].sum()) if (not hydro_df.empty and "threshold_exceeded" in hydro_df.columns) else 0
+hydro_exceeded_count = (
+    int(filtered_hydro["threshold_exceeded"].sum())
+    if (not filtered_hydro.empty and "threshold_exceeded" in filtered_hydro.columns)
+    else 0
+)
 total_lgv_communes = int(len(lgv_communes_df)) if not lgv_communes_df.empty else int(len(commune_df))
 ai_critical_count = int((filtered_sectors.get("ai_pred_risk_level", pd.Series(dtype=str)) == "CRITIQUE").sum()) if not filtered_sectors.empty else 0
 fragile_soil_count = (
@@ -911,7 +967,7 @@ with tabs[0]:
     left, right = st.columns([1.5, 1.0])
 
     with left:
-        st.subheader("Classement complet des communes (note GC)")
+        st.subheader("Classement complet des communes (score risque)")
         if commune_df.empty:
             st.info("Aucune commune pour les filtres courants.")
         else:
@@ -920,7 +976,7 @@ with tabs[0]:
                 alt.Chart(ranked_communes)
                 .mark_bar()
                 .encode(
-                    x=alt.X("note_gc:Q", title="Note GC /100"),
+                    x=alt.X("note_gc:Q", title="Score risque /100"),
                     y=alt.Y("commune_label:N", sort=alt.SortField(field="note_gc", order="descending"), title="Commune"),
                     color=alt.Color(
                         "commune_risk_level:N",
@@ -989,7 +1045,7 @@ with tabs[0]:
             st.metric(f"Max {period_label}", f"{max_rain:.1f} mm")
             st.metric(f"Moyenne {period_label}", f"{mean_rain:.1f} mm")
 
-    st.subheader("Composantes de risque par commune + note GC globale")
+    st.subheader("Composantes de risque par commune + score global")
     if commune_df.empty:
         st.info("Pas de donnees composantes a afficher.")
     else:
@@ -999,7 +1055,7 @@ with tabs[0]:
             "piezo_component_note": "Risque nappes (piezo)",
             "hydro_component_note": "Risque hydro",
             "ai_component_note": "Risque IA pluie+sol",
-            "note_gc": "Note GC globale",
+            "note_gc": "Score risque global",
         }
         comp_cols = ["commune_label"] + list(component_map.keys())
         comp_long = (
@@ -1019,7 +1075,7 @@ with tabs[0]:
             "Risque nappes (piezo)",
             "Risque hydro",
             "Risque IA pluie+sol",
-            "Note GC globale",
+            "Score risque global",
         ]
         heatmap = (
             alt.Chart(comp_long)
@@ -1036,7 +1092,7 @@ with tabs[0]:
                     "commune_label",
                     "component_label",
                     alt.Tooltip("component_note:Q", title="Note composante", format=".1f"),
-                    alt.Tooltip("note_gc:Q", title="Note GC globale", format=".1f"),
+                    alt.Tooltip("note_gc:Q", title="Score risque global", format=".1f"),
                 ],
             )
         )
@@ -1218,7 +1274,7 @@ with tabs[0]:
         s1.metric("Commune", commune_name)
         s2.metric("Code INSEE", commune_code)
         s3.metric("Risque commune", str(selected_commune.get("commune_risk_level", "INDETERMINE")))
-        s4.metric("Note GC globale", f"{float(selected_commune.get('note_gc', 0.0)):.1f}/100")
+        s4.metric("Score risque global", f"{float(selected_commune.get('note_gc', 0.0)):.1f}/100")
         s5.metric("Points LGV", int(float(selected_commune.get("lgv_points_count", 0) or 0)))
         s6.metric(
             "Risque IA commune",
@@ -1226,7 +1282,7 @@ with tabs[0]:
         )
 
         nearest_weather = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
-        nearest_hydro = _nearest_row(hydro_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
+        nearest_hydro = _nearest_row(filtered_hydro, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
         nearest_piezo = _nearest_row(piezo_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
 
         cwx, chx, cpx = st.columns(3)
@@ -1311,7 +1367,7 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Carte multi-couches")
-    if commune_df.empty and filtered_weather.empty and filtered_sectors.empty and lgv_communes_df.empty:
+    if commune_df.empty and filtered_weather.empty and filtered_sectors.empty and filtered_hydro.empty and lgv_communes_df.empty:
         st.info("Pas de donnees cartographiques avec ces filtres.")
     else:
         m = _build_map(
@@ -1319,7 +1375,7 @@ with tabs[1]:
             weather_df=filtered_weather,
             commune_df=commune_df,
             sectors_df=filtered_sectors,
-            hydro_df=hydro_df,
+            hydro_df=filtered_hydro,
             piezo_df=piezo_df,
             geotech_df=geotech_df,
             lgv_communes_df=lgv_communes_df,
@@ -1341,37 +1397,36 @@ with tabs[2]:
     if commune_df.empty:
         st.info("Aucune commune disponible.")
     else:
-        st.dataframe(
-            commune_df[
-                [
-                    "commune_name",
-                    "commune_code",
-                    "departement_code",
-                    "lgv_points_count",
-                    "note_gc",
-                    "commune_risk_level",
-                    "ai_commune_risk_level",
-                    "weather_component_note",
-                    "geotech_component_note",
-                    "piezo_component_note",
-                    "hydro_component_note",
-                    "ai_component_note",
-                    "avg_ai_probability",
-                    "max_ai_probability",
-                    "avg_point_score",
-                    "max_point_score",
-                    "critical",
-                    "high",
-                    "moderate",
-                    "ai_critical",
-                    "ai_high",
-                    "avg_rain_period_mm",
-                    "max_rain_period_mm",
-                ]
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
+        commune_cols = [
+            "commune_name",
+            "commune_code",
+            "departement_code",
+            "lgv_points_count",
+            "note_gc",
+            "commune_risk_level",
+            "ai_commune_risk_level",
+            "weather_component_note",
+            "geotech_component_note",
+            "piezo_component_note",
+            "hydro_component_note",
+            "ai_component_note",
+            "avg_ai_probability",
+            "max_ai_probability",
+            "avg_point_score",
+            "max_point_score",
+            "critical",
+            "high",
+            "moderate",
+            "ai_critical",
+            "ai_high",
+            "avg_rain_period_mm",
+            "max_rain_period_mm",
+        ]
+        commune_cols = [c for c in commune_cols if c in commune_df.columns]
+        commune_view = commune_df[commune_cols].copy()
+        if "note_gc" in commune_view.columns:
+            commune_view = commune_view.rename(columns={"note_gc": "score_risque_global"})
+        st.dataframe(commune_view, use_container_width=True, hide_index=True)
 
     st.subheader("Points LGV filtres (detail)")
     if filtered_sectors.empty:
@@ -1415,13 +1470,20 @@ with tabs[2]:
         st.dataframe(filtered_weather[wx_cols].sort_values("rain_24h_mm", ascending=False), use_container_width=True, hide_index=True)
 
     st.subheader("Cours d'eau et ruisseaux - hauteurs et seuils d'urgence")
-    if hydro_df.empty:
+    if filtered_hydro.empty:
         st.info("Aucune station hydro reseau disponible.")
     else:
+        river_count = int(filtered_hydro["river_name"].dropna().astype(str).nunique()) if "river_name" in filtered_hydro.columns else 0
+        source_count = int(filtered_hydro["source"].dropna().astype(str).nunique()) if "source" in filtered_hydro.columns else 0
+        st.caption(
+            f"Stations affichees: {len(filtered_hydro)} | Cours d'eau: {river_count} | Sources: {source_count} | "
+            f"Seuil urgence depasse: {hydro_exceeded_count}"
+        )
         hydro_view_cols = [
             "station_code",
             "station_name",
             "river_name",
+            "source",
             "distance_to_lgv_km",
             "last_level_m",
             "trend_mph",
@@ -1430,10 +1492,11 @@ with tabs[2]:
             "threshold_ratio",
             "threshold_exceeded",
             "risk_level",
+            "risk_reason",
             "last_obs_utc",
         ]
-        hydro_view_cols = [c for c in hydro_view_cols if c in hydro_df.columns]
-        hydro_view = hydro_df[hydro_view_cols].copy()
+        hydro_view_cols = [c for c in hydro_view_cols if c in filtered_hydro.columns]
+        hydro_view = filtered_hydro[hydro_view_cols].copy()
         if "threshold_ratio" in hydro_view.columns:
             hydro_view = hydro_view.sort_values("threshold_ratio", ascending=False, na_position="last")
         st.dataframe(hydro_view, use_container_width=True, hide_index=True)
