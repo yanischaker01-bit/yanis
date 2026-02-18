@@ -99,6 +99,9 @@ class LGVSeaMonitor:
         self.sector_length_km = 25.0
         self.sector_radius_km = 10.0
         self.lgv_commune_sample_step_km = 0.2
+        self.lgv_commune_dep_discovery_step_km = 4.0
+        self.lgv_commune_dep_discovery_limit = 160
+        self.lgv_commune_capture_buffer_km = 0.35
         self.lgv_communes_cache_days = 30
         self.lgv_reference_departements = ["33", "24", "16", "86", "37"]
         self.ai_model_name = "LGV-SEA-RiskAI-v1"
@@ -1351,8 +1354,44 @@ class LGVSeaMonitor:
         except Exception:
             return []
 
+    def _discover_lgv_departements(self, lines: List[List[Tuple[float, float]]]) -> List[str]:
+        deps: List[str] = []
+        seen = set()
+        for dep in self.lgv_reference_departements:
+            dep_txt = str(dep).strip()
+            if dep_txt and dep_txt not in seen:
+                seen.add(dep_txt)
+                deps.append(dep_txt)
+
+        step_km = max(float(self.lgv_commune_dep_discovery_step_km), self.lgv_commune_sample_step_km, 0.2)
+        raw_samples: List[Dict[str, float]] = []
+        for line in lines:
+            if not isinstance(line, list) or len(line) < 2:
+                continue
+            raw_samples.extend(self._sample_line_with_chainage(line, step_km))
+
+        if len(raw_samples) > self.lgv_commune_dep_discovery_limit:
+            stride = max(1, len(raw_samples) // self.lgv_commune_dep_discovery_limit)
+            sampled = raw_samples[::stride]
+            if sampled[-1] != raw_samples[-1]:
+                sampled.append(raw_samples[-1])
+            raw_samples = sampled
+
+        for sample in raw_samples:
+            lat = self._safe_float(sample.get("latitude"))
+            lon = self._safe_float(sample.get("longitude"))
+            if lat is None or lon is None:
+                continue
+            info = self._resolve_commune_for_point(float(lat), float(lon))
+            dep_txt = str(info.get("departement_code") or "").strip()
+            if dep_txt and dep_txt not in seen:
+                seen.add(dep_txt)
+                deps.append(dep_txt)
+
+        return deps
+
     def _build_lgv_communes_catalog(self) -> Dict[str, object]:
-        required_catalog_version = 2
+        required_catalog_version = 3
         cached = self._load_fresh_cache(self.lgv_communes_cache_file, self.lgv_communes_cache_days * 24)
         current_fingerprint = self._lgv_lines_fingerprint()
         if isinstance(cached, dict) and str(cached.get("lgv_fingerprint") or "") == current_fingerprint:
@@ -1378,7 +1417,26 @@ class LGVSeaMonitor:
             self._save_json(payload, self.lgv_communes_cache_file)
             return payload
 
-        line = self._representative_lgv_line()
+        lines_for_catalog = [list(line) for line in self.lgv_lines_latlon if isinstance(line, list) and len(line) >= 2]
+        if not lines_for_catalog:
+            line = self._representative_lgv_line()
+            if len(line) >= 2:
+                lines_for_catalog = [line]
+
+        if not lines_for_catalog:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "ligne_lgv_vide"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        line = max(lines_for_catalog, key=lambda coords: self._line_length_km(coords))
         samples = self._sample_line_with_chainage(line, self.lgv_commune_sample_step_km)
         if not samples:
             payload = {
@@ -1393,9 +1451,11 @@ class LGVSeaMonitor:
             self._save_json(payload, self.lgv_communes_cache_file)
             return payload
 
+        departements_catalog = self._discover_lgv_departements(lines_for_catalog)
+
         entries: List[Dict[str, object]] = []
         geometries: List[object] = []
-        for dep in self.lgv_reference_departements:
+        for dep in departements_catalog:
             for feat in self._load_communes_department_features(dep):
                 if not isinstance(feat, dict):
                     continue
@@ -1526,13 +1586,44 @@ class LGVSeaMonitor:
             row["sample_count"] = int(row.get("sample_count", 0)) + 1
 
         line_geom = None
+        line_capture_source = None
+        line_capture_geom = None
         if LineString is not None and line and len(line) >= 2:
             try:
                 line_geom = LineString([(float(lon), float(lat)) for lat, lon in line])
             except Exception:
                 line_geom = None
+            try:
+                capture_lines = []
+                for line_coords in lines_for_catalog:
+                    if not isinstance(line_coords, list) or len(line_coords) < 2:
+                        continue
+                    capture_lines.append(LineString([(float(lon), float(lat)) for lat, lon in line_coords]))
+                if capture_lines:
+                    if len(capture_lines) == 1 or MultiLineString is None:
+                        line_capture_source = capture_lines[0]
+                    else:
+                        line_capture_source = MultiLineString([list(seg.coords) for seg in capture_lines])
+            except Exception:
+                line_capture_source = line_geom
 
-        if line_geom is not None:
+        if line_capture_source is None:
+            line_capture_source = line_geom
+
+        if line_capture_source is not None:
+            try:
+                buffer_deg = max(float(self.lgv_commune_capture_buffer_km), 0.0) / 111.0
+            except Exception:
+                buffer_deg = 0.0
+            if buffer_deg > 0:
+                try:
+                    line_capture_geom = line_capture_source.buffer(buffer_deg)
+                except Exception:
+                    line_capture_geom = line_capture_source
+            else:
+                line_capture_geom = line_capture_source
+
+        if line_geom is not None and line_capture_geom is not None:
             for meta in entries:
                 code = str(meta.get("commune_code") or "")
                 if not code:
@@ -1541,9 +1632,9 @@ class LGVSeaMonitor:
                 if geom is None:
                     continue
                 try:
-                    if not geom.intersects(line_geom):
+                    if not geom.intersects(line_capture_geom):
                         continue
-                    intersection = geom.intersection(line_geom)
+                    intersection = geom.intersection(line_capture_geom)
                 except Exception:
                     continue
                 if intersection is None or intersection.is_empty:
@@ -1632,6 +1723,8 @@ class LGVSeaMonitor:
                 "departement_count": int(len(dep_counts)),
                 "departement_distribution": dep_counts,
                 "communes_geojson_count": int(len(commune_features)),
+                "departement_catalog_ref_count": int(len(departements_catalog)),
+                "capture_buffer_km": float(self.lgv_commune_capture_buffer_km),
             },
             "communes": communes_rows,
             "communes_geojson": {
@@ -1639,6 +1732,7 @@ class LGVSeaMonitor:
                 "features": commune_features,
             },
             "departements_ref": self.lgv_reference_departements,
+            "departements_catalog": departements_catalog,
         }
         self._save_json(payload, self.lgv_communes_cache_file)
         ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
@@ -1686,14 +1780,25 @@ class LGVSeaMonitor:
                 except Exception:
                     pass
 
-            if hasattr(g, "coords"):
+            gtype = str(getattr(g, "geom_type", "")).upper()
+            if gtype == "POLYGON":
                 try:
-                    for xy in list(g.coords):
-                        if len(xy) >= 2:
-                            coords.append((float(xy[0]), float(xy[1])))
-                        if len(coords) >= max_points:
-                            return
+                    _walk(g.exterior)
+                    for ring in list(g.interiors):
+                        _walk(ring)
+                    return
                 except Exception:
+                    return
+
+            try:
+                seq = list(g.coords)
+            except Exception:
+                return
+
+            for xy in seq:
+                if len(xy) >= 2:
+                    coords.append((float(xy[0]), float(xy[1])))
+                if len(coords) >= max_points:
                     return
 
         _walk(geom_obj)
