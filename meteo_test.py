@@ -91,15 +91,16 @@ class LGVSeaMonitor:
         self.piezometer_max_stations = 25
         self.piezometer_history_days = 90
         self.piezometer_cache_hours = 6
-        self.hydro_network_corridor_km = 12.0
-        self.hydro_network_max_stations = 45
+        self.hydro_network_corridor_km = 15.0
+        self.hydro_network_max_stations = 80
         self.hydro_network_hours = 120
         self.hydro_network_page_size = 2000
         self.hydro_network_max_pages = 6
-        self.hydro_network_scan_multiplier = 1
+        self.hydro_network_scan_multiplier = 2
         self.hydro_network_cache_hours = 6
         self.hydro_threshold_cache_hours = 24
-        self.sector_length_km = 25.0
+        self.sector_length_km = 5.0
+        self.sector_max_points = 140
         self.sector_radius_km = 10.0
         self.lgv_commune_sample_step_km = 0.2
         self.lgv_commune_dep_discovery_step_km = 4.0
@@ -2531,7 +2532,7 @@ class LGVSeaMonitor:
         }
 
     def fetch_hydro_network_near_lgv(self) -> Dict[str, object]:
-        required_catalog_version = 4
+        required_catalog_version = 5
         cached = self._load_fresh_cache(self.hydro_network_cache_file, self.hydro_network_cache_hours)
         if cached:
             cached_version = int(cached.get("catalog_version", 1) or 1)
@@ -2719,7 +2720,28 @@ class LGVSeaMonitor:
         piezometers: Optional[Dict[str, object]],
         hydro_network: Optional[Dict[str, object]],
     ) -> Dict[str, object]:
-        centers = self._sample_points_along_lgv(self.sector_length_km, 40)
+        centers_with_pk: List[Tuple[float, float, float]] = []
+        line = self._representative_lgv_line()
+        if line and len(line) >= 2:
+            chain_samples = self._sample_line_with_chainage(line, self.sector_length_km)
+            if chain_samples:
+                for item in chain_samples:
+                    lat = self._safe_float(item.get("latitude"))
+                    lon = self._safe_float(item.get("longitude"))
+                    pk_km = self._safe_float(item.get("pk_km"))
+                    if lat is None or lon is None or pk_km is None:
+                        continue
+                    centers_with_pk.append((float(lat), float(lon), float(pk_km)))
+        if not centers_with_pk:
+            fallback_centers = self._sample_points_along_lgv(self.sector_length_km, self.sector_max_points)
+            for idx, (lat, lon) in enumerate(fallback_centers):
+                centers_with_pk.append((float(lat), float(lon), float(idx) * float(self.sector_length_km)))
+        if len(centers_with_pk) > int(self.sector_max_points):
+            stride = max(1, len(centers_with_pk) // int(self.sector_max_points))
+            sampled = centers_with_pk[::stride]
+            if sampled and sampled[-1] != centers_with_pk[-1]:
+                sampled.append(centers_with_pk[-1])
+            centers_with_pk = sampled[: int(self.sector_max_points)]
         sectors = []
         alerts = []
 
@@ -2733,7 +2755,7 @@ class LGVSeaMonitor:
         hydro_score_map = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
         ai_risk_color = {"FAIBLE": "#16a34a", "MODERE": "#ea580c", "ELEVE": "#dc2626", "CRITIQUE": "#7f1d1d"}
 
-        for idx, (lat, lon) in enumerate(centers, start=1):
+        for idx, (lat, lon, pk_km) in enumerate(centers_with_pk, start=1):
             near_weather = [
                 r for r in weather_records
                 if self._haversine_km(lat, lon, float(r.get("latitude", lat)), float(r.get("longitude", lon))) <= self.sector_radius_km
@@ -2801,6 +2823,7 @@ class LGVSeaMonitor:
                 "sector_id": f"S{idx:02d}",
                 "latitude": round(float(lat), 6),
                 "longitude": round(float(lon), 6),
+                "pk_km": round(float(pk_km), 3),
                 "radius_km": self.sector_radius_km,
                 "commune_name": commune_info.get("commune_name"),
                 "commune_code": commune_info.get("commune_code"),
@@ -3950,8 +3973,8 @@ class LGVSeaMonitor:
                     "Intersection de la trace LGV avec contours communaux Geo API Gouv, "
                     "avec chainage PK approximatif par echantillonnage de la ligne."
                 ),
-                "note_gc_commune": (
-                    "Note /100 issue des composantes pluie, geotech, nappes, hydro et de la criticite des points LGV."
+                "score_risque_communal": (
+                    "Score /100 issu des composantes pluie, geotech, nappes, hydro et de la criticite des points LGV."
                 ),
                 "modele_ia_sectoriel": (
                     "Modele IA LGV-SEA-RiskAI-v1: prediction sectorielle via combinaison non lineaire "

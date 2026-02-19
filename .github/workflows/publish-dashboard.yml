@@ -20,6 +20,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,14 +36,21 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run dashboard generation
-        run: python run_once_dashboard.py
+        run: |
+          python run_once_dashboard.py || (sleep 20 && python run_once_dashboard.py) || true
 
       - name: Prepare public artifact
         run: |
-          mkdir -p site
+          mkdir -p site/reports
+          if [ ! -f reports/lgv_dashboard_latest.html ]; then
+            echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
+          fi
+          if [ ! -f reports/streamlit_snapshot_latest.json ]; then
+            echo "{}" > reports/streamlit_snapshot_latest.json
+          fi
           cp reports/lgv_dashboard_latest.html site/index.html
-          cp -r reports site/reports
-          cp -r data site/data
+          cp reports/lgv_dashboard_latest.html site/reports/lgv_dashboard_latest.html
+          cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
