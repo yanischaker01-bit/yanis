@@ -45,6 +45,28 @@ RAIN_COMPONENT_THRESHOLDS = {
     "weather_max_month_mm": (60.0, 110.0, 170.0, 240.0),
 }
 
+WEATHER_SOURCE_RELIABILITY = {
+    "SYNOP": 96.0,
+    "METEOFRANCE": 93.0,
+    "VIGICRUES": 88.0,
+    "OPEN_METEO": 82.0,
+}
+
+WEATHER_ALERT_THRESHOLDS = {
+    "FAIBLE": 25.0,
+    "MODERE": 45.0,
+    "ELEVE": 65.0,
+    "CRITIQUE": 82.0,
+}
+
+WEATHER_OP_ACTIONS = {
+    "FAIBLE": "Suivi normal (controle quotidien).",
+    "MODERE": "Surveillance renforcee (controle terrain <24h).",
+    "ELEVE": "Pre-alerte GC (controle terrain <12h).",
+    "CRITIQUE": "Alerte urgence GC (controle immediat <2h).",
+    "INDETERMINE": "Donnees insuffisantes (verification manuelle).",
+}
+
 
 def _risk_rank(level: str) -> int:
     return RISK_ORDER.get(str(level or "").upper(), 0)
@@ -91,6 +113,257 @@ def _score_from_presence_count(value: float, medium: float, high: float) -> floa
     if value > 0.0:
         return 2.0
     return 1.0
+
+
+def _weather_level_from_index(index: float) -> str:
+    val = float(index or 0.0)
+    if val >= WEATHER_ALERT_THRESHOLDS["CRITIQUE"]:
+        return "CRITIQUE"
+    if val >= WEATHER_ALERT_THRESHOLDS["ELEVE"]:
+        return "ELEVE"
+    if val >= WEATHER_ALERT_THRESHOLDS["MODERE"]:
+        return "MODERE"
+    return "FAIBLE"
+
+
+def _weather_freshness_level_from_age(hours: float) -> str:
+    h = float(hours or 0.0)
+    if h <= 6.0:
+        return "TRES_RECENTE"
+    if h <= 12.0:
+        return "RECENTE"
+    if h <= 24.0:
+        return "VALIDE"
+    if h <= 48.0:
+        return "ANCIENNE"
+    return "OBSOLETE"
+
+
+def _weather_data_reliability_label(quality_note: float, obs_age_h: float) -> str:
+    q = float(quality_note or 0.0)
+    a = float(obs_age_h or 0.0)
+    if q < 55.0 or a > 30.0:
+        return "A_VERIFIER"
+    if q < 70.0 or a > 18.0:
+        return "SURVEILLER"
+    return "OK"
+
+
+def _weather_action_label(level: str, reliability: str) -> str:
+    lvl = str(level or "INDETERMINE").upper()
+    rel = str(reliability or "A_VERIFIER").upper()
+    base = WEATHER_OP_ACTIONS.get(lvl, WEATHER_OP_ACTIONS["INDETERMINE"])
+    if rel == "A_VERIFIER":
+        return f"{base} Validation meteo + terrain obligatoire."
+    if rel == "SURVEILLER":
+        return f"{base} Controler la source meteo avant engagement."
+    return base
+
+
+def _source_reliability_note(source: str) -> float:
+    src = str(source or "").strip().upper()
+    if not src:
+        return 70.0
+    for key, note in WEATHER_SOURCE_RELIABILITY.items():
+        if key in src:
+            return float(note)
+    return 75.0
+
+
+def _build_weather_enhanced(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp | None) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+
+    df = weather_df.copy()
+    for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "rain_forecast_mm", "distance_to_lgv_km"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        else:
+            df[col] = np.nan
+
+    ts_source = None
+    if "date_obs_raw" in df.columns:
+        ts_source = pd.to_datetime(df["date_obs_raw"], utc=True, errors="coerce")
+    if ts_source is None or ts_source.isna().all():
+        ts_source = pd.to_datetime(df.get("date"), utc=True, errors="coerce")
+    df["obs_ts_utc"] = ts_source
+
+    if snapshot_ts is None or pd.isna(snapshot_ts):
+        snapshot_ts = pd.Timestamp.now(tz="UTC")
+    delta_h = (snapshot_ts - df["obs_ts_utc"]).dt.total_seconds() / 3600.0
+    df["obs_age_h"] = pd.to_numeric(delta_h, errors="coerce").fillna(48.0).clip(lower=0.0, upper=240.0)
+
+    def _freshness_note(hours: float) -> float:
+        h = float(hours or 0.0)
+        if h <= 3.0:
+            return 100.0
+        if h <= 6.0:
+            return 95.0
+        if h <= 12.0:
+            return 88.0
+        if h <= 24.0:
+            return 75.0
+        if h <= 48.0:
+            return 60.0
+        return 45.0
+
+    df["source_reliability_note"] = df.get("source", pd.Series("", index=df.index)).map(_source_reliability_note).astype(float)
+    df["freshness_note"] = df["obs_age_h"].map(_freshness_note).astype(float)
+
+    dist = pd.to_numeric(df.get("distance_to_lgv_km"), errors="coerce")
+    df["proximity_note"] = ((1.0 - dist.fillna(2.5).clip(lower=0.0, upper=2.5) / 2.5) * 100.0).clip(lower=35.0, upper=100.0)
+
+    completeness_cols = ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "rain_forecast_mm"]
+    completeness = df[completeness_cols].notna().sum(axis=1) / float(len(completeness_cols))
+    df["completeness_note"] = (completeness * 100.0).clip(lower=20.0, upper=100.0)
+
+    df["weather_quality_note"] = (
+        df["source_reliability_note"] * 0.30
+        + df["freshness_note"] * 0.35
+        + df["completeness_note"] * 0.20
+        + df["proximity_note"] * 0.15
+    ).round(1)
+
+    r24 = pd.to_numeric(df.get("rain_24h_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    r7 = pd.to_numeric(df.get("rain_7d_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    r30 = pd.to_numeric(df.get("rain_30d_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    rf = pd.to_numeric(df.get("rain_forecast_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
+    df["weather_alert_index"] = (
+        (r24 / 90.0).clip(upper=1.6) * 40.0
+        + (r7 / 140.0).clip(upper=1.5) * 30.0
+        + (r30 / 260.0).clip(upper=1.5) * 20.0
+        + (rf / 60.0).clip(upper=1.5) * 10.0
+    ).clip(lower=0.0, upper=100.0).round(1)
+    df["weather_alert_level"] = df["weather_alert_index"].map(_weather_level_from_index)
+
+    base_level = df.get("risk_level", pd.Series("INDETERMINE", index=df.index)).fillna("INDETERMINE").astype(str)
+    op_rank = np.maximum(
+        base_level.map(lambda x: _risk_rank(str(x))).fillna(0).astype(int),
+        df["weather_alert_level"].map(lambda x: _risk_rank(str(x))).fillna(0).astype(int),
+    )
+    rank_to_level = {0: "INDETERMINE", 1: "FAIBLE", 2: "MODERE", 3: "ELEVE", 4: "CRITIQUE"}
+    df["meteo_operational_level"] = op_rank.map(lambda r: rank_to_level.get(int(r), "INDETERMINE"))
+
+    quality_scale = (df["weather_quality_note"] / 100.0).clip(lower=0.30, upper=1.0)
+    df["weather_watch_priority"] = (df["weather_alert_index"] * (0.55 + 0.45 * quality_scale)).round(1)
+
+    def _quality_label(note: float) -> str:
+        v = float(note or 0.0)
+        if v >= 85.0:
+            return "TRES_BONNE"
+        if v >= 70.0:
+            return "BONNE"
+        if v >= 55.0:
+            return "MOYENNE"
+        return "A_VERIFIER"
+
+    df["weather_quality_level"] = df["weather_quality_note"].map(_quality_label)
+    df["obs_freshness_level"] = df["obs_age_h"].map(_weather_freshness_level_from_age)
+    df["weather_data_reliability"] = [
+        _weather_data_reliability_label(float(q), float(a))
+        for q, a in zip(df["weather_quality_note"].tolist(), df["obs_age_h"].tolist())
+    ]
+    df["weather_action_label"] = [
+        _weather_action_label(str(level), str(rel))
+        for level, rel in zip(df["meteo_operational_level"].tolist(), df["weather_data_reliability"].tolist())
+    ]
+    return df
+
+
+def _build_commune_weather_context(
+    commune_rows: pd.DataFrame,
+    weather_df: pd.DataFrame,
+    radius_km: float = 12.0,
+    min_points: int = 3,
+) -> pd.DataFrame:
+    if commune_rows.empty or weather_df.empty:
+        return pd.DataFrame()
+
+    weather = weather_df.copy()
+    weather["latitude"] = pd.to_numeric(weather.get("latitude"), errors="coerce")
+    weather["longitude"] = pd.to_numeric(weather.get("longitude"), errors="coerce")
+    weather = weather.dropna(subset=["latitude", "longitude"])
+    if weather.empty:
+        return pd.DataFrame()
+
+    w_lat = weather["latitude"].to_numpy(dtype=float)
+    w_lon = weather["longitude"].to_numpy(dtype=float)
+    w_r24 = pd.to_numeric(weather.get("rain_24h_mm"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_r7 = pd.to_numeric(weather.get("rain_7d_mm"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_r30 = pd.to_numeric(weather.get("rain_30d_mm"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_rm = pd.to_numeric(weather.get("rain_month_mm"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_rf = pd.to_numeric(weather.get("rain_forecast_mm"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_quality = pd.to_numeric(weather.get("weather_quality_note"), errors="coerce").fillna(60.0).to_numpy(dtype=float)
+    w_alert = pd.to_numeric(weather.get("weather_alert_index"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_priority = pd.to_numeric(weather.get("weather_watch_priority"), errors="coerce").fillna(0.0).to_numpy(dtype=float)
+    w_age = pd.to_numeric(weather.get("obs_age_h"), errors="coerce").fillna(48.0).to_numpy(dtype=float)
+    w_level = weather.get("meteo_operational_level", pd.Series("INDETERMINE", index=weather.index)).astype(str).to_numpy()
+
+    out_rows: List[Dict[str, object]] = []
+    for _, com in commune_rows.iterrows():
+        label = str(com.get("commune_label") or "")
+        lat = pd.to_numeric(com.get("latitude"), errors="coerce")
+        lon = pd.to_numeric(com.get("longitude"), errors="coerce")
+        if not label or pd.isna(lat) or pd.isna(lon):
+            continue
+
+        lat = float(lat)
+        lon = float(lon)
+        p1 = np.radians(lat)
+        p2 = np.radians(w_lat)
+        dlat = np.radians(w_lat - lat)
+        dlon = np.radians(w_lon - lon)
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlon / 2.0) ** 2
+        dist_km = 2.0 * 6371.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+        if dist_km.size == 0:
+            continue
+
+        idx = np.where(dist_km <= float(radius_km))[0]
+        if idx.size < int(min_points):
+            idx = np.argsort(dist_km)[: max(int(min_points), 1)]
+        if idx.size == 0:
+            continue
+
+        sel_dist = dist_km[idx]
+        weights = 1.0 / np.maximum(sel_dist, 0.5)
+        weights = weights / np.maximum(weights.sum(), 1e-9)
+
+        def _wavg(arr: np.ndarray) -> float:
+            return float(np.sum(arr[idx] * weights))
+
+        lvl_rank = [_risk_rank(str(x)) for x in w_level[idx]]
+        max_rank = max(lvl_rank) if lvl_rank else 0
+        lvl_map = {0: "INDETERMINE", 1: "FAIBLE", 2: "MODERE", 3: "ELEVE", 4: "CRITIQUE"}
+        weather_level = lvl_map.get(int(max_rank), "INDETERMINE")
+
+        quality_note = _wavg(w_quality)
+        age_h = _wavg(w_age)
+        reliability_flag = _weather_data_reliability_label(quality_note, age_h)
+        obs_freshness = _weather_freshness_level_from_age(age_h)
+        action_label = _weather_action_label(weather_level, reliability_flag)
+
+        out_rows.append(
+            {
+                "commune_label": label,
+                "weather_points_used": int(idx.size),
+                "weather_mean_dist_km": round(float(np.mean(sel_dist)), 3),
+                "weather_quality_note_commune": round(quality_note, 1),
+                "weather_obs_age_h_commune": round(age_h, 1),
+                "weather_alert_index_commune": round(_wavg(w_alert), 1),
+                "weather_watch_priority_commune": round(_wavg(w_priority), 1),
+                "weather_24h_commune_mm": round(_wavg(w_r24), 1),
+                "weather_7d_commune_mm": round(_wavg(w_r7), 1),
+                "weather_30d_commune_mm": round(_wavg(w_r30), 1),
+                "weather_month_commune_mm": round(_wavg(w_rm), 1),
+                "weather_forecast_commune_mm": round(_wavg(w_rf), 1),
+                "weather_alert_level_commune": weather_level,
+                "weather_reliability_flag": reliability_flag,
+                "weather_obs_freshness_commune": obs_freshness,
+                "weather_action_commune": action_label,
+            }
+        )
+
+    return pd.DataFrame(out_rows)
 
 
 def _find_snapshot() -> Path | None:
@@ -181,6 +454,39 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     dlon = math.radians(lon2 - lon1)
     a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
     return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _choose_weather_signal_column(df: pd.DataFrame, preferred: str, fallbacks: List[str]) -> str:
+    if df.empty:
+        return preferred
+
+    ordered: List[str] = []
+    for col in [preferred] + fallbacks:
+        if col not in ordered:
+            ordered.append(col)
+
+    def _signal_score(col: str) -> Tuple[int, float]:
+        if col not in df.columns:
+            return (-1, -1.0)
+        s = pd.to_numeric(df[col], errors="coerce")
+        if not s.notna().any():
+            return (0, -1.0)
+        non_zero = int((s.fillna(0.0) > 0.0).sum())
+        max_val = float(s.max(skipna=True))
+        return (non_zero, max_val)
+
+    pref_non_zero, pref_max = _signal_score(preferred)
+    if pref_non_zero > 0 and pref_max > 0.0:
+        return preferred
+
+    best_col = preferred
+    best_score = (pref_non_zero, pref_max)
+    for col in ordered[1:]:
+        score = _signal_score(col)
+        if score > best_score:
+            best_col = col
+            best_score = score
+    return best_col
 
 
 def _nearest_row(df: pd.DataFrame, lat: float, lon: float) -> Dict[str, object]:
@@ -470,7 +776,12 @@ def _build_pluvio_ranking(
         wx = _nearest_row(weather_df, lat, lon) if isinstance(weather_df, pd.DataFrame) else {}
         r1j = pd.to_numeric(wx.get("rain_24h_mm"), errors="coerce")
         r7j = pd.to_numeric(wx.get("rain_7d_mm"), errors="coerce")
-        r1m = pd.to_numeric(wx.get("rain_month_mm"), errors="coerce")
+        r30j = pd.to_numeric(wx.get("rain_30d_mm"), errors="coerce")
+        r1m_raw = pd.to_numeric(wx.get("rain_month_mm"), errors="coerce")
+        if (pd.isna(r1m_raw) or float(r1m_raw) <= 0.0) and (not pd.isna(r30j) and float(r30j) > 0.0):
+            r1m = r30j
+        else:
+            r1m = r1m_raw
 
         winter = None
         spring = None
@@ -503,14 +814,20 @@ def _build_pluvio_ranking(
 
     out = pd.DataFrame(rows)
     metric_cols = ["cum_1j_mm", "cum_1_semaine_mm", "cum_1_mois_mm", "cum_hiver_mm", "cum_printemps_mm", "max_mensuel_mm"]
+    realtime_cols = {"cum_1j_mm", "cum_1_semaine_mm", "cum_1_mois_mm"}
     for col in metric_cols:
         out[col] = pd.to_numeric(out[col], errors="coerce")
+        if col in realtime_cols:
+            if out[col].notna().any():
+                fallback = float(out[col].median(skipna=True))
+            else:
+                fallback = 0.0
+            out[col] = out[col].fillna(fallback)
+        rank_col = f"rang_{col.replace('cum_', '').replace('_mm', '')}"
         if out[col].notna().any():
-            fallback = float(out[col].median(skipna=True))
+            out[rank_col] = out[col].rank(method="min", ascending=False).astype("Int64")
         else:
-            fallback = 0.0
-        out[col] = out[col].fillna(fallback)
-        out[f"rang_{col.replace('cum_', '').replace('_mm', '')}"] = out[col].rank(method="min", ascending=False).astype("Int64")
+            out[rank_col] = pd.Series([pd.NA] * len(out), dtype="Int64")
     return out.sort_values(["cum_1_mois_mm", "cum_1_semaine_mm", "cum_1j_mm"], ascending=False, na_position="last")
 
 
@@ -662,16 +979,35 @@ def _build_map(
     if show_weather and not weather_df.empty:
         weather_layer = folium.FeatureGroup(name="Meteo", show=True)
         for _, row in weather_df.iterrows():
-            lvl = str(row.get("risk_level", "INDETERMINE"))
+            lvl = str(row.get("meteo_operational_level", row.get("risk_level", "INDETERMINE")))
             if _risk_rank(lvl) < _risk_rank(min_risk):
                 continue
             rain = float(row.get(rain_col_weather, 0.0) or 0.0)
+            quality_note = pd.to_numeric(row.get("weather_quality_note"), errors="coerce")
+            alert_idx = pd.to_numeric(row.get("weather_alert_index"), errors="coerce")
+            obs_age = pd.to_numeric(row.get("obs_age_h"), errors="coerce")
+            data_reliability = str(
+                row.get(
+                    "weather_data_reliability",
+                    _weather_data_reliability_label(
+                        0.0 if pd.isna(quality_note) else float(quality_note),
+                        0.0 if pd.isna(obs_age) else float(obs_age),
+                    ),
+                )
+            )
+            freshness_label = str(row.get("obs_freshness_level", _weather_freshness_level_from_age(0.0 if pd.isna(obs_age) else float(obs_age))))
+            action_label = str(row.get("weather_action_label", _weather_action_label(lvl, data_reliability)))
             popup = (
                 f"<b>Station:</b> {row.get('station_id')}<br>"
                 f"<b>Source:</b> {row.get('source')}<br>"
                 f"<b>Commune station:</b> {row.get('station_commune_name', 'n/a')}<br>"
-                f"<b>Risque:</b> {lvl}<br>"
+                f"<b>Risque meteo operationnel:</b> {lvl}<br>"
                 f"<b>Cumul filtre:</b> {rain:.1f} mm<br>"
+                f"<b>Indice alerte meteo:</b> {0.0 if pd.isna(alert_idx) else float(alert_idx):.1f}/100<br>"
+                f"<b>Qualite mesure:</b> {0.0 if pd.isna(quality_note) else float(quality_note):.1f}/100 ({row.get('weather_quality_level', 'n/a')})<br>"
+                f"<b>Anciennete obs:</b> {0.0 if pd.isna(obs_age) else float(obs_age):.1f} h ({freshness_label})<br>"
+                f"<b>Fiabilite donnee:</b> {data_reliability}<br>"
+                f"<b>Action recommandee:</b> {action_label}<br>"
                 f"<b>Dist LGV:</b> {row.get('distance_to_lgv_km')} km"
             )
             folium.CircleMarker(
@@ -940,6 +1276,7 @@ metadata_obj = snapshot.get("metadata") if isinstance(snapshot.get("metadata"), 
 line_meta = metadata_obj.get("line_monitoring", {}) if isinstance(metadata_obj.get("line_monitoring"), dict) else {}
 sector_base_km_raw = pd.to_numeric(line_meta.get("sector_length_km"), errors="coerce")
 sector_base_km = float(sector_base_km_raw) if not pd.isna(sector_base_km_raw) else 5.0
+snapshot_ts = pd.to_datetime(snapshot.get("timestamp_utc"), utc=True, errors="coerce")
 
 if not weather_df.empty:
     for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "distance_to_lgv_km"]:
@@ -949,6 +1286,7 @@ if not weather_df.empty:
     if "station_commune_name" not in weather_df.columns:
         weather_df["station_commune_name"] = "Inconnue"
     weather_df["station_commune_name"] = weather_df["station_commune_name"].fillna("Inconnue")
+    weather_df = _build_weather_enhanced(weather_df, snapshot_ts)
 
 if not sectors_df.empty:
     for col in [
@@ -1023,6 +1361,11 @@ with st.sidebar:
     period_label = st.selectbox("Periode pluvio", list(RAIN_PERIODS.keys()), index=0)
     rain_col_weather, commune_rain_col = RAIN_PERIODS[period_label]
     min_risk = st.selectbox("Risque minimum", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=2)
+    weather_risk_mode = st.selectbox(
+        "Filtre meteo",
+        ["Operationnel renforce (recommande)", "Pluie brute (niveau source)"],
+        index=0,
+    )
     sector_risk_mode = st.selectbox("Filtre secteurs", ["IA predictive", "Operationnel"], index=0)
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
@@ -1046,6 +1389,9 @@ with st.sidebar:
         station_communes,
         key="flt_station_communes",
     )
+    weather_min_quality = st.slider("Qualite meteo min (/100, 0=desactive)", min_value=0, max_value=100, value=0, step=5)
+    weather_max_age_h = st.slider("Age max observations meteo (h, 0=desactive)", min_value=0, max_value=120, value=0, step=6)
+    st.caption("Lecture meteo: qualite<55 ou age>30h = A_VERIFIER. Alerte critique >= 82/100.")
 
     hydro_sources = sorted(hydro_df["source"].dropna().astype(str).unique().tolist()) if "source" in hydro_df.columns else []
     selected_hydro_sources = _multiselect_with_all("Sources hydro", hydro_sources, key="flt_hydro_sources")
@@ -1066,13 +1412,41 @@ with st.sidebar:
     show_geotech = st.checkbox("Layer geotech", value=False)
     show_fr_layer = st.checkbox("Layer geographie FR", value=False)
 
-filtered_weather = weather_df.copy()
-if not filtered_weather.empty and selected_sources:
-    filtered_weather = filtered_weather[filtered_weather["source"].astype(str).isin(selected_sources)]
-if not filtered_weather.empty and selected_station_communes:
-    filtered_weather = filtered_weather[filtered_weather["station_commune_name"].astype(str).isin(selected_station_communes)]
+weather_for_context = weather_df.copy()
+if not weather_for_context.empty and selected_sources:
+    weather_for_context = weather_for_context[weather_for_context["source"].astype(str).isin(selected_sources)]
+if not weather_for_context.empty and selected_station_communes:
+    weather_for_context = weather_for_context[weather_for_context["station_commune_name"].astype(str).isin(selected_station_communes)]
+if not weather_for_context.empty and int(weather_min_quality) > 0 and "weather_quality_note" in weather_for_context.columns:
+    weather_for_context = weather_for_context[
+        pd.to_numeric(weather_for_context["weather_quality_note"], errors="coerce").fillna(0.0) >= float(weather_min_quality)
+    ]
+if not weather_for_context.empty and int(weather_max_age_h) > 0 and "obs_age_h" in weather_for_context.columns:
+    weather_for_context = weather_for_context[
+        pd.to_numeric(weather_for_context["obs_age_h"], errors="coerce").fillna(999.0) <= float(weather_max_age_h)
+    ]
+
+filtered_weather = weather_for_context.copy()
 if not filtered_weather.empty and str(min_risk).upper() != "TOUT":
-    filtered_weather = filtered_weather[filtered_weather["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+    weather_risk_col = "meteo_operational_level"
+    if weather_risk_mode.startswith("Pluie") or weather_risk_col not in filtered_weather.columns:
+        weather_risk_col = "risk_level"
+    filtered_weather = filtered_weather[filtered_weather[weather_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+
+weather_signal_df = filtered_weather if not filtered_weather.empty else weather_df
+effective_rain_col_weather = _choose_weather_signal_column(
+    weather_signal_df,
+    rain_col_weather,
+    ["rain_30d_mm", "rain_7d_mm", "rain_24h_mm", "rain_month_mm"],
+)
+RAIN_COL_LABELS = {
+    "rain_24h_mm": "24h",
+    "rain_7d_mm": "7 jours",
+    "rain_30d_mm": "30 jours",
+    "rain_month_mm": "Mois courant",
+}
+effective_period_label = RAIN_COL_LABELS.get(effective_rain_col_weather, period_label)
+weather_signal_fallback = effective_rain_col_weather != rain_col_weather
 
 filtered_sectors = sectors_df.copy()
 if not filtered_sectors.empty and selected_communes:
@@ -1138,18 +1512,6 @@ if not lgv_communes_df.empty:
             commune_pool = pd.concat([commune_pool, missing_rows], ignore_index=True, sort=False)
 
 if not commune_pool.empty:
-    defaults = {
-        "commune_risk_level": "INDETERMINE",
-        "risk_score": 0.0,
-        "lgv_points_count": 0,
-        "ai_commune_risk_level": "INDETERMINE",
-        "max_ai_probability": 0.0,
-    }
-    for col, default in defaults.items():
-        if col not in commune_pool.columns:
-            commune_pool[col] = default
-        else:
-            commune_pool[col] = commune_pool[col].fillna(default)
     commune_pool["commune_code"] = commune_pool.get("commune_code", "").fillna("").astype(str)
     commune_pool["commune_label"] = commune_pool.apply(
         lambda r: f"{str(r.get('commune_name') or 'Inconnue')} ({str(r.get('commune_code') or '')})"
@@ -1157,6 +1519,93 @@ if not commune_pool.empty:
         else str(r.get("commune_name") or "Inconnue"),
         axis=1,
     )
+
+    weather_ctx_source = weather_for_context if not weather_for_context.empty else weather_df
+    weather_context_df = _build_commune_weather_context(
+        commune_pool[["commune_label", "latitude", "longitude"]],
+        weather_ctx_source,
+        radius_km=12.0,
+        min_points=3,
+    )
+    if not weather_context_df.empty:
+        ctx_cols = [c for c in weather_context_df.columns if c != "commune_label"]
+        commune_pool = commune_pool.drop(columns=[c for c in ctx_cols if c in commune_pool.columns], errors="ignore")
+        commune_pool = commune_pool.merge(weather_context_df, on="commune_label", how="left")
+        if not commune_df.empty and "commune_label" in commune_df.columns:
+            commune_df = commune_df.drop(columns=[c for c in ctx_cols if c in commune_df.columns], errors="ignore")
+            commune_df = commune_df.merge(weather_context_df, on="commune_label", how="left")
+
+    if not commune_df.empty and "weather_alert_index_commune" in commune_df.columns:
+        base_weather_note = pd.to_numeric(commune_df.get("weather_component_note"), errors="coerce").fillna(0.0)
+        ctx_alert = pd.to_numeric(commune_df.get("weather_alert_index_commune"), errors="coerce").fillna(base_weather_note)
+        ctx_quality = pd.to_numeric(commune_df.get("weather_quality_note_commune"), errors="coerce").fillna(60.0).clip(lower=0.0, upper=100.0)
+        ctx_priority = pd.to_numeric(commune_df.get("weather_watch_priority_commune"), errors="coerce").fillna(0.0).clip(lower=0.0, upper=100.0)
+
+        commune_df["weather_component_note_raw"] = base_weather_note.round(1)
+        commune_df["weather_component_note"] = (
+            base_weather_note * 0.65 + ctx_alert * 0.35
+        ).clip(lower=0.0, upper=100.0).round(1)
+
+        quality_factor = (ctx_quality / 100.0).clip(lower=0.30, upper=1.0)
+        weather_effective_note = commune_df["weather_component_note"] * (0.55 + 0.45 * quality_factor)
+        commune_df["risk_score"] = (
+            pd.to_numeric(commune_df.get("risk_score"), errors="coerce").fillna(0.0) * 0.84
+            + weather_effective_note * 0.16
+        ).clip(lower=0.0, upper=100.0)
+        high_watch_mask = ctx_priority >= 85.0
+        commune_df.loc[high_watch_mask, "risk_score"] = (
+            commune_df.loc[high_watch_mask, "risk_score"] + 3.0
+        ).clip(upper=100.0)
+        commune_df["risk_score"] = pd.to_numeric(commune_df["risk_score"], errors="coerce").fillna(0.0).round(1)
+        commune_df["commune_risk_level"] = commune_df["risk_score"].map(_risk_level_from_note)
+        commune_df["note_gc"] = commune_df["risk_score"]
+
+        sync_cols = [
+            "commune_risk_level",
+            "risk_score",
+            "note_gc",
+            "weather_component_note",
+            "weather_component_note_raw",
+            "weather_points_used",
+            "weather_mean_dist_km",
+            "weather_quality_note_commune",
+            "weather_obs_age_h_commune",
+            "weather_alert_index_commune",
+            "weather_watch_priority_commune",
+            "weather_24h_commune_mm",
+            "weather_7d_commune_mm",
+            "weather_30d_commune_mm",
+            "weather_month_commune_mm",
+            "weather_forecast_commune_mm",
+            "weather_alert_level_commune",
+            "weather_reliability_flag",
+            "weather_obs_freshness_commune",
+            "weather_action_commune",
+        ]
+        sync_cols = [c for c in sync_cols if c in commune_df.columns]
+        if sync_cols:
+            sync_df = commune_df[["commune_label"] + sync_cols].drop_duplicates(subset=["commune_label"], keep="first")
+            commune_pool = commune_pool.drop(columns=[c for c in sync_cols if c in commune_pool.columns], errors="ignore")
+            commune_pool = commune_pool.merge(sync_df, on="commune_label", how="left")
+
+    defaults = {
+        "commune_risk_level": "INDETERMINE",
+        "risk_score": 0.0,
+        "lgv_points_count": 0,
+        "ai_commune_risk_level": "INDETERMINE",
+        "max_ai_probability": 0.0,
+        "weather_quality_note_commune": 0.0,
+        "weather_alert_index_commune": 0.0,
+        "weather_watch_priority_commune": 0.0,
+        "weather_reliability_flag": "A_VERIFIER",
+        "weather_obs_freshness_commune": "OBSOLETE",
+        "weather_action_commune": WEATHER_OP_ACTIONS["INDETERMINE"],
+    }
+    for col, default in defaults.items():
+        if col not in commune_pool.columns:
+            commune_pool[col] = default
+        else:
+            commune_pool[col] = commune_pool[col].fillna(default)
 
 selected_commune: Dict[str, object] = {}
 history_years = 5
@@ -1309,6 +1758,7 @@ tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes", "Metada
 
 with tabs[0]:
     left, right = st.columns([1.5, 1.0])
+    weather_summary_df = pd.DataFrame()
 
     with left:
         st.subheader("Classement complet des communes (score risque)")
@@ -1381,13 +1831,98 @@ with tabs[0]:
             st.altair_chart(chart_dist, use_container_width=True)
 
         st.subheader("Synthese pluie")
-        if filtered_weather.empty or rain_col_weather not in filtered_weather.columns:
+        if filtered_weather.empty or effective_rain_col_weather not in filtered_weather.columns:
             st.info("Pas de donnees pluie pour ce filtre.")
         else:
-            max_rain = float(filtered_weather[rain_col_weather].max())
-            mean_rain = float(filtered_weather[rain_col_weather].mean())
-            st.metric(f"Max {period_label}", f"{max_rain:.1f} mm")
-            st.metric(f"Moyenne {period_label}", f"{mean_rain:.1f} mm")
+            weather_summary_df = filtered_weather.copy()
+            max_rain = float(pd.to_numeric(weather_summary_df[effective_rain_col_weather], errors="coerce").fillna(0.0).max())
+            mean_rain = float(pd.to_numeric(weather_summary_df[effective_rain_col_weather], errors="coerce").fillna(0.0).mean())
+            st.metric(f"Max {effective_period_label}", f"{max_rain:.1f} mm")
+            st.metric(f"Moyenne {effective_period_label}", f"{mean_rain:.1f} mm")
+            if weather_signal_fallback:
+                st.caption(
+                    f"Periode demandee '{period_label}' sans signal exploitable sur ce snapshot. "
+                    f"Affichage bascule sur '{effective_period_label}'."
+                )
+            if "weather_quality_note" in weather_summary_df.columns:
+                q_mean = pd.to_numeric(weather_summary_df["weather_quality_note"], errors="coerce").mean()
+                st.metric("Qualite meteo moyenne", f"{0.0 if pd.isna(q_mean) else float(q_mean):.1f}/100")
+            if "obs_age_h" in weather_summary_df.columns:
+                stale_count = int((pd.to_numeric(weather_summary_df["obs_age_h"], errors="coerce").fillna(999.0) > 24.0).sum())
+                st.metric("Stations > 24h", stale_count)
+            if "weather_alert_index" in weather_summary_df.columns:
+                alert_mean = pd.to_numeric(weather_summary_df["weather_alert_index"], errors="coerce").fillna(0.0).mean()
+                critical_alert = int((pd.to_numeric(weather_summary_df["weather_alert_index"], errors="coerce").fillna(0.0) >= WEATHER_ALERT_THRESHOLDS["CRITIQUE"]).sum())
+                st.metric("Indice alerte moyen", f"{float(alert_mean):.1f}/100")
+                st.metric("Stations alerte critique", critical_alert)
+            if "weather_data_reliability" in weather_summary_df.columns:
+                to_verify_count = int((weather_summary_df["weather_data_reliability"].astype(str) == "A_VERIFIER").sum())
+                st.metric("Stations A_VERIFIER", to_verify_count)
+
+    if not weather_summary_df.empty:
+        st.markdown("**Lecture meteo sans ambiguite (regles de decision)**")
+        st.caption(
+            "Les stations sont classees par indice d'alerte, qualite et anciennete. "
+            "Le niveau operationnel guide l'action GC."
+        )
+        weather_legend_df = pd.DataFrame(
+            [
+                {
+                    "Niveau operationnel": "FAIBLE",
+                    "Indice alerte meteo": "< 45",
+                    "Action GC": WEATHER_OP_ACTIONS["FAIBLE"],
+                },
+                {
+                    "Niveau operationnel": "MODERE",
+                    "Indice alerte meteo": "45 a 64.9",
+                    "Action GC": WEATHER_OP_ACTIONS["MODERE"],
+                },
+                {
+                    "Niveau operationnel": "ELEVE",
+                    "Indice alerte meteo": "65 a 81.9",
+                    "Action GC": WEATHER_OP_ACTIONS["ELEVE"],
+                },
+                {
+                    "Niveau operationnel": "CRITIQUE",
+                    "Indice alerte meteo": ">= 82",
+                    "Action GC": WEATHER_OP_ACTIONS["CRITIQUE"],
+                },
+            ]
+        )
+        st.dataframe(weather_legend_df, use_container_width=True, hide_index=True)
+
+        if "meteo_operational_level" in weather_summary_df.columns:
+            level_dist_df = (
+                weather_summary_df["meteo_operational_level"]
+                .fillna("INDETERMINE")
+                .astype(str)
+                .value_counts()
+                .rename_axis("meteo_operational_level")
+                .reset_index(name="count")
+            )
+            level_chart = (
+                alt.Chart(level_dist_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("count:Q", title="Nombre de stations"),
+                    y=alt.Y("meteo_operational_level:N", sort="-x", title="Niveau meteo"),
+                    color=alt.Color(
+                        "meteo_operational_level:N",
+                        scale=alt.Scale(
+                            domain=["FAIBLE", "MODERE", "ELEVE", "CRITIQUE", "INDETERMINE"],
+                            range=[
+                                RISK_COLOR["FAIBLE"],
+                                RISK_COLOR["MODERE"],
+                                RISK_COLOR["ELEVE"],
+                                RISK_COLOR["CRITIQUE"],
+                                RISK_COLOR["INDETERMINE"],
+                            ],
+                        ),
+                    ),
+                    tooltip=["meteo_operational_level", "count"],
+                )
+            )
+            st.altair_chart(level_chart, use_container_width=True)
 
     st.subheader("Composantes de risque par commune + score global")
     if commune_df.empty:
@@ -1561,30 +2096,102 @@ with tabs[0]:
         st.altair_chart(pedo_chart, use_container_width=True)
 
     st.subheader("Top stations meteo")
-    if filtered_weather.empty or rain_col_weather not in filtered_weather.columns:
+    if filtered_weather.empty or effective_rain_col_weather not in filtered_weather.columns:
         st.info("Pas de station meteo pour ce filtre.")
     else:
-        top_stations = filtered_weather.sort_values(rain_col_weather, ascending=False).head(20).copy()
+        station_rank_mode = st.selectbox(
+            "Classement stations meteo",
+            ["Priorite de surveillance", f"Cumul {effective_period_label}"],
+            index=0,
+            key="station_rank_mode",
+        )
+        station_rank_col = "weather_watch_priority" if "weather_watch_priority" in filtered_weather.columns else effective_rain_col_weather
+        station_rank_title = "Priorite de surveillance (/100)"
+        if station_rank_mode.startswith("Cumul"):
+            station_rank_col = effective_rain_col_weather
+            station_rank_title = f"Cumul {effective_period_label} (mm)"
+
+        top_stations = filtered_weather.sort_values(station_rank_col, ascending=False).head(25).copy()
         top_stations["station_display"] = top_stations["station_id"].astype(str) + " (" + top_stations["source"].astype(str) + ")"
+        station_color_col = "meteo_operational_level" if "meteo_operational_level" in top_stations.columns else "risk_level"
+        station_tooltip = [
+            c
+            for c in [
+                "station_id",
+                "source",
+                "station_commune_name",
+                effective_rain_col_weather,
+                "weather_watch_priority",
+                "distance_to_lgv_km",
+                "risk_level",
+                "meteo_operational_level",
+                "weather_alert_index",
+                "weather_quality_note",
+                "weather_quality_level",
+                "weather_data_reliability",
+                "weather_action_label",
+                "obs_age_h",
+                "obs_freshness_level",
+                "date_obs_raw",
+            ]
+            if c in top_stations.columns
+        ]
         chart_st = (
             alt.Chart(top_stations)
             .mark_bar()
             .encode(
-                x=alt.X(f"{rain_col_weather}:Q", title=f"Cumul {period_label} (mm)"),
+                x=alt.X(f"{station_rank_col}:Q", title=station_rank_title),
                 y=alt.Y("station_display:N", sort="-x", title="Station"),
-                color=alt.Color("risk_level:N", scale=alt.Scale(domain=list(RISK_COLOR.keys()), range=list(RISK_COLOR.values()))),
+                color=alt.Color(f"{station_color_col}:N", scale=alt.Scale(domain=list(RISK_COLOR.keys()), range=list(RISK_COLOR.values()))),
+                tooltip=station_tooltip,
+            )
+        )
+        st.altair_chart(chart_st, use_container_width=True)
+        st.caption("Tri recommande: priorite de surveillance. Si la fiabilite meteo est faible, verification terrain obligatoire.")
+
+    st.subheader("Qualite et priorite meteo des stations")
+    if filtered_weather.empty:
+        st.info("Pas de station meteo pour l'analyse qualite/alerte.")
+    elif "weather_quality_note" not in filtered_weather.columns or "weather_watch_priority" not in filtered_weather.columns:
+        st.info("Indicateurs qualite meteo indisponibles dans ce snapshot.")
+    else:
+        qdf = filtered_weather.copy()
+        qdf["weather_quality_note"] = pd.to_numeric(qdf.get("weather_quality_note"), errors="coerce").fillna(0.0)
+        qdf["weather_watch_priority"] = pd.to_numeric(qdf.get("weather_watch_priority"), errors="coerce").fillna(0.0)
+        qdf["rain_24h_mm"] = pd.to_numeric(qdf.get("rain_24h_mm"), errors="coerce").fillna(0.0)
+        qdf["meteo_operational_level"] = qdf.get("meteo_operational_level", qdf.get("risk_level", "INDETERMINE")).astype(str)
+        scatter = (
+            alt.Chart(qdf)
+            .mark_circle(opacity=0.85)
+            .encode(
+                x=alt.X("weather_quality_note:Q", title="Qualite meteo (/100)"),
+                y=alt.Y("weather_watch_priority:Q", title="Priorite de surveillance (/100)"),
+                size=alt.Size("rain_24h_mm:Q", title="Pluie 24h (mm)"),
+                color=alt.Color(
+                    "meteo_operational_level:N",
+                    scale=alt.Scale(domain=["FAIBLE", "MODERE", "ELEVE", "CRITIQUE", "INDETERMINE"], range=[RISK_COLOR["FAIBLE"], RISK_COLOR["MODERE"], RISK_COLOR["ELEVE"], RISK_COLOR["CRITIQUE"], RISK_COLOR["INDETERMINE"]]),
+                    legend=alt.Legend(title="Risque meteo"),
+                ),
                 tooltip=[
                     "station_id",
                     "source",
                     "station_commune_name",
-                    rain_col_weather,
-                    "distance_to_lgv_km",
-                    "risk_level",
-                    "date_obs_raw",
+                    "weather_quality_note",
+                    "weather_quality_level",
+                    "weather_alert_index",
+                    "weather_watch_priority",
+                    "obs_age_h",
+                    "rain_24h_mm",
+                    "rain_7d_mm",
+                    "rain_30d_mm",
                 ],
             )
         )
-        st.altair_chart(chart_st, use_container_width=True)
+        st.altair_chart(scatter, use_container_width=True)
+        st.caption(
+            "Lecture: haut-droite = stations a traiter en priorite. "
+            "Qualite<55 ou age>30h => indicateur a confirmer avant decision travaux."
+        )
 
     st.subheader("Comparaison pluvio entre communes (multi-annees)")
     if not history_compare_enabled:
@@ -1672,7 +2279,7 @@ with tabs[0]:
     if pluvio_ranking_df.empty:
         st.info("Classement indisponible: selectionne des communes avec mesures meteo et historique.")
     else:
-        period_options = ["1J", "1 semaine", "1 mois", "Hiver", "Printemps", "Max mensuel", "Années"]
+        period_options = ["1J", "1 semaine", "1 mois", "Hiver", "Printemps", "Max mensuel", "Annees"]
         selected_periods = st.multiselect(
             "Filtres periodes classement",
             period_options,
@@ -1686,15 +2293,15 @@ with tabs[0]:
             "Hiver": "cum_hiver_mm",
             "Printemps": "cum_printemps_mm",
             "Max mensuel": "max_mensuel_mm",
-            "Années": "cum_annees_mm",
+            "Annees": "cum_annees_mm",
         }
         ranking_df = pluvio_ranking_df.copy()
         selected_years: List[int] = []
-        if "Années" in selected_periods and not compare_history_full_df.empty:
+        if "Annees" in selected_periods and not compare_history_full_df.empty:
             year_vals = sorted(pd.to_numeric(compare_history_full_df.get("year"), errors="coerce").dropna().astype(int).unique().tolist())
             if year_vals:
                 selected_years = st.multiselect(
-                    "Filtre années (historique)",
+                    "Filtre annees (historique)",
                     year_vals,
                     default=year_vals[-min(5, len(year_vals)):],
                     key="pluvio_year_filter",
@@ -1717,11 +2324,11 @@ with tabs[0]:
                 ranking_df["cum_annees_mm"] = pd.to_numeric(ranking_df["cum_annees_mm"], errors="coerce").fillna(annual_fallback)
                 ranking_df["rang_annees"] = ranking_df["cum_annees_mm"].rank(method="min", ascending=False).astype("Int64")
             else:
-                ranking_df["cum_annees_mm"] = 0.0
-                ranking_df["rang_annees"] = pd.Series([1] * len(ranking_df), dtype="Int64")
+                ranking_df["cum_annees_mm"] = np.nan
+                ranking_df["rang_annees"] = pd.Series([pd.NA] * len(ranking_df), dtype="Int64")
         else:
-            ranking_df["cum_annees_mm"] = 0.0
-            ranking_df["rang_annees"] = pd.Series([1] * len(ranking_df), dtype="Int64")
+            ranking_df["cum_annees_mm"] = np.nan
+            ranking_df["rang_annees"] = pd.Series([pd.NA] * len(ranking_df), dtype="Int64")
 
         active_sort_options = {k: v for k, v in ranking_sort_options.items() if k in selected_periods} or {"1 mois": "cum_1_mois_mm"}
         ranking_sort_label = st.selectbox(
@@ -1740,7 +2347,7 @@ with tabs[0]:
             "Hiver": ["cum_hiver_mm", "rang_hiver"],
             "Printemps": ["cum_printemps_mm", "rang_printemps"],
             "Max mensuel": ["max_mensuel_mm", "rang_max_mensuel"],
-            "Années": ["cum_annees_mm", "rang_annees"],
+            "Annees": ["cum_annees_mm", "rang_annees"],
         }
         ranking_cols = ["commune_label"]
         for p in selected_periods:
@@ -1749,6 +2356,17 @@ with tabs[0]:
             ranking_cols.append("annee_saison_ref")
         ranking_cols = [c for c in ranking_cols if c in ranking_df.columns]
         st.dataframe(ranking_df[ranking_cols], use_container_width=True, hide_index=True)
+        if ranking_sort_col in ranking_df.columns:
+            ranking_sort_series = pd.to_numeric(ranking_df[ranking_sort_col], errors="coerce")
+            if not ranking_sort_series.notna().any():
+                st.info(
+                    f"Aucune valeur disponible pour '{ranking_sort_label}'. "
+                    "Active la comparaison historique pour les indicateurs saisonniers/annuels."
+                )
+            elif float(ranking_sort_series.max()) <= 0.0:
+                st.warning(
+                    f"Toutes les valeurs de '{ranking_sort_label}' sont nulles ou proches de 0 sur ce snapshot."
+                )
 
         rank_count = len(ranking_df)
         top_rank_count = rank_count
@@ -1761,22 +2379,34 @@ with tabs[0]:
                 step=1 if rank_count <= 40 else 5,
                 key="pluvio_ranking_topn",
             )
-        top_rank = ranking_df.head(int(top_rank_count)).copy()
-        bar_rank = (
-            alt.Chart(top_rank)
-            .mark_bar()
-            .encode(
-                x=alt.X(f"{ranking_sort_col}:Q", title=f"Cumul {ranking_sort_label} (mm)"),
-                y=alt.Y("commune_label:N", sort="-x", title="Commune"),
-                tooltip=[c for c in ranking_cols if c in top_rank.columns],
+        chart_df = ranking_df.copy()
+        if ranking_sort_col in chart_df.columns:
+            chart_df[ranking_sort_col] = pd.to_numeric(chart_df[ranking_sort_col], errors="coerce")
+            chart_df = chart_df[chart_df[ranking_sort_col].notna()].copy()
+        chart_df = chart_df.head(int(top_rank_count)).copy()
+        if chart_df.empty:
+            st.info("Graphe indisponible: aucune valeur exploitable pour ce classement.")
+        else:
+            bar_rank = (
+                alt.Chart(chart_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X(f"{ranking_sort_col}:Q", title=f"Cumul {ranking_sort_label} (mm)"),
+                    y=alt.Y("commune_label:N", sort="-x", title="Commune"),
+                    tooltip=[c for c in ranking_cols if c in chart_df.columns],
+                )
             )
-        )
-        st.altair_chart(bar_rank, use_container_width=True)
+            st.altair_chart(bar_rank, use_container_width=True)
 
         if "max_mensuel_mm" in ranking_df.columns:
-            max_month_df = ranking_df[["commune_label", "max_mensuel_mm"]].sort_values("max_mensuel_mm", ascending=False)
+            max_month_df = ranking_df[["commune_label", "max_mensuel_mm"]].copy()
+            max_month_df["max_mensuel_mm"] = pd.to_numeric(max_month_df["max_mensuel_mm"], errors="coerce")
+            max_month_df = max_month_df[max_month_df["max_mensuel_mm"].notna()].sort_values("max_mensuel_mm", ascending=False)
             st.markdown("**Comparatif des maxima mensuels (historique)**")
-            st.dataframe(max_month_df, use_container_width=True, hide_index=True)
+            if max_month_df.empty:
+                st.info("Maxima mensuels indisponibles: active la comparaison historique multi-annees.")
+            else:
+                st.dataframe(max_month_df, use_container_width=True, hide_index=True)
 
     st.subheader("Analyse detaillee commune")
     if not selected_commune:
@@ -1784,8 +2414,14 @@ with tabs[0]:
     else:
         commune_name = str(selected_commune.get("commune_name") or "Inconnue")
         commune_code = str(selected_commune.get("commune_code") or "N/A")
+        weather_quality_val = pd.to_numeric(selected_commune.get("weather_quality_note_commune"), errors="coerce")
+        weather_quality_val = 0.0 if pd.isna(weather_quality_val) else float(weather_quality_val)
+        weather_priority_val = pd.to_numeric(selected_commune.get("weather_watch_priority_commune"), errors="coerce")
+        weather_priority_val = 0.0 if pd.isna(weather_priority_val) else float(weather_priority_val)
+        weather_points_val = pd.to_numeric(selected_commune.get("weather_points_used"), errors="coerce")
+        weather_points_val = 0 if pd.isna(weather_points_val) else int(float(weather_points_val))
 
-        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1, s2, s3, s4, s5, s6, s7, s8 = st.columns(8)
         s1.metric("Commune", commune_name)
         s2.metric("Code INSEE", commune_code)
         s3.metric("Risque commune", str(selected_commune.get("commune_risk_level", "INDETERMINE")))
@@ -1794,6 +2430,22 @@ with tabs[0]:
         s6.metric(
             "Risque IA commune",
             f"{selected_commune.get('ai_commune_risk_level', 'INDETERMINE')} ({float(selected_commune.get('max_ai_probability', 0.0) or 0.0) * 100.0:.0f}%)",
+        )
+        s7.metric(
+            "Qualite meteo",
+            f"{weather_quality_val:.1f}/100",
+        )
+        s8.metric(
+            "Priorite meteo",
+            f"{weather_priority_val:.1f}/100",
+        )
+        st.caption(
+            "Meteo commune: "
+            + f"alerte={selected_commune.get('weather_alert_level_commune', 'INDETERMINE')} | "
+            + f"fiabilite={selected_commune.get('weather_reliability_flag', 'A_VERIFIER')} | "
+            + f"fraicheur={selected_commune.get('weather_obs_freshness_commune', 'OBSOLETE')} | "
+            + f"action={selected_commune.get('weather_action_commune', WEATHER_OP_ACTIONS['INDETERMINE'])} | "
+            + f"stations utilisees={weather_points_val}"
         )
 
         nearest_weather = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
@@ -1813,6 +2465,13 @@ with tabs[0]:
                         "rain_24h_mm": nearest_weather.get("rain_24h_mm"),
                         "rain_7d_mm": nearest_weather.get("rain_7d_mm"),
                         "rain_30d_mm": nearest_weather.get("rain_30d_mm"),
+                        "weather_alert_index": nearest_weather.get("weather_alert_index"),
+                        "weather_watch_priority": nearest_weather.get("weather_watch_priority"),
+                        "weather_quality_note": nearest_weather.get("weather_quality_note"),
+                        "weather_data_reliability": nearest_weather.get("weather_data_reliability"),
+                        "obs_age_h": nearest_weather.get("obs_age_h"),
+                        "obs_freshness_level": nearest_weather.get("obs_freshness_level"),
+                        "weather_action_label": nearest_weather.get("weather_action_label"),
                         "date_obs_raw": nearest_weather.get("date_obs_raw"),
                     }
                 )
@@ -1895,7 +2554,7 @@ with tabs[1]:
             geotech_df=geotech_df,
             lgv_communes_df=lgv_communes_df,
             fr_communes_geojson=fr_communes_geojson,
-            rain_col_weather=rain_col_weather,
+            rain_col_weather=effective_rain_col_weather,
             min_risk=min_risk,
             show_weather=show_weather,
             show_communes=show_communes,
@@ -1921,10 +2580,21 @@ with tabs[2]:
             "commune_risk_level",
             "ai_commune_risk_level",
             "weather_component_note",
+            "weather_component_note_raw",
             "geotech_component_note",
             "piezo_component_note",
             "hydro_component_note",
             "ai_component_note",
+            "weather_points_used",
+            "weather_mean_dist_km",
+            "weather_quality_note_commune",
+            "weather_obs_age_h_commune",
+            "weather_alert_index_commune",
+            "weather_watch_priority_commune",
+            "weather_alert_level_commune",
+            "weather_reliability_flag",
+            "weather_obs_freshness_commune",
+            "weather_action_commune",
             "avg_ai_probability",
             "max_ai_probability",
             "avg_point_score",
@@ -1970,19 +2640,88 @@ with tabs[2]:
     if filtered_weather.empty:
         st.info("Aucune station meteo sur les filtres actifs.")
     else:
-        wx_cols = [
-            "station_id",
-            "source",
-            "station_commune_name",
-            "distance_to_lgv_km",
-            "rain_24h_mm",
-            "rain_7d_mm",
-            "rain_30d_mm",
-            "rain_month_mm",
-            "date_obs_raw",
-        ]
-        wx_cols = [c for c in wx_cols if c in filtered_weather.columns]
-        st.dataframe(filtered_weather[wx_cols].sort_values("rain_24h_mm", ascending=False), use_container_width=True, hide_index=True)
+        wx_view = filtered_weather.copy()
+        for col, default in [
+            ("weather_alert_index", 0.0),
+            ("weather_watch_priority", 0.0),
+            ("weather_quality_note", 0.0),
+            ("obs_age_h", 240.0),
+            ("distance_to_lgv_km", np.nan),
+            ("rain_24h_mm", 0.0),
+            ("rain_7d_mm", 0.0),
+            ("rain_30d_mm", 0.0),
+            ("rain_month_mm", 0.0),
+        ]:
+            if col in wx_view.columns:
+                wx_view[col] = pd.to_numeric(wx_view[col], errors="coerce").fillna(default)
+            else:
+                wx_view[col] = default
+        wx_view["meteo_operational_level"] = wx_view.get("meteo_operational_level", wx_view.get("risk_level", "INDETERMINE")).astype(str)
+        if "weather_data_reliability" not in wx_view.columns:
+            wx_view["weather_data_reliability"] = [
+                _weather_data_reliability_label(float(q), float(a))
+                for q, a in zip(wx_view["weather_quality_note"].tolist(), wx_view["obs_age_h"].tolist())
+            ]
+        if "obs_freshness_level" not in wx_view.columns:
+            wx_view["obs_freshness_level"] = wx_view["obs_age_h"].map(_weather_freshness_level_from_age)
+        if "weather_action_label" not in wx_view.columns:
+            wx_view["weather_action_label"] = [
+                _weather_action_label(str(lvl), str(rel))
+                for lvl, rel in zip(wx_view["meteo_operational_level"].tolist(), wx_view["weather_data_reliability"].tolist())
+            ]
+
+        wx_view = wx_view.sort_values(
+            ["weather_watch_priority", "weather_alert_index", "rain_24h_mm"],
+            ascending=[False, False, False],
+            na_position="last",
+        )
+        wx_view = wx_view.rename(
+            columns={
+                "station_id": "station",
+                "source": "source_meteo",
+                "station_commune_name": "commune_station",
+                "distance_to_lgv_km": "distance_lgv_km",
+                "meteo_operational_level": "niveau_operationnel",
+                "weather_alert_index": "indice_alerte_meteo_100",
+                "weather_watch_priority": "priorite_surveillance_100",
+                "weather_quality_note": "qualite_meteo_100",
+                "weather_data_reliability": "fiabilite_donnee",
+                "weather_action_label": "action_recommandee_gc",
+                "obs_age_h": "age_observation_h",
+                "obs_freshness_level": "fraicheur_observation",
+                "date_obs_raw": "date_observation_utc",
+            }
+        )
+        st.dataframe(
+            wx_view[
+                [
+                    c
+                    for c in [
+                        "station",
+                        "source_meteo",
+                        "commune_station",
+                        "distance_lgv_km",
+                        "rain_24h_mm",
+                        "rain_7d_mm",
+                        "rain_30d_mm",
+                        "rain_month_mm",
+                        "niveau_operationnel",
+                        "indice_alerte_meteo_100",
+                        "priorite_surveillance_100",
+                        "qualite_meteo_100",
+                        "fiabilite_donnee",
+                        "action_recommandee_gc",
+                        "age_observation_h",
+                        "fraicheur_observation",
+                        "date_observation_utc",
+                    ]
+                    if c in wx_view.columns
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Tri applique: priorite_surveillance_100, puis indice_alerte_meteo_100, puis pluie_24h.")
 
     st.subheader("Cours d'eau et ruisseaux - hauteurs et seuils d'urgence")
     if filtered_hydro.empty:
@@ -2086,6 +2825,107 @@ with tabs[3]:
     else:
         st.info("Metadata IA non disponible dans ce snapshot.")
 
+    st.subheader("Logique meteo renforcee (Streamlit)")
+    st.markdown(
+        """
+        - Chaque station est evaluee par une **qualite meteo** (/100):
+          source + fraicheur + completude + proximite LGV.
+        - Un **indice d'alerte meteo** (/100) combine pluie 24h, 7j, 30j et pluie previsionnelle.
+        - Le **risque meteo operationnel** prend le max entre classe pluie brute et alerte renforcee.
+        - Au niveau commune, les stations proches sont agregees par distance pour calculer:
+          qualite, alerte, priorite de surveillance, fiabilite.
+        - Le score communal final reintegre ce signal meteo avec un poids adapte a la fiabilite des observations.
+        """
+    )
+
+    st.subheader("Metadata meteo detaillee (sans ambiguite)")
+    st.markdown(
+        """
+        - **Objectif**: transformer une pluie brute en decision GC actionnable.
+        - **Unite**: tous les scores meteo sont normalises sur 100.
+        - **Principe**: une valeur elevee = priorite de surveillance plus forte.
+        """
+    )
+    weather_formula_df = pd.DataFrame(
+        [
+            {
+                "Champ metadata": "weather_quality_note",
+                "Formule / logique": "0.30*source_reliability + 0.35*freshness + 0.20*completude + 0.15*proximite",
+                "Interpretation": "Qualite intrinsique de la donnee station (0-100).",
+            },
+            {
+                "Champ metadata": "weather_alert_index",
+                "Formule / logique": "40% pluie24h + 30% pluie7j + 20% pluie30j + 10% pluie_prevision",
+                "Interpretation": "Intensite hydrometeo combinee (0-100).",
+            },
+            {
+                "Champ metadata": "meteo_operational_level",
+                "Formule / logique": "max(risk_level_source, niveau(weather_alert_index))",
+                "Interpretation": "Niveau final pour pilotage exploitation.",
+            },
+            {
+                "Champ metadata": "weather_watch_priority",
+                "Formule / logique": "weather_alert_index * (0.55 + 0.45 * quality_scale)",
+                "Interpretation": "Priorite de traitement tenant compte de la fiabilite.",
+            },
+            {
+                "Champ metadata": "weather_data_reliability",
+                "Formule / logique": "OK / SURVEILLER / A_VERIFIER selon qualite et age obs",
+                "Interpretation": "Statut de confiance minimum avant engagement travaux.",
+            },
+        ]
+    )
+    st.dataframe(weather_formula_df, use_container_width=True, hide_index=True)
+
+    weather_threshold_df = pd.DataFrame(
+        [
+            {
+                "Niveau": "FAIBLE",
+                "Seuil indice alerte": "< 45",
+                "Action exploitation GC": WEATHER_OP_ACTIONS["FAIBLE"],
+            },
+            {
+                "Niveau": "MODERE",
+                "Seuil indice alerte": "45 a 64.9",
+                "Action exploitation GC": WEATHER_OP_ACTIONS["MODERE"],
+            },
+            {
+                "Niveau": "ELEVE",
+                "Seuil indice alerte": "65 a 81.9",
+                "Action exploitation GC": WEATHER_OP_ACTIONS["ELEVE"],
+            },
+            {
+                "Niveau": "CRITIQUE",
+                "Seuil indice alerte": ">= 82",
+                "Action exploitation GC": WEATHER_OP_ACTIONS["CRITIQUE"],
+            },
+        ]
+    )
+    st.markdown("**Seuils de niveau meteo operationnel**")
+    st.dataframe(weather_threshold_df, use_container_width=True, hide_index=True)
+
+    reliability_df = pd.DataFrame(
+        [
+            {
+                "Statut fiabilite": "OK",
+                "Condition": "qualite>=70 ET age_obs<=18h",
+                "Decision": "donnee exploitable directement",
+            },
+            {
+                "Statut fiabilite": "SURVEILLER",
+                "Condition": "55<=qualite<70 OU 18h<age_obs<=30h",
+                "Decision": "confirmer via 2e source meteo/hydro",
+            },
+            {
+                "Statut fiabilite": "A_VERIFIER",
+                "Condition": "qualite<55 OU age_obs>30h",
+                "Decision": "verification terrain/telemesure obligatoire",
+            },
+        ]
+    )
+    st.markdown("**Regles de fiabilite des donnees meteo**")
+    st.dataframe(reliability_df, use_container_width=True, hide_index=True)
+
     st.subheader("Sources de donnees")
     sources_meta = metadata_obj.get("sources", [])
     if isinstance(sources_meta, list) and sources_meta:
@@ -2098,9 +2938,21 @@ with tabs[3]:
     st.subheader("Frequence de mise a jour")
     update_meta = metadata_obj.get("update_frequency", {}) if isinstance(metadata_obj.get("update_frequency"), dict) else {}
     if update_meta:
-        st.write(update_meta)
+        update_df = pd.DataFrame(
+            [{"Bloc": str(k), "Frequence declaree": str(v)} for k, v in update_meta.items()]
+        )
+        st.dataframe(update_df, use_container_width=True, hide_index=True)
     else:
         st.info("Frequence de MAJ non renseignee dans le snapshot.")
+    st.markdown(
+        """
+        **Frequences cibles recommandees (pilotage GC):**
+        - Meteo station (pluie/obs): 5 a 60 min selon source.
+        - Hydro (hauteurs cours d'eau): 5 a 30 min sur stations telemetrees.
+        - Consolidation snapshot decisionnel: horaire (minimum quotidien).
+        - Historique climatologique: recalcul mensuel ou a chaque ingestion majeure.
+        """
+    )
 
     st.subheader("Couche geographique FR")
     fr_summary = {}
