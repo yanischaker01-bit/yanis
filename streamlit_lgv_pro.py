@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -66,6 +67,27 @@ WEATHER_OP_ACTIONS = {
     "CRITIQUE": "Alerte urgence GC (controle immediat <2h).",
     "INDETERMINE": "Donnees insuffisantes (verification manuelle).",
 }
+
+SLIP_ALERT_THRESHOLDS = {
+    "FAIBLE": 45.0,
+    "MODERE": 60.0,
+    "ELEVE": 75.0,
+    "CRITIQUE": 88.0,
+}
+
+DEFAULT_MANUAL_PK_RANGES = [
+    (98.244, 98.640),
+    (119.590, 120.970),
+    (102.700, 103.970),
+    (104.700, 109.200),
+    (114.890, 117.340),
+    (2.500, 2.800),
+    (54.770, 54.920),
+    (2.500, 3.100),
+    (20.090, 20.180),
+    (80.370, 80.650),
+    (216.700, 216.950),
+]
 
 
 def _risk_rank(level: str) -> int:
@@ -489,6 +511,200 @@ def _choose_weather_signal_column(df: pd.DataFrame, preferred: str, fallbacks: L
     return best_col
 
 
+def _slip_level_from_index(index: float) -> str:
+    val = float(index or 0.0)
+    if val >= SLIP_ALERT_THRESHOLDS["CRITIQUE"]:
+        return "CRITIQUE"
+    if val >= SLIP_ALERT_THRESHOLDS["ELEVE"]:
+        return "ELEVE"
+    if val >= SLIP_ALERT_THRESHOLDS["MODERE"]:
+        return "MODERE"
+    return "FAIBLE"
+
+
+def _parse_manual_pk_ranges(raw_text: str) -> List[Tuple[float, float]]:
+    if not str(raw_text or "").strip():
+        return []
+
+    ranges: List[Tuple[float, float]] = []
+    seen = set()
+    chunks = re.split(r"[;\n]+", str(raw_text))
+    for chunk in chunks:
+        numbers = re.findall(r"-?\d+(?:[.,]\d+)?", chunk)
+        if len(numbers) < 2:
+            continue
+        try:
+            start = float(numbers[0].replace(",", "."))
+            end = float(numbers[1].replace(",", "."))
+        except ValueError:
+            continue
+        a, b = (start, end) if start <= end else (end, start)
+        key = (round(a, 3), round(b, 3))
+        if key in seen:
+            continue
+        seen.add(key)
+        ranges.append((float(key[0]), float(key[1])))
+    return ranges
+
+
+def _build_slip_assessment(
+    sectors_df: pd.DataFrame,
+    manual_pk_ranges: List[Tuple[float, float]],
+) -> pd.DataFrame:
+    if sectors_df.empty:
+        return sectors_df.copy()
+
+    work = sectors_df.copy()
+    for col, default in [
+        ("pk_km", np.nan),
+        ("score", 0.0),
+        ("ai_pred_probability", 0.0),
+        ("ai_soil_fragility", 0.0),
+        ("weather_max_24h_mm", 0.0),
+        ("weather_max_7d_mm", 0.0),
+        ("weather_max_30d_mm", 0.0),
+        ("hydro_stations", 0.0),
+        ("geotech_points", 0.0),
+        ("piezometers", 0.0),
+    ]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(default)
+        else:
+            work[col] = default
+
+    ai_note = (work["ai_pred_probability"].clip(lower=0.0, upper=1.0) * 100.0).clip(lower=0.0, upper=100.0)
+    soil_note = (work["ai_soil_fragility"].clip(lower=0.0, upper=1.0) * 100.0).clip(lower=0.0, upper=100.0)
+    weather_note = (
+        (work["weather_max_24h_mm"] / 80.0).clip(upper=1.5) * 30.0
+        + (work["weather_max_7d_mm"] / 120.0).clip(upper=1.5) * 35.0
+        + (work["weather_max_30d_mm"] / 240.0).clip(upper=1.5) * 35.0
+    ).clip(lower=0.0, upper=100.0)
+    hydro_note = (work["hydro_stations"].clip(lower=0.0, upper=5.0) / 5.0 * 100.0).clip(lower=0.0, upper=100.0)
+    geotech_note = (work["geotech_points"].clip(lower=0.0, upper=4.0) / 4.0 * 100.0).clip(lower=0.0, upper=100.0)
+    piezo_note = (work["piezometers"].clip(lower=0.0, upper=2.0) / 2.0 * 100.0).clip(lower=0.0, upper=100.0)
+    score_note = (work["score"].clip(lower=0.0, upper=4.0) / 4.0 * 100.0).clip(lower=0.0, upper=100.0)
+
+    work["slip_ai_note"] = ai_note.round(1)
+    work["slip_soil_note"] = soil_note.round(1)
+    work["slip_weather_note"] = weather_note.round(1)
+    work["slip_hydro_note"] = hydro_note.round(1)
+    work["slip_geotech_note"] = geotech_note.round(1)
+    work["slip_piezo_note"] = piezo_note.round(1)
+    work["slip_score_note"] = score_note.round(1)
+
+    slip_index = (
+        ai_note * 0.30
+        + soil_note * 0.20
+        + weather_note * 0.22
+        + hydro_note * 0.12
+        + geotech_note * 0.10
+        + piezo_note * 0.04
+        + score_note * 0.02
+    ).clip(lower=0.0, upper=100.0)
+
+    manual_watch = pd.Series(False, index=work.index)
+    if manual_pk_ranges:
+        pk_vals = pd.to_numeric(work["pk_km"], errors="coerce")
+        for start, end in manual_pk_ranges:
+            manual_watch = manual_watch | ((pk_vals >= float(start)) & (pk_vals <= float(end)))
+    work["manual_watch_pk"] = manual_watch.fillna(False).astype(bool)
+
+    work["slip_index"] = np.where(
+        work["manual_watch_pk"],
+        np.minimum(100.0, slip_index + 6.0),
+        slip_index,
+    ).round(1)
+    work["slip_level"] = work["slip_index"].map(_slip_level_from_index)
+
+    def _top_drivers(row: pd.Series) -> str:
+        drivers = [
+            ("IA", float(row.get("slip_ai_note", 0.0))),
+            ("Sol", float(row.get("slip_soil_note", 0.0))),
+            ("Pluie", float(row.get("slip_weather_note", 0.0))),
+            ("Hydro", float(row.get("slip_hydro_note", 0.0))),
+            ("Geotech", float(row.get("slip_geotech_note", 0.0))),
+            ("Piezo", float(row.get("slip_piezo_note", 0.0))),
+        ]
+        drivers = sorted(drivers, key=lambda x: x[1], reverse=True)
+        return " | ".join([f"{label}:{value:.0f}" for label, value in drivers[:3]])
+
+    work["slip_drivers"] = work.apply(_top_drivers, axis=1)
+    return work
+
+
+def _build_slip_corridors(
+    sectors_df: pd.DataFrame,
+    alert_threshold: float,
+) -> pd.DataFrame:
+    if sectors_df.empty or "pk_km" not in sectors_df.columns or "slip_index" not in sectors_df.columns:
+        return pd.DataFrame()
+
+    work = sectors_df.copy()
+    if "sector_id" not in work.columns:
+        work["sector_id"] = [f"S{i+1}" for i in range(len(work))]
+    if "commune_name" not in work.columns:
+        work["commune_name"] = "Inconnue"
+    for col, default in [("ai_pred_probability", 0.0), ("weather_max_30d_mm", 0.0), ("ai_soil_fragility", 0.0)]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(default)
+        else:
+            work[col] = default
+    work["pk_km"] = pd.to_numeric(work.get("pk_km"), errors="coerce")
+    work["slip_index"] = pd.to_numeric(work.get("slip_index"), errors="coerce")
+    work = work.dropna(subset=["pk_km", "slip_index"]).sort_values("pk_km").reset_index(drop=True)
+    if work.empty:
+        return pd.DataFrame()
+
+    focus = work[
+        (work["slip_index"] >= float(alert_threshold))
+        | (work.get("manual_watch_pk", pd.Series(False, index=work.index)).fillna(False).astype(bool))
+    ].copy()
+    if focus.empty:
+        return pd.DataFrame()
+
+    step = pd.to_numeric(work["pk_km"].diff(), errors="coerce").dropna()
+    median_step = float(step[step > 0].median()) if not step.empty and (step > 0).any() else 5.0
+    max_gap = max(2.0, median_step * 1.35)
+
+    focus = focus.sort_values("pk_km").reset_index(drop=True)
+    corridor_ids: List[int] = []
+    cid = 1
+    prev_pk = None
+    for _, row in focus.iterrows():
+        pk = float(row["pk_km"])
+        if prev_pk is not None and (pk - prev_pk) > max_gap:
+            cid += 1
+        corridor_ids.append(cid)
+        prev_pk = pk
+    focus["slip_corridor_raw_id"] = corridor_ids
+    focus["slip_corridor_id"] = focus["slip_corridor_raw_id"].map(lambda x: f"GLI-{int(x):03d}")
+
+    grouped = (
+        focus.groupby(["slip_corridor_raw_id", "slip_corridor_id"], as_index=False)
+        .agg(
+            pk_start_km=("pk_km", "min"),
+            pk_end_km=("pk_km", "max"),
+            sector_count=("sector_id", "count"),
+            slip_index_max=("slip_index", "max"),
+            slip_index_mean=("slip_index", "mean"),
+            manual_watch_count=("manual_watch_pk", "sum"),
+            critical_count=("slip_level", lambda s: int((s.astype(str) == "CRITIQUE").sum())),
+            commune_dominante=("commune_name", lambda s: str(s.mode().iloc[0]) if not s.mode().empty else str(s.iloc[0])),
+            max_ai_probability=("ai_pred_probability", "max"),
+            max_weather_30d_mm=("weather_max_30d_mm", "max"),
+            max_soil_fragility=("ai_soil_fragility", "max"),
+        )
+    )
+    grouped["corridor_length_km"] = (grouped["pk_end_km"] - grouped["pk_start_km"]).clip(lower=0.0).round(2)
+    grouped["slip_index_max"] = pd.to_numeric(grouped["slip_index_max"], errors="coerce").round(1)
+    grouped["slip_index_mean"] = pd.to_numeric(grouped["slip_index_mean"], errors="coerce").round(1)
+    grouped["slip_level"] = grouped["slip_index_max"].map(_slip_level_from_index)
+    grouped["max_ai_probability"] = pd.to_numeric(grouped["max_ai_probability"], errors="coerce").round(3)
+    grouped["max_weather_30d_mm"] = pd.to_numeric(grouped["max_weather_30d_mm"], errors="coerce").round(1)
+    grouped["max_soil_fragility"] = pd.to_numeric(grouped["max_soil_fragility"], errors="coerce").round(3)
+    return grouped.sort_values(["slip_index_max", "corridor_length_km"], ascending=[False, False]).reset_index(drop=True)
+
+
 def _nearest_row(df: pd.DataFrame, lat: float, lon: float) -> Dict[str, object]:
     if df.empty or "latitude" not in df.columns or "longitude" not in df.columns:
         return {}
@@ -787,12 +1003,31 @@ def _build_pluvio_ranking(
         spring = None
         season_year = None
         max_monthly = None
+        history_mode = "ESTIME_RECENT"
         if not hist.empty:
             h = hist[hist["commune_label"] == label]
             winter, spring, season_year = _season_totals_from_monthly(h)
             if not h.empty:
                 max_monthly_val = pd.to_numeric(h.get("monthly_precip_mm"), errors="coerce").max()
                 max_monthly = None if pd.isna(max_monthly_val) else round(float(max_monthly_val), 1)
+                history_mode = "ARCHIVE"
+
+        if max_monthly is None:
+            monthly_candidates = [x for x in [r1m, r30j, r7j] if not pd.isna(x)]
+            if monthly_candidates:
+                max_monthly = round(float(max(monthly_candidates)), 1)
+        if winter is None:
+            if not pd.isna(r30j) and float(r30j) > 0.0:
+                winter = round(float(r30j) * 3.0, 1)
+            elif not pd.isna(r7j) and float(r7j) > 0.0:
+                winter = round(float(r7j) * 12.0, 1)
+        if spring is None:
+            if not pd.isna(r30j) and float(r30j) > 0.0:
+                spring = round(float(r30j) * 3.0, 1)
+            elif not pd.isna(r7j) and float(r7j) > 0.0:
+                spring = round(float(r7j) * 12.0, 1)
+        if season_year is None:
+            season_year = int(datetime.now(timezone.utc).year)
 
         rows.append(
             {
@@ -806,6 +1041,7 @@ def _build_pluvio_ranking(
                 "cum_printemps_mm": spring,
                 "max_mensuel_mm": max_monthly,
                 "annee_saison_ref": season_year,
+                "histo_mode": history_mode,
             }
         )
 
@@ -951,6 +1187,7 @@ def _build_map(
     weather_df: pd.DataFrame,
     commune_df: pd.DataFrame,
     sectors_df: pd.DataFrame,
+    slip_corridors_df: pd.DataFrame,
     hydro_df: pd.DataFrame,
     piezo_df: pd.DataFrame,
     geotech_df: pd.DataFrame,
@@ -964,6 +1201,8 @@ def _build_map(
     show_hydro: bool,
     show_piezo: bool,
     show_geotech: bool,
+    show_slip: bool,
+    slip_alert_threshold: float,
     show_fr_layer: bool,
 ) -> folium.Map:
     m = folium.Map(location=[46.2, 0.2], zoom_start=7, tiles="CartoDB positron")
@@ -1102,6 +1341,83 @@ def _build_map(
                 popup=folium.Popup(popup, max_width=420),
             ).add_to(sectors_layer)
         sectors_layer.add_to(m)
+
+    if show_slip and not sectors_df.empty and "slip_index" in sectors_df.columns:
+        slip_layer = folium.FeatureGroup(name="Zones glissement", show=True)
+        slip_work = sectors_df.copy()
+        slip_work["pk_km"] = pd.to_numeric(slip_work.get("pk_km"), errors="coerce")
+        slip_work["slip_index"] = pd.to_numeric(slip_work.get("slip_index"), errors="coerce").fillna(0.0)
+        slip_work["slip_level"] = slip_work.get("slip_level", pd.Series("FAIBLE", index=slip_work.index)).astype(str)
+        slip_work["manual_watch_pk"] = slip_work.get("manual_watch_pk", pd.Series(False, index=slip_work.index)).fillna(False).astype(bool)
+
+        slip_focus = slip_work[
+            (slip_work["slip_index"] >= float(slip_alert_threshold))
+            | (slip_work["manual_watch_pk"])
+        ].copy()
+        if str(min_risk).upper() != "TOUT":
+            slip_focus = slip_focus[
+                slip_focus["slip_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(str(min_risk).upper())
+            ]
+
+        for _, row in slip_focus.iterrows():
+            lat = pd.to_numeric(row.get("latitude"), errors="coerce")
+            lon = pd.to_numeric(row.get("longitude"), errors="coerce")
+            if pd.isna(lat) or pd.isna(lon):
+                continue
+            lvl = str(row.get("slip_level", "FAIBLE"))
+            slip_index = float(pd.to_numeric(row.get("slip_index"), errors="coerce") or 0.0)
+            radius = max(6, min(15, 5 + slip_index / 12.0))
+            popup = (
+                f"<b>Zone glissement:</b> {row.get('sector_id')}<br>"
+                f"<b>PK:</b> {row.get('pk_km')}<br>"
+                f"<b>Niveau glissement:</b> {lvl}<br>"
+                f"<b>Indice glissement:</b> {slip_index:.1f}/100<br>"
+                f"<b>Commune:</b> {row.get('commune_name', 'n/a')}<br>"
+                f"<b>Drivers:</b> {row.get('slip_drivers', 'n/a')}<br>"
+                f"<b>Zone PK manuelle:</b> {row.get('manual_watch_pk', False)}"
+            )
+            folium.CircleMarker(
+                [float(lat), float(lon)],
+                radius=radius,
+                color=RISK_COLOR.get(lvl, "#6b7280"),
+                fill=True,
+                fill_opacity=0.55,
+                weight=2,
+                popup=folium.Popup(popup, max_width=420),
+            ).add_to(slip_layer)
+
+        if not slip_corridors_df.empty:
+            for _, corr in slip_corridors_df.iterrows():
+                cid = str(corr.get("slip_corridor_id", ""))
+                cmax = float(pd.to_numeric(corr.get("slip_index_max"), errors="coerce") or 0.0)
+                lvl = str(corr.get("slip_level", _slip_level_from_index(cmax)))
+                pk_start = float(pd.to_numeric(corr.get("pk_start_km"), errors="coerce") or 0.0)
+                pk_end = float(pd.to_numeric(corr.get("pk_end_km"), errors="coerce") or 0.0)
+                cpoints = slip_work[
+                    (pd.to_numeric(slip_work.get("pk_km"), errors="coerce") >= pk_start)
+                    & (pd.to_numeric(slip_work.get("pk_km"), errors="coerce") <= pk_end)
+                ].copy()
+                cpoints = cpoints.sort_values("pk_km")
+                coords: List[Tuple[float, float]] = []
+                for _, crow in cpoints.iterrows():
+                    clat = pd.to_numeric(crow.get("latitude"), errors="coerce")
+                    clon = pd.to_numeric(crow.get("longitude"), errors="coerce")
+                    if pd.isna(clat) or pd.isna(clon):
+                        continue
+                    coords.append((float(clat), float(clon)))
+                if len(coords) >= 2:
+                    tooltip = (
+                        f"{cid} | PK {float(corr.get('pk_start_km', 0.0)):.2f}-{float(corr.get('pk_end_km', 0.0)):.2f} | "
+                        f"indice max={cmax:.1f}"
+                    )
+                    folium.PolyLine(
+                        coords,
+                        color=RISK_COLOR.get(lvl, "#7f1d1d"),
+                        weight=max(3, min(8, int(round(cmax / 18.0)))),
+                        opacity=0.85,
+                        tooltip=tooltip,
+                    ).add_to(slip_layer)
+        slip_layer.add_to(m)
 
     if show_hydro and not hydro_df.empty:
         hydro_layer = folium.FeatureGroup(name="Hydro reseau", show=False)
@@ -1400,6 +1716,14 @@ with st.sidebar:
     selected_hydro_rivers = _multiselect_with_all("Cours d'eau / ruisseaux", hydro_rivers, key="flt_hydro_rivers")
     hydro_risk_filter = st.selectbox("Risque hydro", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=0)
     hydro_only_exceeded = st.checkbox("Hydro: uniquement seuil urgence depasse", value=False)
+    slip_alert_threshold = st.slider("Seuil alerte glissement (/100)", min_value=40, max_value=95, value=68, step=2)
+    enable_manual_pk_watch = st.checkbox("Activer zones PK sous surveillance (capture)", value=True)
+    default_manual_pk_text = "; ".join([f"{a:.3f}-{b:.3f}" for a, b in DEFAULT_MANUAL_PK_RANGES])
+    manual_pk_watch_text = st.text_area(
+        "PK sous surveillance (format: 98.244-98.640; 119.590-120.970; ...)",
+        value=default_manual_pk_text,
+        height=90,
+    )
 
     st.caption("Toutes les communes filtrees sont affichees (pas de limite a 25).")
 
@@ -1410,6 +1734,7 @@ with st.sidebar:
     show_hydro = st.checkbox("Layer hydro", value=True)
     show_piezo = st.checkbox("Layer piezometres", value=False)
     show_geotech = st.checkbox("Layer geotech", value=False)
+    show_slip = st.checkbox("Layer zones glissement", value=True)
     show_fr_layer = st.checkbox("Layer geographie FR", value=False)
 
 weather_for_context = weather_df.copy()
@@ -1448,6 +1773,10 @@ RAIN_COL_LABELS = {
 effective_period_label = RAIN_COL_LABELS.get(effective_rain_col_weather, period_label)
 weather_signal_fallback = effective_rain_col_weather != rain_col_weather
 
+manual_pk_ranges = _parse_manual_pk_ranges(manual_pk_watch_text) if enable_manual_pk_watch else []
+if not sectors_df.empty:
+    sectors_df = _build_slip_assessment(sectors_df, manual_pk_ranges)
+
 filtered_sectors = sectors_df.copy()
 if not filtered_sectors.empty and selected_communes:
     filtered_sectors = filtered_sectors[filtered_sectors["commune_name"].astype(str).isin(selected_communes)]
@@ -1456,6 +1785,16 @@ if not filtered_sectors.empty and str(min_risk).upper() != "TOUT":
     if sector_risk_mode.startswith("IA") and "ai_pred_risk_level" in filtered_sectors.columns:
         sector_risk_col = "ai_pred_risk_level"
     filtered_sectors = filtered_sectors[filtered_sectors[sector_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+
+slip_source_df = filtered_sectors if not filtered_sectors.empty else sectors_df
+slip_corridors_df = _build_slip_corridors(slip_source_df, float(slip_alert_threshold))
+if not slip_source_df.empty and "slip_index" in slip_source_df.columns:
+    slip_focus_df = slip_source_df[
+        (pd.to_numeric(slip_source_df.get("slip_index"), errors="coerce").fillna(0.0) >= float(slip_alert_threshold))
+        | (slip_source_df.get("manual_watch_pk", pd.Series(False, index=slip_source_df.index)).fillna(False).astype(bool))
+    ].copy()
+else:
+    slip_focus_df = pd.DataFrame()
 
 filtered_hydro = hydro_df.copy()
 if not filtered_hydro.empty and selected_hydro_sources and "source" in filtered_hydro.columns:
@@ -1743,8 +2082,23 @@ fragile_soil_count = (
     if not filtered_sectors.empty
     else 0
 )
+slip_high_count = (
+    int((pd.to_numeric(slip_source_df.get("slip_index"), errors="coerce").fillna(0.0) >= float(slip_alert_threshold)).sum())
+    if not slip_source_df.empty
+    else 0
+)
+slip_critical_count = (
+    int((slip_source_df.get("slip_level", pd.Series(dtype=str)).astype(str) == "CRITIQUE").sum())
+    if not slip_source_df.empty
+    else 0
+)
+manual_watch_count = (
+    int(slip_source_df.get("manual_watch_pk", pd.Series(dtype=bool)).fillna(False).astype(bool).sum())
+    if not slip_source_df.empty
+    else 0
+)
 
-col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
+col1, col2, col3, col4, col5, col6, col7, col8, col9, col10 = st.columns(10)
 col1.metric("Risque global", risk_level)
 col2.metric("Score global", f"{score:.2f}/4")
 col3.metric("Stations meteo", int(len(filtered_weather)))
@@ -1753,6 +2107,8 @@ col5.metric("Communes traversees LGV", total_lgv_communes)
 col6.metric("Hydro seuil urgence", hydro_exceeded_count)
 col7.metric("Secteurs IA critiques", ai_critical_count)
 col8.metric("Secteurs sols fragiles", fragile_soil_count)
+col9.metric("Zones glissement >= seuil", slip_high_count)
+col10.metric("PK surveillance manuelle", manual_watch_count)
 
 tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes", "Metadata"])
 
@@ -2072,6 +2428,123 @@ with tabs[0]:
         )
         st.altair_chart(seg_chart, use_container_width=True)
 
+    st.subheader("Surveillance glissement (profil PK sur 300 km)")
+    if slip_source_df.empty or "slip_index" not in slip_source_df.columns:
+        st.info("Aucun indicateur glissement disponible sur les secteurs.")
+    else:
+        gl_df = slip_source_df.copy()
+        gl_df["pk_km"] = pd.to_numeric(gl_df.get("pk_km"), errors="coerce")
+        gl_df["slip_index"] = pd.to_numeric(gl_df.get("slip_index"), errors="coerce")
+        gl_df["slip_level"] = gl_df.get("slip_level", pd.Series("FAIBLE", index=gl_df.index)).astype(str)
+        gl_df["manual_watch_pk"] = gl_df.get("manual_watch_pk", pd.Series(False, index=gl_df.index)).fillna(False).astype(bool)
+        gl_df = gl_df.dropna(subset=["pk_km", "slip_index"]).sort_values("pk_km")
+
+        if gl_df.empty:
+            st.info("Profil glissement indisponible sur ce filtre.")
+        else:
+            st.caption(
+                f"Seuil alerte glissement actif: {float(slip_alert_threshold):.0f}/100 | "
+                f"Secteurs critiques: {slip_critical_count} | Zones manuelles activees: {manual_watch_count}"
+            )
+            if enable_manual_pk_watch and manual_pk_ranges:
+                st.caption(
+                    "PK surveilles (manuel): "
+                    + ", ".join([f"{a:.3f}-{b:.3f}" for a, b in manual_pk_ranges[:12]])
+                )
+
+            profile_base = alt.Chart(gl_df)
+            profile_line = profile_base.mark_line(color="#0f172a").encode(
+                x=alt.X("pk_km:Q", title="PK (km)"),
+                y=alt.Y("slip_index:Q", title="Indice glissement (/100)"),
+                tooltip=[
+                    "sector_id",
+                    "commune_name",
+                    "pk_km",
+                    "slip_index",
+                    "slip_level",
+                    "manual_watch_pk",
+                    "slip_drivers",
+                ],
+            )
+            profile_points = profile_base.mark_circle(size=55, opacity=0.85).encode(
+                x="pk_km:Q",
+                y="slip_index:Q",
+                color=alt.Color(
+                    "slip_level:N",
+                    scale=alt.Scale(
+                        domain=["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"],
+                        range=[RISK_COLOR["FAIBLE"], RISK_COLOR["MODERE"], RISK_COLOR["ELEVE"], RISK_COLOR["CRITIQUE"]],
+                    ),
+                    legend=alt.Legend(title="Niveau glissement"),
+                ),
+                shape=alt.Shape(
+                    "manual_watch_pk:N",
+                    scale=alt.Scale(domain=[False, True], range=["circle", "diamond"]),
+                    legend=alt.Legend(title="PK manuel"),
+                ),
+            )
+            threshold_rule = alt.Chart(pd.DataFrame({"y": [float(slip_alert_threshold)]})).mark_rule(
+                color="#7f1d1d",
+                strokeDash=[6, 4],
+            ).encode(y="y:Q")
+            st.altair_chart((profile_line + profile_points + threshold_rule).interactive(), use_container_width=True)
+
+            pk_bin_df = gl_df.copy()
+            pk_bin_df["pk_bin_start"] = (np.floor(pk_bin_df["pk_km"] / 10.0) * 10.0).astype(int)
+            pk_bin_df["pk_bin_label"] = pk_bin_df["pk_bin_start"].map(lambda v: f"PK {int(v)}-{int(v)+10}")
+            pk_bin_df = (
+                pk_bin_df.groupby(["pk_bin_start", "pk_bin_label"], as_index=False)
+                .agg(
+                    slip_index_max=("slip_index", "max"),
+                    slip_index_mean=("slip_index", "mean"),
+                    sector_count=("sector_id", "count"),
+                )
+                .sort_values("pk_bin_start")
+            )
+            pk_bin_chart = (
+                alt.Chart(pk_bin_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("pk_bin_label:N", title="Troncon 10 km"),
+                    y=alt.Y("slip_index_max:Q", title="Indice glissement max (/100)"),
+                    color=alt.Color("slip_index_max:Q", scale=alt.Scale(scheme="orangered"), title="Intensite"),
+                    tooltip=["pk_bin_label", "slip_index_max", "slip_index_mean", "sector_count"],
+                )
+            )
+            st.altair_chart(pk_bin_chart, use_container_width=True)
+
+            if slip_corridors_df.empty:
+                st.info("Aucun corridor glissement au-dessus du seuil sur ce filtre.")
+            else:
+                corr_chart_df = slip_corridors_df.head(25).copy()
+                corr_chart = (
+                    alt.Chart(corr_chart_df)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("slip_index_max:Q", title="Indice glissement max (/100)"),
+                        y=alt.Y("slip_corridor_id:N", sort="-x", title="Corridor"),
+                        color=alt.Color(
+                            "slip_level:N",
+                            scale=alt.Scale(
+                                domain=["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"],
+                                range=[RISK_COLOR["FAIBLE"], RISK_COLOR["MODERE"], RISK_COLOR["ELEVE"], RISK_COLOR["CRITIQUE"]],
+                            ),
+                        ),
+                        tooltip=[
+                            "slip_corridor_id",
+                            "pk_start_km",
+                            "pk_end_km",
+                            "corridor_length_km",
+                            "slip_index_max",
+                            "slip_index_mean",
+                            "sector_count",
+                            "manual_watch_count",
+                            "commune_dominante",
+                        ],
+                    )
+                )
+                st.altair_chart(corr_chart, use_container_width=True)
+
     st.subheader("Profil pedologique LGV (points geotechniques)")
     if geotech_df.empty or "pedology_family" not in geotech_df.columns:
         st.info("Pedologie indisponible dans ce snapshot.")
@@ -2354,8 +2827,16 @@ with tabs[0]:
             ranking_cols.extend(col_map.get(p, []))
         if any(p in selected_periods for p in ["Hiver", "Printemps"]):
             ranking_cols.append("annee_saison_ref")
+        if "histo_mode" in ranking_df.columns:
+            ranking_cols.append("histo_mode")
         ranking_cols = [c for c in ranking_cols if c in ranking_df.columns]
         st.dataframe(ranking_df[ranking_cols], use_container_width=True, hide_index=True)
+        if "histo_mode" in ranking_df.columns:
+            mode_count = ranking_df["histo_mode"].astype(str).value_counts().to_dict()
+            st.caption(
+                "Mode historique classement: "
+                + ", ".join([f"{k}={v}" for k, v in mode_count.items()])
+            )
         if ranking_sort_col in ranking_df.columns:
             ranking_sort_series = pd.to_numeric(ranking_df[ranking_sort_col], errors="coerce")
             if not ranking_sort_series.notna().any():
@@ -2549,6 +3030,7 @@ with tabs[1]:
             weather_df=filtered_weather,
             commune_df=commune_df,
             sectors_df=filtered_sectors,
+            slip_corridors_df=slip_corridors_df,
             hydro_df=filtered_hydro,
             piezo_df=piezo_df,
             geotech_df=geotech_df,
@@ -2562,6 +3044,8 @@ with tabs[1]:
             show_hydro=show_hydro,
             show_piezo=show_piezo,
             show_geotech=show_geotech,
+            show_slip=show_slip,
+            slip_alert_threshold=float(slip_alert_threshold),
             show_fr_layer=show_fr_layer,
         )
         st_folium(m, height=680, use_container_width=True)
@@ -2619,6 +3103,7 @@ with tabs[2]:
     else:
         view_cols = [
             "sector_id",
+            "pk_km",
             "commune_name",
             "risk_level",
             "score",
@@ -2630,11 +3115,47 @@ with tabs[2]:
             "ai_pred_probability",
             "ai_soil_fragility",
             "ai_dominant_pedology",
+            "slip_index",
+            "slip_level",
+            "manual_watch_pk",
+            "slip_drivers",
             "under_watch",
         ]
         present_cols = [c for c in view_cols if c in filtered_sectors.columns]
-        sort_col = "ai_pred_probability" if "ai_pred_probability" in filtered_sectors.columns else "score"
+        sort_col = "slip_index" if "slip_index" in filtered_sectors.columns else ("ai_pred_probability" if "ai_pred_probability" in filtered_sectors.columns else "score")
         st.dataframe(filtered_sectors[present_cols].sort_values(sort_col, ascending=False), use_container_width=True, hide_index=True)
+
+    st.subheader("Zones glissement detectees (corridors PK)")
+    if slip_corridors_df.empty:
+        st.info("Aucun corridor glissement detecte au-dessus du seuil actif.")
+    else:
+        corr_cols = [
+            "slip_corridor_id",
+            "pk_start_km",
+            "pk_end_km",
+            "corridor_length_km",
+            "slip_level",
+            "slip_index_max",
+            "slip_index_mean",
+            "sector_count",
+            "critical_count",
+            "manual_watch_count",
+            "commune_dominante",
+            "max_ai_probability",
+            "max_weather_30d_mm",
+            "max_soil_fragility",
+        ]
+        corr_cols = [c for c in corr_cols if c in slip_corridors_df.columns]
+        st.dataframe(slip_corridors_df[corr_cols], use_container_width=True, hide_index=True)
+
+    st.subheader("PK sous surveillance manuelle (expert GC)")
+    if not enable_manual_pk_watch or not manual_pk_ranges:
+        st.info("Aucune zone PK manuelle active.")
+    else:
+        manual_df = pd.DataFrame(
+            [{"pk_start_km": round(a, 3), "pk_end_km": round(b, 3), "length_km": round(b - a, 3)} for a, b in manual_pk_ranges]
+        ).sort_values("pk_start_km")
+        st.dataframe(manual_df, use_container_width=True, hide_index=True)
 
     st.subheader("Stations meteo filtrees (commune/station)")
     if filtered_weather.empty:
@@ -2925,6 +3446,38 @@ with tabs[3]:
     )
     st.markdown("**Regles de fiabilite des donnees meteo**")
     st.dataframe(reliability_df, use_container_width=True, hide_index=True)
+
+    st.subheader("Logique glissement de terrain (surveillance GC)")
+    st.markdown(
+        """
+        - L'indice glissement est calcule par secteur PK (0-100) via: IA + fragilite sol + pluie + hydro + geotech + piezo.
+        - Les corridors glissement sont des regroupements de secteurs contigus au-dessus du seuil d'alerte.
+        - Les zones PK manuelles (capture expert) peuvent surclasser localement la priorite de surveillance.
+        - Le rendu carte montre les secteurs critiques + polylignes de corridors pour prioriser les rondes terrain.
+        """
+    )
+    slip_method_df = pd.DataFrame(
+        [
+            {"Composante": "IA prediction", "Poids": "30%", "Indicateur": "ai_pred_probability"},
+            {"Composante": "Fragilite pedologique", "Poids": "20%", "Indicateur": "ai_soil_fragility"},
+            {"Composante": "Pression pluie", "Poids": "22%", "Indicateur": "weather_max_24h/7d/30d"},
+            {"Composante": "Hydro reseau", "Poids": "12%", "Indicateur": "hydro_stations"},
+            {"Composante": "Geotech", "Poids": "10%", "Indicateur": "geotech_points"},
+            {"Composante": "Piezo", "Poids": "4%", "Indicateur": "piezometers"},
+            {"Composante": "Score secteur", "Poids": "2%", "Indicateur": "score"},
+        ]
+    )
+    st.dataframe(slip_method_df, use_container_width=True, hide_index=True)
+
+    slip_levels_df = pd.DataFrame(
+        [
+            {"Niveau glissement": "FAIBLE", "Seuil indice": "< 60", "Action GC": "Surveillance normale"},
+            {"Niveau glissement": "MODERE", "Seuil indice": "60-74.9", "Action GC": "Controle renforce"},
+            {"Niveau glissement": "ELEVE", "Seuil indice": "75-87.9", "Action GC": "Inspection terrain prioritaire"},
+            {"Niveau glissement": "CRITIQUE", "Seuil indice": ">= 88", "Action GC": "Intervention urgente"},
+        ]
+    )
+    st.dataframe(slip_levels_df, use_container_width=True, hide_index=True)
 
     st.subheader("Sources de donnees")
     sources_meta = metadata_obj.get("sources", [])
