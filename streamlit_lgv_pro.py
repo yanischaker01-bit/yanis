@@ -246,6 +246,21 @@ def _to_non_negative_numeric(series: pd.Series | object, index: pd.Index) -> pd.
     return s.where(s >= 0.0)
 
 
+def _to_float_or_none(value: object) -> float | None:
+    num = pd.to_numeric(value, errors="coerce")
+    if pd.isna(num):
+        return None
+    return float(num)
+
+
+def _format_mm(value: object, decimals: int = 1) -> str:
+    num = _to_float_or_none(value)
+    if num is None:
+        return "N/A"
+    d = max(0, int(decimals))
+    return f"{num:.{d}f} mm"
+
+
 def _normalize_weather_rain_columns(df: pd.DataFrame) -> Tuple[Dict[str, pd.Series], pd.Series]:
     idx = df.index
     raw_24 = _to_non_negative_numeric(df["rain_24h_mm"] if "rain_24h_mm" in df.columns else pd.Series(np.nan, index=idx), idx)
@@ -271,8 +286,8 @@ def _normalize_weather_rain_columns(df: pd.DataFrame) -> Tuple[Dict[str, pd.Seri
     rain_30_base = raw_30.fillna(rain_7)
     rain_30 = pd.Series(np.maximum(rain_30_base.to_numpy(dtype=float), rain_7.to_numpy(dtype=float)), index=idx, dtype=float)
 
-    month_fallback = pd.Series(np.maximum(rain_30.to_numpy(dtype=float), rain_7.to_numpy(dtype=float)), index=idx, dtype=float)
-    rain_month = raw_month.fillna(month_fallback)
+    # Keep month as true calendar-month accumulation only; avoid silent 30d substitution.
+    rain_month = raw_month.astype(float)
     rain_forecast = raw_forecast.fillna(rain_24)
 
     normalized = {
@@ -690,6 +705,37 @@ def _prepare_monthly_history_chart_df(df: pd.DataFrame, default_commune_label: s
     out["month_label"] = out["month"].map(MONTH_LABELS_SHORT)
     out["commune_short"] = out["commune_label"].map(_commune_short_label)
     return out.sort_values(["commune_label", "ym_date"]).reset_index(drop=True)
+
+
+def _build_history_month_lookup(history_df: pd.DataFrame) -> Tuple[Dict[Tuple[str, str], float], Dict[str, float]]:
+    if history_df.empty:
+        return {}, {}
+    work = history_df.copy()
+    if "commune_label" not in work.columns:
+        return {}, {}
+    work["commune_label"] = work["commune_label"].fillna("").astype(str)
+    if "ym" not in work.columns:
+        if "year" not in work.columns or "month" not in work.columns:
+            return {}, {}
+        yy = pd.to_numeric(work.get("year"), errors="coerce").fillna(0).astype(int).astype(str)
+        mm = pd.to_numeric(work.get("month"), errors="coerce").fillna(0).astype(int).map(lambda v: f"{int(v):02d}")
+        work["ym"] = yy + "-" + mm
+    work["ym"] = work["ym"].astype(str)
+    work["monthly_precip_mm"] = pd.to_numeric(work.get("monthly_precip_mm"), errors="coerce")
+    work = work.dropna(subset=["monthly_precip_mm"])
+    if work.empty:
+        return {}, {}
+
+    exact_map: Dict[Tuple[str, str], float] = {}
+    for row in work[["commune_label", "ym", "monthly_precip_mm"]].itertuples(index=False):
+        exact_map[(str(row.commune_label), str(row.ym))] = float(row.monthly_precip_mm)
+
+    latest_map: Dict[str, float] = {}
+    latest_rows = work.sort_values("ym").groupby("commune_label", as_index=False).tail(1)
+    for row in latest_rows[["commune_label", "monthly_precip_mm"]].itertuples(index=False):
+        latest_map[str(row.commune_label)] = float(row.monthly_precip_mm)
+
+    return exact_map, latest_map
 
 
 def _align_history_month_with_reference(history_df: pd.DataFrame, reference: Dict[str, object]) -> Tuple[pd.DataFrame, bool]:
@@ -1648,10 +1694,7 @@ def _build_pluvio_ranking(
         r7j = pd.to_numeric(wx.get("rain_7d_mm"), errors="coerce")
         r30j = pd.to_numeric(wx.get("rain_30d_mm"), errors="coerce")
         r1m_raw = pd.to_numeric(wx.get("rain_month_mm"), errors="coerce")
-        if (pd.isna(r1m_raw) or float(r1m_raw) <= 0.0) and (not pd.isna(r30j) and float(r30j) > 0.0):
-            r1m = r30j
-        else:
-            r1m = r1m_raw
+        r1m = r1m_raw
 
         winter = None
         spring = None
@@ -1660,6 +1703,25 @@ def _build_pluvio_ranking(
         history_mode = "ESTIME_RECENT"
         if not hist.empty:
             h = hist[hist["commune_label"] == label]
+            if (pd.isna(r1m) or float(r1m) < 0.0) and not h.empty:
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    cur_ym = f"{int(now_utc.year):04d}-{int(now_utc.month):02d}"
+                    h_ym = h.copy()
+                    if "ym" not in h_ym.columns and "year" in h_ym.columns and "month" in h_ym.columns:
+                        h_ym["ym"] = (
+                            pd.to_numeric(h_ym.get("year"), errors="coerce").fillna(0).astype(int).astype(str)
+                            + "-"
+                            + pd.to_numeric(h_ym.get("month"), errors="coerce").fillna(0).astype(int).map(lambda v: f"{int(v):02d}")
+                        )
+                    if "ym" in h_ym.columns:
+                        hm = h_ym[h_ym["ym"].astype(str) == cur_ym]
+                        if not hm.empty:
+                            hm_val = pd.to_numeric(hm.get("monthly_precip_mm"), errors="coerce").dropna()
+                            if not hm_val.empty:
+                                r1m = float(hm_val.iloc[-1])
+                except Exception:
+                    pass
             winter, spring, season_year = _season_totals_from_monthly(h)
             if not h.empty:
                 max_monthly_val = pd.to_numeric(h.get("monthly_precip_mm"), errors="coerce").max()
@@ -2458,7 +2520,9 @@ with st.sidebar:
         st.cache_data.clear()
         st.rerun()
 
-    period_label = st.selectbox("Periode pluvio", list(RAIN_PERIODS.keys()), index=0)
+    period_options = list(RAIN_PERIODS.keys())
+    period_default_idx = period_options.index("Mois courant") if "Mois courant" in period_options else 0
+    period_label = st.selectbox("Periode pluvio", period_options, index=period_default_idx)
     rain_col_weather, commune_rain_col = RAIN_PERIODS[period_label]
     weather_obs_window = st.selectbox(
         "Recherche pluie (fenetre obs)",
@@ -2494,6 +2558,14 @@ with st.sidebar:
         index=0,
     )
     sector_risk_mode = st.selectbox("Filtre secteurs", ["IA predictive", "Operationnel"], index=0)
+    ai_probability_min_pct = st.slider(
+        "Seuil IA predictive min (%)",
+        min_value=0,
+        max_value=100,
+        value=30,
+        step=5,
+        help="Filtre les secteurs selon la probabilite IA predictive.",
+    )
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
     selected_sources = _multiselect_with_all("Sources meteo", sources, key="flt_sources")
@@ -2606,6 +2678,11 @@ if not filtered_sectors.empty and str(min_risk).upper() != "TOUT":
     if sector_risk_mode.startswith("IA") and "ai_pred_risk_level" in filtered_sectors.columns:
         sector_risk_col = "ai_pred_risk_level"
     filtered_sectors = filtered_sectors[filtered_sectors[sector_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+if not filtered_sectors.empty and "ai_pred_probability" in filtered_sectors.columns and int(ai_probability_min_pct) > 0:
+    min_prob = float(ai_probability_min_pct) / 100.0
+    filtered_sectors = filtered_sectors[
+        pd.to_numeric(filtered_sectors["ai_pred_probability"], errors="coerce").fillna(0.0) >= min_prob
+    ]
 
 slip_source_df = filtered_sectors if not filtered_sectors.empty else sectors_df
 slip_corridors_df = _build_slip_corridors(slip_source_df, float(slip_alert_threshold))
@@ -3669,6 +3746,7 @@ with tabs[0]:
                 "puis fallback archive si necessaire."
             )
 
+        history_month_exact, history_month_latest = _build_history_month_lookup(compare_history_full_df)
         latest_rows: List[Dict[str, object]] = []
         if selected_compare_commune_labels:
             for label in selected_compare_commune_labels:
@@ -3678,6 +3756,21 @@ with tabs[0]:
                 com = hit.iloc[0].to_dict()
                 wx_source = filtered_weather if not filtered_weather.empty else weather_df
                 ref = _build_commune_weather_reference(com, wx_source, snapshot_ts)
+                ref_obs = pd.to_datetime(ref.get("obs_date"), utc=True, errors="coerce")
+                ref_ym = (
+                    f"{int(ref_obs.year):04d}-{int(ref_obs.month):02d}"
+                    if not pd.isna(ref_obs)
+                    else ""
+                )
+                hist_month_mm = history_month_exact.get((str(label), ref_ym), np.nan)
+                if pd.isna(hist_month_mm):
+                    hist_month_mm = history_month_latest.get(str(label), np.nan)
+                ref_month_mm = pd.to_numeric(ref.get("rain_month_mm"), errors="coerce")
+                delta_hist_ref = (
+                    abs(float(ref_month_mm) - float(hist_month_mm))
+                    if (not pd.isna(ref_month_mm) and not pd.isna(hist_month_mm))
+                    else np.nan
+                )
                 latest_rows.append(
                     {
                         "commune": label,
@@ -3693,13 +3786,37 @@ with tabs[0]:
                         "rain_7d_mm": ref.get("rain_7d_mm"),
                         "rain_30d_mm": ref.get("rain_30d_mm"),
                         "rain_month_mm": ref.get("rain_month_mm"),
+                        "hist_month_mm": None if pd.isna(hist_month_mm) else round(float(hist_month_mm), 2),
+                        "delta_hist_vs_ref_month_mm": None if pd.isna(delta_hist_ref) else round(float(delta_hist_ref), 2),
                         "date_obs": ref.get("obs_date"),
+                        "ym_ref": ref_ym,
                         "reliability": ref.get("weather_data_reliability"),
                     }
                 )
         if latest_rows:
             st.markdown("**Dernieres mesures meteo par commune comparee**")
             latest_df = pd.DataFrame(latest_rows)
+            preferred_cols = [
+                "commune",
+                "mode_source",
+                "source_label",
+                "station_meteo",
+                "commune_station",
+                "dist_station_km",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "hist_month_mm",
+                "delta_hist_vs_ref_month_mm",
+                "date_obs",
+                "ym_ref",
+                "reliability",
+                "source_brute",
+                "latitude_ref",
+                "longitude_ref",
+            ]
+            latest_df = latest_df[[c for c in preferred_cols if c in latest_df.columns]]
             st.dataframe(latest_df, use_container_width=True, hide_index=True)
             mode_counts = latest_df.get("mode_source", pd.Series(dtype=str)).astype(str).value_counts().to_dict()
             if mode_counts:
@@ -3707,6 +3824,13 @@ with tabs[0]:
                     "Comparatif sources communes: "
                     + ", ".join([f"{k}={v}" for k, v in mode_counts.items()])
                 )
+            if "delta_hist_vs_ref_month_mm" in latest_df.columns:
+                delta_series = pd.to_numeric(latest_df["delta_hist_vs_ref_month_mm"], errors="coerce")
+                if delta_series.notna().any():
+                    st.caption(
+                        "Ecart historique vs reference (mois courant): "
+                        + f"moyenne={float(delta_series.mean()):.2f} mm | max={float(delta_series.max()):.2f} mm"
+                    )
             st.caption(
                 "Regle appliquee: InfoClimat/SYNOP prioritaire (station commune), "
                 "puis station InfoClimat la plus proche; Open-Meteo archive uniquement en dernier recours."
@@ -3716,11 +3840,11 @@ with tabs[0]:
                 "mois = cumul du mois calendaire courant."
             )
 
-    st.subheader("Classement cumuls pluvio (1J / 1 semaine / 1 mois / hiver / printemps / max mensuel / annees)")
+    st.subheader("Classement cumuls pluvio (1J / 1 semaine / mois calendaire / hiver / printemps / max mensuel / annees)")
     if pluvio_ranking_df.empty:
         st.info("Classement indisponible: selectionne des communes avec mesures meteo et historique.")
     else:
-        period_options = ["1J", "1 semaine", "1 mois", "Hiver", "Printemps", "Max mensuel", "Annees"]
+        period_options = ["1J", "1 semaine", "Mois courant (calendaire)", "Hiver", "Printemps", "Max mensuel", "Annees"]
         selected_periods = st.multiselect(
             "Filtres periodes classement",
             period_options,
@@ -3730,7 +3854,7 @@ with tabs[0]:
         ranking_sort_options = {
             "1J": "cum_1j_mm",
             "1 semaine": "cum_1_semaine_mm",
-            "1 mois": "cum_1_mois_mm",
+            "Mois courant (calendaire)": "cum_1_mois_mm",
             "Hiver": "cum_hiver_mm",
             "Printemps": "cum_printemps_mm",
             "Max mensuel": "max_mensuel_mm",
@@ -3771,7 +3895,7 @@ with tabs[0]:
             ranking_df["cum_annees_mm"] = np.nan
             ranking_df["rang_annees"] = pd.Series([pd.NA] * len(ranking_df), dtype="Int64")
 
-        active_sort_options = {k: v for k, v in ranking_sort_options.items() if k in selected_periods} or {"1 mois": "cum_1_mois_mm"}
+        active_sort_options = {k: v for k, v in ranking_sort_options.items() if k in selected_periods} or {"Mois courant (calendaire)": "cum_1_mois_mm"}
         ranking_sort_label = st.selectbox(
             "Classement principal",
             list(active_sort_options.keys()),
@@ -3784,7 +3908,7 @@ with tabs[0]:
         col_map = {
             "1J": ["cum_1j_mm", "rang_1j"],
             "1 semaine": ["cum_1_semaine_mm", "rang_1_semaine"],
-            "1 mois": ["cum_1_mois_mm", "rang_1_mois"],
+            "Mois courant (calendaire)": ["cum_1_mois_mm", "rang_1_mois"],
             "Hiver": ["cum_hiver_mm", "rang_hiver"],
             "Printemps": ["cum_printemps_mm", "rang_printemps"],
             "Max mensuel": ["max_mensuel_mm", "rang_max_mensuel"],
@@ -3919,44 +4043,59 @@ with tabs[0]:
             st.markdown("**Derniere mesure meteo proche (coherente historique commune)**")
             ref_mode = str(selected_commune_weather_reference.get("source_mode") or "AUCUNE_DONNEE")
             if ref_mode != "AUCUNE_DONNEE":
-                st.write(
-                    {
-                        "mode_source": ref_mode,
-                        "source_label": selected_commune_weather_reference.get("source_label"),
-                        "source": selected_commune_weather_reference.get("source"),
-                        "station_id": selected_commune_weather_reference.get("station_id"),
-                        "commune_station": selected_commune_weather_reference.get("commune_station"),
-                        "distance_km": selected_commune_weather_reference.get("distance_km"),
-                        "rain_24h_mm": selected_commune_weather_reference.get("rain_24h_mm"),
-                        "rain_7d_mm": selected_commune_weather_reference.get("rain_7d_mm"),
-                        "rain_30d_mm": selected_commune_weather_reference.get("rain_30d_mm"),
-                        "rain_month_mm": selected_commune_weather_reference.get("rain_month_mm"),
-                        "weather_alert_index": selected_commune_weather_reference.get("weather_alert_index"),
-                        "weather_quality_note": selected_commune_weather_reference.get("weather_quality_note"),
-                        "weather_data_reliability": selected_commune_weather_reference.get("weather_data_reliability"),
-                        "date_obs_raw": selected_commune_weather_reference.get("obs_date"),
-                    }
+                ref_24h = _to_float_or_none(selected_commune_weather_reference.get("rain_24h_mm"))
+                ref_7d = _to_float_or_none(selected_commune_weather_reference.get("rain_7d_mm"))
+                ref_30d = _to_float_or_none(selected_commune_weather_reference.get("rain_30d_mm"))
+                ref_month = _to_float_or_none(selected_commune_weather_reference.get("rain_month_mm"))
+                m24, m7, m30, mm = st.columns(4)
+                m24.metric("24h", _format_mm(ref_24h))
+                m7.metric("7 jours", _format_mm(ref_7d))
+                m30.metric("30 jours", _format_mm(ref_30d))
+                mm.metric("Mois courant", _format_mm(ref_month))
+
+                ref_table = pd.DataFrame(
+                    [
+                        {
+                            "mode_source": ref_mode,
+                            "source_label": selected_commune_weather_reference.get("source_label"),
+                            "source": selected_commune_weather_reference.get("source"),
+                            "station_id": selected_commune_weather_reference.get("station_id"),
+                            "commune_station": selected_commune_weather_reference.get("commune_station"),
+                            "distance_km": selected_commune_weather_reference.get("distance_km"),
+                            "latitude_ref": selected_commune_weather_reference.get("ref_latitude"),
+                            "longitude_ref": selected_commune_weather_reference.get("ref_longitude"),
+                            "rain_24h_mm": ref_24h,
+                            "rain_7d_mm": ref_7d,
+                            "rain_30d_mm": ref_30d,
+                            "rain_month_mm": ref_month,
+                            "weather_alert_index": selected_commune_weather_reference.get("weather_alert_index"),
+                            "weather_quality_note": selected_commune_weather_reference.get("weather_quality_note"),
+                            "weather_data_reliability": selected_commune_weather_reference.get("weather_data_reliability"),
+                            "date_obs_raw": selected_commune_weather_reference.get("obs_date"),
+                        }
+                    ]
                 )
+                st.dataframe(ref_table, use_container_width=True, hide_index=True)
                 st.caption(
                     "Definition periodes: 30j = cumul glissant 30 jours; mois = cumul du mois calendaire en cours."
                 )
                 hist_ref_date = str(history_payload.get("latest_obs_date") or "")
                 hist_ref_30d = pd.to_numeric(history_payload.get("recent_rain_30d_mm"), errors="coerce")
                 hist_ref_month = pd.to_numeric(history_payload.get("recent_rain_month_mm"), errors="coerce")
-                ref_30d = pd.to_numeric(selected_commune_weather_reference.get("rain_30d_mm"), errors="coerce")
-                ref_month = pd.to_numeric(selected_commune_weather_reference.get("rain_month_mm"), errors="coerce")
+                ref_30d_num = pd.to_numeric(ref_30d, errors="coerce")
+                ref_month_num = pd.to_numeric(ref_month, errors="coerce")
                 if ref_mode == "OPEN_METEO_ARCHIVE_FALLBACK":
-                    if not pd.isna(hist_ref_30d) and not pd.isna(ref_30d):
-                        delta_30d = abs(float(hist_ref_30d) - float(ref_30d))
+                    if not pd.isna(hist_ref_30d) and not pd.isna(ref_30d_num):
+                        delta_30d = abs(float(hist_ref_30d) - float(ref_30d_num))
                         st.caption(
                             f"Controle coherence 30j ({hist_ref_date}): "
-                            f"historique={float(hist_ref_30d):.1f} mm | mesure ref={float(ref_30d):.1f} mm | ecart={delta_30d:.1f} mm"
+                            f"historique={float(hist_ref_30d):.1f} mm | mesure ref={float(ref_30d_num):.1f} mm | ecart={delta_30d:.1f} mm"
                         )
-                    if not pd.isna(hist_ref_month) and not pd.isna(ref_month):
-                        delta_month = abs(float(hist_ref_month) - float(ref_month))
+                    if not pd.isna(hist_ref_month) and not pd.isna(ref_month_num):
+                        delta_month = abs(float(hist_ref_month) - float(ref_month_num))
                         st.caption(
                             f"Controle coherence mois courant ({hist_ref_date}): "
-                            f"historique={float(hist_ref_month):.1f} mm | mesure ref={float(ref_month):.1f} mm | ecart={delta_month:.1f} mm"
+                            f"historique={float(hist_ref_month):.1f} mm | mesure ref={float(ref_month_num):.1f} mm | ecart={delta_month:.1f} mm"
                         )
                 elif not pd.isna(hist_ref_30d):
                     st.caption(
@@ -3966,71 +4105,97 @@ with tabs[0]:
                     )
                 if nearest_weather_snapshot:
                     with st.expander("Comparer avec station snapshot la plus proche"):
-                        st.write(
-                            {
-                                "station_id": nearest_weather_snapshot.get("station_id"),
-                                "source": nearest_weather_snapshot.get("source"),
-                                "commune_station": nearest_weather_snapshot.get("station_commune_name"),
-                                "distance_km": nearest_weather_snapshot.get("_dist_km"),
-                                "rain_24h_mm": nearest_weather_snapshot.get("rain_24h_mm"),
-                                "rain_7d_mm": nearest_weather_snapshot.get("rain_7d_mm"),
-                                "rain_30d_mm": nearest_weather_snapshot.get("rain_30d_mm"),
-                                "date_obs_raw": nearest_weather_snapshot.get("date_obs_raw"),
-                            }
+                        near_month = pd.to_numeric(nearest_weather_snapshot.get("rain_month_mm"), errors="coerce")
+                        near_30d = pd.to_numeric(nearest_weather_snapshot.get("rain_30d_mm"), errors="coerce")
+                        near_table = pd.DataFrame(
+                            [
+                                {
+                                    "station_id": nearest_weather_snapshot.get("station_id"),
+                                    "source": nearest_weather_snapshot.get("source"),
+                                    "commune_station": nearest_weather_snapshot.get("station_commune_name"),
+                                    "distance_km": nearest_weather_snapshot.get("_dist_km"),
+                                    "rain_24h_mm": nearest_weather_snapshot.get("rain_24h_mm"),
+                                    "rain_7d_mm": nearest_weather_snapshot.get("rain_7d_mm"),
+                                    "rain_30d_mm": near_30d,
+                                    "rain_month_mm": near_month,
+                                    "date_obs_raw": nearest_weather_snapshot.get("date_obs_raw"),
+                                }
+                            ]
                         )
+                        st.dataframe(near_table, use_container_width=True, hide_index=True)
+                        if not pd.isna(ref_month_num) and not pd.isna(near_month):
+                            delta_month_snap = abs(float(ref_month_num) - float(near_month))
+                            st.caption(
+                                f"Ecart reference vs station snapshot (mois courant): {delta_month_snap:.2f} mm"
+                            )
+                        if not pd.isna(ref_30d_num) and not pd.isna(near_30d):
+                            delta_30d_snap = abs(float(ref_30d_num) - float(near_30d))
+                            st.caption(
+                                f"Ecart reference vs station snapshot (30j): {delta_30d_snap:.2f} mm"
+                            )
             elif nearest_weather_snapshot:
-                st.write(
-                    {
-                        "mode_source": "NEAREST_STATION_FALLBACK",
-                        "source_label": "Fallback station snapshot",
-                        "station_id": nearest_weather_snapshot.get("station_id"),
-                        "source": nearest_weather_snapshot.get("source"),
-                        "commune_station": nearest_weather_snapshot.get("station_commune_name"),
-                        "distance_km": nearest_weather_snapshot.get("_dist_km"),
-                        "rain_24h_mm": nearest_weather_snapshot.get("rain_24h_mm"),
-                        "rain_7d_mm": nearest_weather_snapshot.get("rain_7d_mm"),
-                        "rain_30d_mm": nearest_weather_snapshot.get("rain_30d_mm"),
-                        "weather_alert_index": nearest_weather_snapshot.get("weather_alert_index"),
-                        "weather_watch_priority": nearest_weather_snapshot.get("weather_watch_priority"),
-                        "weather_quality_note": nearest_weather_snapshot.get("weather_quality_note"),
-                        "weather_data_reliability": nearest_weather_snapshot.get("weather_data_reliability"),
-                        "obs_age_h": nearest_weather_snapshot.get("obs_age_h"),
-                        "obs_freshness_level": nearest_weather_snapshot.get("obs_freshness_level"),
-                        "weather_action_label": nearest_weather_snapshot.get("weather_action_label"),
-                        "date_obs_raw": nearest_weather_snapshot.get("date_obs_raw"),
-                    }
+                fallback_table = pd.DataFrame(
+                    [
+                        {
+                            "mode_source": "NEAREST_STATION_FALLBACK",
+                            "source_label": "Fallback station snapshot",
+                            "station_id": nearest_weather_snapshot.get("station_id"),
+                            "source": nearest_weather_snapshot.get("source"),
+                            "commune_station": nearest_weather_snapshot.get("station_commune_name"),
+                            "distance_km": nearest_weather_snapshot.get("_dist_km"),
+                            "rain_24h_mm": nearest_weather_snapshot.get("rain_24h_mm"),
+                            "rain_7d_mm": nearest_weather_snapshot.get("rain_7d_mm"),
+                            "rain_30d_mm": nearest_weather_snapshot.get("rain_30d_mm"),
+                            "rain_month_mm": nearest_weather_snapshot.get("rain_month_mm"),
+                            "weather_alert_index": nearest_weather_snapshot.get("weather_alert_index"),
+                            "weather_watch_priority": nearest_weather_snapshot.get("weather_watch_priority"),
+                            "weather_quality_note": nearest_weather_snapshot.get("weather_quality_note"),
+                            "weather_data_reliability": nearest_weather_snapshot.get("weather_data_reliability"),
+                            "obs_age_h": nearest_weather_snapshot.get("obs_age_h"),
+                            "obs_freshness_level": nearest_weather_snapshot.get("obs_freshness_level"),
+                            "weather_action_label": nearest_weather_snapshot.get("weather_action_label"),
+                            "date_obs_raw": nearest_weather_snapshot.get("date_obs_raw"),
+                        }
+                    ]
                 )
+                st.dataframe(fallback_table, use_container_width=True, hide_index=True)
                 st.caption("Reference commune indisponible: fallback station snapshot.")
             else:
                 st.info("Pas de mesure meteo proche.")
         with chx:
             st.markdown("**Derniere mesure hydro proche**")
             if nearest_hydro:
-                st.write(
-                    {
-                        "station_code": nearest_hydro.get("station_code"),
-                        "river_name": nearest_hydro.get("river_name"),
-                        "distance_km": nearest_hydro.get("_dist_km"),
-                        "last_level_m": nearest_hydro.get("last_level_m"),
-                        "trend_mph": nearest_hydro.get("trend_mph"),
-                        "last_obs_utc": nearest_hydro.get("last_obs_utc"),
-                    }
+                hydro_table = pd.DataFrame(
+                    [
+                        {
+                            "station_code": nearest_hydro.get("station_code"),
+                            "river_name": nearest_hydro.get("river_name"),
+                            "distance_km": nearest_hydro.get("_dist_km"),
+                            "last_level_m": nearest_hydro.get("last_level_m"),
+                            "trend_mph": nearest_hydro.get("trend_mph"),
+                            "last_obs_utc": nearest_hydro.get("last_obs_utc"),
+                        }
+                    ]
                 )
+                st.dataframe(hydro_table, use_container_width=True, hide_index=True)
             else:
                 st.info("Pas de mesure hydro proche.")
         with cpx:
             st.markdown("**Derniere mesure piezometre proche**")
             if nearest_piezo:
-                st.write(
-                    {
-                        "code_bss": nearest_piezo.get("code_bss"),
-                        "name": nearest_piezo.get("name"),
-                        "distance_km": nearest_piezo.get("_dist_km"),
-                        "depth_m": nearest_piezo.get("depth_m"),
-                        "trend_depth_mpd": nearest_piezo.get("trend_depth_mpd"),
-                        "last_date_utc": nearest_piezo.get("last_date_utc"),
-                    }
+                piezo_table = pd.DataFrame(
+                    [
+                        {
+                            "code_bss": nearest_piezo.get("code_bss"),
+                            "name": nearest_piezo.get("name"),
+                            "distance_km": nearest_piezo.get("_dist_km"),
+                            "depth_m": nearest_piezo.get("depth_m"),
+                            "trend_depth_mpd": nearest_piezo.get("trend_depth_mpd"),
+                            "last_date_utc": nearest_piezo.get("last_date_utc"),
+                        }
+                    ]
                 )
+                st.dataframe(piezo_table, use_container_width=True, hide_index=True)
             else:
                 st.info("Pas de piezometre proche.")
 
