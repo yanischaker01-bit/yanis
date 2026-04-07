@@ -140,6 +140,7 @@ class LGVSeaMonitor:
         self.open_meteo_model = "meteofrance_seamless"
         self.open_meteo_sample_step_km = 3.0
         self.open_meteo_max_points = 120
+        self.weather_source_mode = str(os.getenv("LGV_WEATHER_SOURCE_MODE", "info_climat")).strip().lower()
 
         os.makedirs("data", exist_ok=True)
         os.makedirs("reports", exist_ok=True)
@@ -187,6 +188,70 @@ class LGVSeaMonitor:
         if rain_24h >= 20 or r7 >= 40 or r30 >= 90:
             return "VIGILANCE"
         return "NORMAL"
+
+    @staticmethod
+    def _normalize_rain_bundle(
+        rain_instant: Optional[float],
+        rain_12h: Optional[float],
+        rain_24h: Optional[float],
+        rain_7d: Optional[float],
+        rain_30d: Optional[float],
+        rain_month: Optional[float],
+        rain_forecast: Optional[float],
+    ) -> Dict[str, float]:
+        def _to_valid(v: Optional[float]) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                x = float(v)
+            except Exception:
+                return None
+            if not math.isfinite(x):
+                return None
+            if x < 0.0 or x >= 900.0:  # guard common missing/sentinel values
+                return None
+            return x
+
+        r_in = _to_valid(rain_instant)
+        r_12 = _to_valid(rain_12h)
+        r_24 = _to_valid(rain_24h)
+        r_7 = _to_valid(rain_7d)
+        r_30 = _to_valid(rain_30d)
+        r_m = _to_valid(rain_month)
+        r_f = _to_valid(rain_forecast)
+
+        r_in = 0.0 if r_in is None else r_in
+        r_12 = r_in if r_12 is None else r_12
+        r_24 = r_12 if r_24 is None else r_24
+        r_7 = r_24 if r_7 is None else r_7
+        r_30 = r_7 if r_30 is None else r_30
+        r_m = max(r_24, r_30) if r_m is None else max(r_m, r_24)
+        r_f = r_in if r_f is None else r_f
+
+        # Keep cumulative indicators coherent.
+        r_12 = max(r_12, r_in)
+        r_24 = max(r_24, r_12)
+        r_7 = max(r_7, r_24)
+        r_30 = max(r_30, r_7)
+
+        # Plausibility caps; keep conservative fallback behavior.
+        r_in = min(r_in, 250.0)
+        r_12 = min(max(r_12, r_in), 400.0)
+        r_24 = min(max(r_24, r_12), 700.0)
+        r_7 = min(max(r_7, r_24), 2200.0)
+        r_30 = min(max(r_30, r_7), 5000.0)
+        r_m = min(max(r_m, r_24), 5000.0)
+        r_f = min(max(r_f, 0.0), 400.0)
+
+        return {
+            "rain_instant_mm": r_in,
+            "rain_12h_mm": r_12,
+            "rain_24h_mm": r_24,
+            "rain_7d_mm": r_7,
+            "rain_30d_mm": r_30,
+            "rain_month_mm": r_m,
+            "rain_forecast_mm": r_f,
+        }
 
     @staticmethod
     def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -1932,14 +1997,20 @@ class LGVSeaMonitor:
         rr24 = self._safe_float(row.get("rr24"))
         generic_rain = self._safe_float(row.get("precipitation"))
 
-        rain_instant = rr1 if rr1 is not None else (rr3 if rr3 is not None else (generic_rain or 0.0))
-        rain_12h = rr12 if rr12 is not None else rain_instant
-        rain_24h = rr24 if rr24 is not None else rain_12h
-        rain_7d = rain_24h
-        rain_30d = rain_24h
-        rain_month = rain_24h
-        rain_forecast = rain_instant  # no forecast from SYNOP row, keep same value
-        rain_class = self._station_pluvio_class(float(rain_24h), float(rain_7d), float(rain_30d))
+        rain_pack = self._normalize_rain_bundle(
+            rain_instant=rr1 if rr1 is not None else (rr3 if rr3 is not None else generic_rain),
+            rain_12h=rr12,
+            rain_24h=rr24,
+            rain_7d=rr24,
+            rain_30d=rr24,
+            rain_month=rr24,
+            rain_forecast=rr1 if rr1 is not None else rr3,
+        )
+        rain_class = self._station_pluvio_class(
+            float(rain_pack["rain_24h_mm"]),
+            float(rain_pack["rain_7d_mm"]),
+            float(rain_pack["rain_30d_mm"]),
+        )
 
         return {
             "station_id": station_id or "unknown",
@@ -1947,14 +2018,15 @@ class LGVSeaMonitor:
             "latitude": round(float(lat), 6),
             "longitude": round(float(lon), 6),
             "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(lat, lon)), 3),
-            "precipitation_mm": round(float(rain_forecast), 3),
-            "rain_24h_mm": round(float(rain_24h), 3),
-            "rain_7d_mm": round(float(rain_7d), 3),
-            "rain_30d_mm": round(float(rain_30d), 3),
-            "rain_month_mm": round(float(rain_month), 3),
-            "rain_12h_mm": round(float(rain_12h), 3),
-            "rain_instant_mm": round(float(rain_instant), 3),
-            "rain_forecast_mm": round(float(rain_forecast), 3),
+            # precipitation_mm is normalized as observed 24h rain for cross-source consistency.
+            "precipitation_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+            "rain_24h_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+            "rain_7d_mm": round(float(rain_pack["rain_7d_mm"]), 3),
+            "rain_30d_mm": round(float(rain_pack["rain_30d_mm"]), 3),
+            "rain_month_mm": round(float(rain_pack["rain_month_mm"]), 3),
+            "rain_12h_mm": round(float(rain_pack["rain_12h_mm"]), 3),
+            "rain_instant_mm": round(float(rain_pack["rain_instant_mm"]), 3),
+            "rain_forecast_mm": round(float(rain_pack["rain_forecast_mm"]), 3),
             "rain_class": rain_class,
             "source": DataSource.SYNOP_METEOFRANCE.value,
         }
@@ -1981,9 +2053,42 @@ class LGVSeaMonitor:
 
                 all_df = pd.DataFrame(rows)
                 all_df["date"] = pd.to_datetime(all_df["date_obs_raw"], format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+                fallback_mask = all_df["date"].isna()
+                if fallback_mask.any():
+                    all_df.loc[fallback_mask, "date"] = pd.to_datetime(
+                        all_df.loc[fallback_mask, "date_obs_raw"],
+                        errors="coerce",
+                        utc=True,
+                    )
                 all_df = all_df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
                 if all_df.empty:
                     continue
+
+                # Keep one freshest record per station and coerce numeric rain fields.
+                all_df = all_df.sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+                for col in [
+                    "precipitation_mm",
+                    "rain_24h_mm",
+                    "rain_7d_mm",
+                    "rain_30d_mm",
+                    "rain_month_mm",
+                    "rain_12h_mm",
+                    "rain_instant_mm",
+                    "rain_forecast_mm",
+                    "distance_to_lgv_km",
+                ]:
+                    all_df[col] = pd.to_numeric(all_df.get(col), errors="coerce")
+                for col in [
+                    "precipitation_mm",
+                    "rain_24h_mm",
+                    "rain_7d_mm",
+                    "rain_30d_mm",
+                    "rain_month_mm",
+                    "rain_12h_mm",
+                    "rain_instant_mm",
+                    "rain_forecast_mm",
+                ]:
+                    all_df[col] = all_df[col].fillna(0.0).clip(lower=0.0)
 
                 selected_df = all_df[all_df["distance_to_lgv_km"] <= self.weather_corridor_km].copy()
                 notice = None
@@ -2104,7 +2209,20 @@ class LGVSeaMonitor:
             rain_30d = sum(v for dt, v, _ in past if dt > lower_30d)
             rain_month = sum(v for dt, v, _ in past if dt >= month_start)
             rain_forecast = future[0][1] if future else rain_instant
-            rain_class = self._station_pluvio_class(float(rain_24h), float(rain_7d), float(rain_30d))
+            rain_pack = self._normalize_rain_bundle(
+                rain_instant=rain_instant,
+                rain_12h=rain_12h,
+                rain_24h=rain_24h,
+                rain_7d=rain_7d,
+                rain_30d=rain_30d,
+                rain_month=rain_month,
+                rain_forecast=rain_forecast,
+            )
+            rain_class = self._station_pluvio_class(
+                float(rain_pack["rain_24h_mm"]),
+                float(rain_pack["rain_7d_mm"]),
+                float(rain_pack["rain_30d_mm"]),
+            )
 
             rows.append(
                 {
@@ -2113,14 +2231,15 @@ class LGVSeaMonitor:
                     "latitude": round(float(lat), 6),
                     "longitude": round(float(lon), 6),
                     "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(float(lat), float(lon))), 3),
-                    "precipitation_mm": round(rain_forecast, 3),
-                    "rain_24h_mm": round(rain_24h, 3),
-                    "rain_7d_mm": round(rain_7d, 3),
-                    "rain_30d_mm": round(rain_30d, 3),
-                    "rain_month_mm": round(rain_month, 3),
-                    "rain_12h_mm": round(rain_12h, 3),
-                    "rain_instant_mm": round(rain_instant, 3),
-                    "rain_forecast_mm": round(rain_forecast, 3),
+                    # precipitation_mm is normalized as observed 24h rain for cross-source consistency.
+                    "precipitation_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                    "rain_24h_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                    "rain_7d_mm": round(float(rain_pack["rain_7d_mm"]), 3),
+                    "rain_30d_mm": round(float(rain_pack["rain_30d_mm"]), 3),
+                    "rain_month_mm": round(float(rain_pack["rain_month_mm"]), 3),
+                    "rain_12h_mm": round(float(rain_pack["rain_12h_mm"]), 3),
+                    "rain_instant_mm": round(float(rain_pack["rain_instant_mm"]), 3),
+                    "rain_forecast_mm": round(float(rain_pack["rain_forecast_mm"]), 3),
                     "rain_class": rain_class,
                     "source": DataSource.OPEN_METEO.value,
                     "selection_mode": "open_meteo_grid",
@@ -2154,6 +2273,31 @@ class LGVSeaMonitor:
         df = pd.DataFrame(rows)
         df["date"] = pd.to_datetime(df["date_obs_raw"], errors="coerce", utc=True)
         df = df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
+        if not df.empty:
+            df = df.sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+            for col in [
+                "precipitation_mm",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "rain_12h_mm",
+                "rain_instant_mm",
+                "rain_forecast_mm",
+                "distance_to_lgv_km",
+            ]:
+                df[col] = pd.to_numeric(df.get(col), errors="coerce")
+            for col in [
+                "precipitation_mm",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "rain_12h_mm",
+                "rain_instant_mm",
+                "rain_forecast_mm",
+            ]:
+                df[col] = df[col].fillna(0.0).clip(lower=0.0)
         ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
         csv_path = os.path.join("data", f"open_meteo_lgv_grid_{ts}.csv")
         df.to_csv(csv_path, index=False)
@@ -2170,12 +2314,31 @@ class LGVSeaMonitor:
         open_meteo = self.fetch_pluviometry_open_meteo()
 
         frames_all = [df for df in [synop.get("all"), open_meteo.get("all")] if isinstance(df, pd.DataFrame) and not df.empty]
-        frames_sel = [df for df in [synop.get("selected"), open_meteo.get("selected")] if isinstance(df, pd.DataFrame) and not df.empty]
         all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
-        selected_df = pd.concat(frames_sel, ignore_index=True) if frames_sel else pd.DataFrame()
+        synop_selected = synop.get("selected") if isinstance(synop.get("selected"), pd.DataFrame) else pd.DataFrame()
+        open_selected = open_meteo.get("selected") if isinstance(open_meteo.get("selected"), pd.DataFrame) else pd.DataFrame()
+        mode = str(getattr(self, "weather_source_mode", "info_climat") or "info_climat").lower()
+
+        if mode in {"info_climat", "infoclimat", "synop_only", "synop"}:
+            if not synop_selected.empty:
+                selected_df = synop_selected.copy()
+                selected_df["selection_mode"] = "info_climat_primary_synop"
+                mode_notice = "Mode InfoClimat: SYNOP prioritaire."
+            elif not open_selected.empty:
+                selected_df = open_selected.copy()
+                selected_df["selection_mode"] = "info_climat_fallback_open_meteo"
+                mode_notice = "Mode InfoClimat: fallback Open-Meteo (SYNOP indisponible)."
+            else:
+                selected_df = pd.DataFrame()
+                mode_notice = "Mode InfoClimat: aucune source meteo disponible."
+        else:
+            frames_sel = [df for df in [synop_selected, open_selected] if isinstance(df, pd.DataFrame) and not df.empty]
+            selected_df = pd.concat(frames_sel, ignore_index=True) if frames_sel else pd.DataFrame()
+            mode_notice = f"Mode meteo '{mode}': fusion SYNOP + Open-Meteo."
 
         notices = [n for n in [synop.get("notice"), open_meteo.get("notice")] if n]
-        notice = " | ".join(notices) if notices else None
+        notices.append(mode_notice)
+        notice = " | ".join([n for n in notices if n]) if notices else None
 
         ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
         combined_csv = os.path.join("data", f"weather_combined_{ts}.csv")
@@ -2189,6 +2352,7 @@ class LGVSeaMonitor:
                 "synop_source": synop.get("source_url"),
                 "open_meteo_source": open_meteo.get("source_url"),
                 "selected_station_count": int(len(selected_df)) if not selected_df.empty else 0,
+                "weather_source_mode": mode,
                 "notice": notice,
                 "combined_csv": combined_csv if not selected_df.empty else None,
             },
@@ -3955,10 +4119,13 @@ class LGVSeaMonitor:
                 "corridor_weather_km": self.weather_corridor_km,
                 "corridor_hydro_km": self.hydro_network_corridor_km,
                 "corridor_piezometer_km": self.piezometer_corridor_km,
+                "weather_source_mode": self.weather_source_mode,
             },
             "calculation_methods": {
                 "pluviometrie": (
-                    "Fusion SYNOP + Open-Meteo. Classe pluie par seuils 24h/7j/30j, "
+                    "Mode 'info_climat': SYNOP Meteo-France prioritaire (open-data officiel), "
+                    "fallback Open-Meteo uniquement si SYNOP indisponible. "
+                    "Cumuls pluie normalises (24h<=7j<=30j), controles de valeurs aberrantes, "
                     "distance a la LGV par projection segmentaire."
                 ),
                 "hydrometrie": (
@@ -4008,6 +4175,12 @@ class LGVSeaMonitor:
                     "label": "Hub'Eau Niveaux de nappes",
                     "url": "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes",
                     "usage": "piezometrie et tendances de nappes",
+                },
+                {
+                    "id": "infoclimat_reference",
+                    "label": "InfoClimat (reference utilisateur)",
+                    "url": "https://www.infoclimat.fr/",
+                    "usage": "reference visuelle; source primaire pipeline = SYNOP Meteo-France",
                 },
                 {
                     "id": "georisques_rga_mvt",

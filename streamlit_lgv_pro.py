@@ -19,6 +19,7 @@ SNAPSHOT_LATEST = Path("reports/streamlit_snapshot_latest.json")
 SNAPSHOT_GLOB = "streamlit_snapshot_*.json"
 REMOTE_SNAPSHOT_URLS = [
     "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json",
+    "https://raw.githubusercontent.com/yanischaker01-bit/yanis/main/reports/streamlit_snapshot_latest.json",
 ]
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_MODEL = "meteofrance_seamless"
@@ -88,6 +89,30 @@ DEFAULT_MANUAL_PK_RANGES = [
     (80.370, 80.650),
     (216.700, 216.950),
 ]
+
+MONTH_LABELS_SHORT = {
+    1: "Jan",
+    2: "Fev",
+    3: "Mar",
+    4: "Avr",
+    5: "Mai",
+    6: "Juin",
+    7: "Juil",
+    8: "Aou",
+    9: "Sep",
+    10: "Oct",
+    11: "Nov",
+    12: "Dec",
+}
+MONTH_ORDER_SHORT = [MONTH_LABELS_SHORT[m] for m in range(1, 13)]
+MONTH_SHORT_TO_NUM = {v: k for k, v in MONTH_LABELS_SHORT.items()}
+
+OBS_WINDOW_HOURS = {
+    "Tout": None,
+    "1 jour": 24.0,
+    "7 jours": 24.0 * 7.0,
+    "Mois courant": None,
+}
 
 
 def _risk_rank(level: str) -> int:
@@ -192,16 +217,77 @@ def _source_reliability_note(source: str) -> float:
     return 75.0
 
 
+def _to_non_negative_numeric(series: pd.Series | object, index: pd.Index) -> pd.Series:
+    s = pd.to_numeric(series, errors="coerce")
+    if not isinstance(s, pd.Series):
+        s = pd.Series(np.nan, index=index, dtype=float)
+    else:
+        s = s.reindex(index)
+    return s.where(s >= 0.0)
+
+
+def _normalize_weather_rain_columns(df: pd.DataFrame) -> Tuple[Dict[str, pd.Series], pd.Series]:
+    idx = df.index
+    raw_24 = _to_non_negative_numeric(df["rain_24h_mm"] if "rain_24h_mm" in df.columns else pd.Series(np.nan, index=idx), idx)
+    raw_7 = _to_non_negative_numeric(df["rain_7d_mm"] if "rain_7d_mm" in df.columns else pd.Series(np.nan, index=idx), idx)
+    raw_30 = _to_non_negative_numeric(df["rain_30d_mm"] if "rain_30d_mm" in df.columns else pd.Series(np.nan, index=idx), idx)
+    raw_month = _to_non_negative_numeric(df["rain_month_mm"] if "rain_month_mm" in df.columns else pd.Series(np.nan, index=idx), idx)
+    raw_forecast = _to_non_negative_numeric(df["rain_forecast_mm"] if "rain_forecast_mm" in df.columns else pd.Series(np.nan, index=idx), idx)
+
+    completeness_raw = pd.DataFrame(
+        {
+            "rain_24h_mm": raw_24,
+            "rain_7d_mm": raw_7,
+            "rain_30d_mm": raw_30,
+            "rain_month_mm": raw_month,
+            "rain_forecast_mm": raw_forecast,
+        }
+    )
+    completeness_ratio = completeness_raw.notna().sum(axis=1) / float(len(completeness_raw.columns))
+
+    rain_24 = raw_24.fillna(0.0)
+    rain_7_base = raw_7.fillna(rain_24)
+    rain_7 = pd.Series(np.maximum(rain_7_base.to_numpy(dtype=float), rain_24.to_numpy(dtype=float)), index=idx, dtype=float)
+    rain_30_base = raw_30.fillna(rain_7)
+    rain_30 = pd.Series(np.maximum(rain_30_base.to_numpy(dtype=float), rain_7.to_numpy(dtype=float)), index=idx, dtype=float)
+
+    month_fallback = pd.Series(np.maximum(rain_30.to_numpy(dtype=float), rain_7.to_numpy(dtype=float)), index=idx, dtype=float)
+    rain_month = raw_month.fillna(month_fallback)
+    rain_forecast = raw_forecast.fillna(rain_24)
+
+    normalized = {
+        "rain_24h_mm": rain_24.astype(float),
+        "rain_7d_mm": rain_7.astype(float),
+        "rain_30d_mm": rain_30.astype(float),
+        "rain_month_mm": rain_month.astype(float),
+        "rain_forecast_mm": rain_forecast.astype(float),
+    }
+    return normalized, completeness_ratio.astype(float)
+
+
+def _snapshot_payload_timestamp(payload: Dict[str, object]) -> pd.Timestamp:
+    if not isinstance(payload, dict):
+        return pd.NaT
+    return pd.to_datetime(payload.get("timestamp_utc"), utc=True, errors="coerce")
+
+
+def _snapshot_age_hours(snapshot_ts: pd.Timestamp | None) -> float | None:
+    if snapshot_ts is None or pd.isna(snapshot_ts):
+        return None
+    now_utc = pd.Timestamp.now(tz="UTC")
+    age_h = (now_utc - snapshot_ts).total_seconds() / 3600.0
+    return max(0.0, float(age_h))
+
+
 def _build_weather_enhanced(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp | None) -> pd.DataFrame:
     if weather_df.empty:
         return weather_df.copy()
 
     df = weather_df.copy()
-    for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "rain_forecast_mm", "distance_to_lgv_km"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        else:
-            df[col] = np.nan
+    rain_cols, completeness = _normalize_weather_rain_columns(df)
+    for col, series in rain_cols.items():
+        df[col] = series
+    df["distance_to_lgv_km"] = pd.to_numeric(df.get("distance_to_lgv_km"), errors="coerce")
 
     ts_source = None
     if "date_obs_raw" in df.columns:
@@ -235,8 +321,6 @@ def _build_weather_enhanced(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp 
     dist = pd.to_numeric(df.get("distance_to_lgv_km"), errors="coerce")
     df["proximity_note"] = ((1.0 - dist.fillna(2.5).clip(lower=0.0, upper=2.5) / 2.5) * 100.0).clip(lower=35.0, upper=100.0)
 
-    completeness_cols = ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "rain_forecast_mm"]
-    completeness = df[completeness_cols].notna().sum(axis=1) / float(len(completeness_cols))
     df["completeness_note"] = (completeness * 100.0).clip(lower=20.0, upper=100.0)
 
     df["weather_quality_note"] = (
@@ -410,7 +494,7 @@ def _load_snapshot(path_str: str, mtime: float) -> Dict[str, object]:
 @st.cache_data(show_spinner=False, ttl=300)
 def _load_remote_snapshot(url: str) -> Dict[str, object]:
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(url, timeout=12)
         if response.status_code != 200 or not response.text.strip():
             return {}
         payload = response.json()
@@ -420,15 +504,34 @@ def _load_remote_snapshot(url: str) -> Dict[str, object]:
 
 
 def _load_snapshot_payload() -> Tuple[Dict[str, object], str]:
+    candidates: List[Tuple[str, Dict[str, object]]] = []
     local_path = _find_snapshot()
     if local_path is not None:
-        return _load_snapshot(str(local_path), local_path.stat().st_mtime), f"local:{local_path}"
+        try:
+            local_payload = _load_snapshot(str(local_path), local_path.stat().st_mtime)
+            if local_payload:
+                candidates.append((f"local:{local_path}", local_payload))
+        except Exception:
+            pass
 
     for url in REMOTE_SNAPSHOT_URLS:
         payload = _load_remote_snapshot(url)
         if payload:
-            return payload, url
-    return {}, ""
+            candidates.append((url, payload))
+
+    if not candidates:
+        return {}, ""
+
+    def _candidate_rank(item: Tuple[str, Dict[str, object]]) -> Tuple[int, int, int]:
+        source, payload = item
+        ts = _snapshot_payload_timestamp(payload)
+        has_ts = 0 if pd.isna(ts) else 1
+        ts_val = int(ts.value) if has_ts else -1
+        local_bonus = 1 if str(source).startswith("local:") else 0
+        return has_ts, ts_val, local_bonus
+
+    best_source, best_payload = max(candidates, key=_candidate_rank)
+    return best_payload, best_source
 
 
 def _safe_df(records: object) -> pd.DataFrame:
@@ -464,6 +567,126 @@ def _multiselect_with_all(label: str, options: List[str], key: str) -> List[str]
     if not selected or "Tout" in selected:
         return clean_options
     return [opt for opt in clean_options if opt in selected]
+
+
+def _ensure_month_column(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    if "month" in out.columns:
+        out["month"] = pd.to_numeric(out["month"], errors="coerce")
+    elif "ym" in out.columns:
+        out["month"] = pd.to_numeric(out["ym"].astype(str).str.slice(5, 7), errors="coerce")
+    else:
+        out["month"] = np.nan
+    out["month"] = out["month"].fillna(0).astype(int)
+    return out
+
+
+def _filter_history_months(df: pd.DataFrame, selected_month_numbers: List[int]) -> pd.DataFrame:
+    if df.empty or not selected_month_numbers:
+        return df.copy()
+    work = _ensure_month_column(df)
+    month_set = set(int(m) for m in selected_month_numbers if int(m) in MONTH_LABELS_SHORT)
+    if not month_set:
+        return work
+    return work[work["month"].isin(month_set)].copy()
+
+
+def _build_monthly_climatology(monthly_df: pd.DataFrame) -> pd.DataFrame:
+    if monthly_df.empty:
+        return pd.DataFrame()
+    work = _ensure_month_column(monthly_df)
+    work["monthly_precip_mm"] = pd.to_numeric(work.get("monthly_precip_mm"), errors="coerce")
+    work = work.dropna(subset=["month", "monthly_precip_mm"])
+    if work.empty:
+        return pd.DataFrame()
+    out = (
+        work.groupby("month", as_index=False)["monthly_precip_mm"]
+        .mean()
+        .rename(columns={"monthly_precip_mm": "climatology_mm"})
+    )
+    out["climatology_mm"] = pd.to_numeric(out["climatology_mm"], errors="coerce").round(1)
+    out["month_label"] = out["month"].map(MONTH_LABELS_SHORT)
+    return out.sort_values("month")
+
+
+def _commune_short_label(label: object) -> str:
+    txt = str(label or "").strip()
+    if not txt:
+        return "Inconnue"
+    if " (" in txt:
+        txt = txt.split(" (", 1)[0].strip()
+    if len(txt) <= 22:
+        return txt
+    return txt[:19].rstrip() + "..."
+
+
+def _prepare_monthly_history_chart_df(df: pd.DataFrame, default_commune_label: str = "") -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    if "ym" not in out.columns:
+        if "year" in out.columns and "month" in out.columns:
+            yy = pd.to_numeric(out.get("year"), errors="coerce").fillna(0).astype(int).astype(str)
+            mm = pd.to_numeric(out.get("month"), errors="coerce").fillna(0).astype(int).map(lambda v: f"{int(v):02d}")
+            out["ym"] = yy + "-" + mm
+        else:
+            return pd.DataFrame()
+    out["ym"] = out["ym"].astype(str)
+    out["ym_date"] = pd.to_datetime(out["ym"] + "-01", utc=True, errors="coerce")
+    out["monthly_precip_mm"] = pd.to_numeric(out.get("monthly_precip_mm"), errors="coerce")
+    if "year" not in out.columns:
+        out["year"] = pd.to_numeric(out["ym"].str.slice(0, 4), errors="coerce")
+    else:
+        out["year"] = pd.to_numeric(out.get("year"), errors="coerce")
+    if "month" not in out.columns:
+        out["month"] = pd.to_numeric(out["ym"].str.slice(5, 7), errors="coerce")
+    else:
+        out["month"] = pd.to_numeric(out.get("month"), errors="coerce")
+    if "commune_label" not in out.columns:
+        out["commune_label"] = str(default_commune_label or "Inconnue")
+    out["commune_label"] = out["commune_label"].fillna(str(default_commune_label or "Inconnue")).astype(str)
+    out = out.dropna(subset=["ym_date", "monthly_precip_mm", "year", "month"])
+    if out.empty:
+        return pd.DataFrame()
+    out["monthly_precip_mm"] = out["monthly_precip_mm"].clip(lower=0.0)
+    out["year"] = out["year"].astype(int)
+    out["month"] = out["month"].astype(int)
+    out["month_label"] = out["month"].map(MONTH_LABELS_SHORT)
+    out["commune_short"] = out["commune_label"].map(_commune_short_label)
+    return out.sort_values(["commune_label", "ym_date"]).reset_index(drop=True)
+
+
+def _is_infoclimat_station_source(source: object) -> bool:
+    src = str(source or "").strip().lower()
+    if not src:
+        return False
+    return ("infoclimat" in src) or ("synop" in src)
+
+
+def _apply_weather_obs_window(
+    weather_df: pd.DataFrame,
+    window_label: str,
+    snapshot_ts: pd.Timestamp | None,
+) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+    label = str(window_label or "Tout")
+    if label == "Tout":
+        return weather_df.copy()
+
+    ref_ts = snapshot_ts if snapshot_ts is not None and not pd.isna(snapshot_ts) else pd.Timestamp.now(tz="UTC")
+    obs_ts = pd.to_datetime(weather_df.get("obs_ts_utc"), utc=True, errors="coerce")
+    if label == "Mois courant":
+        mask = (obs_ts.dt.year == int(ref_ts.year)) & (obs_ts.dt.month == int(ref_ts.month))
+    else:
+        max_hours = OBS_WINDOW_HOURS.get(label)
+        if max_hours is None:
+            return weather_df.copy()
+        age_h = (ref_ts - obs_ts).dt.total_seconds() / 3600.0
+        mask = pd.to_numeric(age_h, errors="coerce").fillna(9999.0) <= float(max_hours)
+    return weather_df[mask.fillna(False)].copy()
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -787,13 +1010,7 @@ def _load_sector_monthly_history(lat: float, lon: float, years_back: int) -> Dic
         )
         monthly["monthly_precip_mm"] = monthly["monthly_precip_mm"].round(1)
 
-        clim = monthly.groupby("month", as_index=False)["monthly_precip_mm"].mean().rename(columns={"monthly_precip_mm": "climatology_mm"})
-        clim["climatology_mm"] = clim["climatology_mm"].round(1)
-        month_names = {
-            1: "Jan", 2: "Fev", 3: "Mar", 4: "Avr", 5: "Mai", 6: "Juin",
-            7: "Juil", 8: "Aou", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
-        }
-        clim["month_label"] = clim["month"].map(month_names)
+        clim = _build_monthly_climatology(monthly)
 
         return {
             "monthly": monthly.sort_values("ym").to_dict(orient="records"),
@@ -803,6 +1020,263 @@ def _load_sector_monthly_history(lat: float, lon: float, years_back: int) -> Dic
         }
     except Exception as exc:
         return {"monthly": [], "climatology": [], "model": used_model, "error": str(exc)}
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
+def _load_sector_daily_precip_on_date(lat: float, lon: float, target_day_iso: str) -> Dict[str, object]:
+    params = {
+        "latitude": f"{lat:.6f}",
+        "longitude": f"{lon:.6f}",
+        "start_date": str(target_day_iso),
+        "end_date": str(target_day_iso),
+        "daily": "precipitation_sum",
+        "timezone": "UTC",
+        "models": OPEN_METEO_MODEL,
+    }
+    used_model = OPEN_METEO_MODEL
+    try:
+        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        if response.status_code != 200:
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            response = requests.get(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30)
+            used_model = "open_meteo_default"
+        if response.status_code != 200 or not response.text.strip():
+            return {"date": str(target_day_iso), "precip_mm": None, "model": used_model, "error": f"HTTP {response.status_code}"}
+
+        payload = response.json()
+        entry = payload[0] if isinstance(payload, list) and payload else payload
+        if not isinstance(entry, dict):
+            return {"date": str(target_day_iso), "precip_mm": None, "model": used_model, "error": "payload invalide"}
+        daily = entry.get("daily", {}) if isinstance(entry.get("daily"), dict) else {}
+        times = daily.get("time", []) or []
+        vals = daily.get("precipitation_sum", []) or []
+        if not times or not vals:
+            return {"date": str(target_day_iso), "precip_mm": None, "model": used_model, "error": "serie vide"}
+
+        day_df = pd.DataFrame(
+            {
+                "date": pd.to_datetime(times, utc=True, errors="coerce"),
+                "precip_mm": pd.to_numeric(vals, errors="coerce"),
+            }
+        ).dropna(subset=["date", "precip_mm"])
+        if day_df.empty:
+            return {"date": str(target_day_iso), "precip_mm": None, "model": used_model, "error": "serie vide"}
+
+        precip_val = float(day_df["precip_mm"].iloc[-1])
+        return {"date": str(target_day_iso), "precip_mm": round(max(0.0, precip_val), 2), "model": used_model, "error": None}
+    except Exception as exc:
+        return {"date": str(target_day_iso), "precip_mm": None, "model": used_model, "error": str(exc)}
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
+def _load_sector_recent_weather_archive(lat: float, lon: float, lookback_days: int = 45) -> Dict[str, object]:
+    now_utc = datetime.now(timezone.utc)
+    lookback = max(32, min(int(lookback_days), 120))
+    start_date = (now_utc - timedelta(days=lookback)).strftime("%Y-%m-%d")
+    end_date = now_utc.strftime("%Y-%m-%d")
+    params = {
+        "latitude": f"{lat:.6f}",
+        "longitude": f"{lon:.6f}",
+        "start_date": start_date,
+        "end_date": end_date,
+        "daily": "precipitation_sum",
+        "timezone": "UTC",
+        "models": OPEN_METEO_MODEL,
+    }
+
+    used_model = OPEN_METEO_MODEL
+    try:
+        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        if response.status_code != 200:
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            response = requests.get(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30)
+            used_model = "open_meteo_default"
+        if response.status_code != 200 or not response.text.strip():
+            return {"error": f"HTTP {response.status_code}", "model": used_model}
+
+        payload = response.json()
+        entry = payload[0] if isinstance(payload, list) and payload else payload
+        if not isinstance(entry, dict):
+            return {"error": "payload invalide", "model": used_model}
+        daily = entry.get("daily", {}) if isinstance(entry.get("daily"), dict) else {}
+        times = daily.get("time", []) or []
+        vals = daily.get("precipitation_sum", []) or []
+        if not times or not vals:
+            return {"error": "serie vide", "model": used_model}
+
+        df = pd.DataFrame(
+            {
+                "date": pd.to_datetime(times, utc=True, errors="coerce"),
+                "precip_mm": pd.to_numeric(vals, errors="coerce"),
+            }
+        )
+        df = df.dropna(subset=["date"])
+        if df.empty:
+            return {"error": "serie vide", "model": used_model}
+        df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.normalize()
+        df = df.dropna(subset=["date"]).sort_values("date")
+        if df.empty:
+            return {"error": "serie vide", "model": used_model}
+
+        last_date = pd.Timestamp(df["date"].max()).tz_convert("UTC")
+        lower_7d = last_date - pd.Timedelta(days=6)
+        lower_30d = last_date - pd.Timedelta(days=29)
+        month_start = pd.Timestamp(year=int(last_date.year), month=int(last_date.month), day=1, tz="UTC")
+
+        rain_24h = float(df.loc[df["date"] == last_date, "precip_mm"].sum())
+        rain_7d = float(df.loc[df["date"] >= lower_7d, "precip_mm"].sum())
+        rain_30d = float(df.loc[df["date"] >= lower_30d, "precip_mm"].sum())
+        rain_month = float(df.loc[df["date"] >= month_start, "precip_mm"].sum())
+        rain_24h = max(0.0, rain_24h)
+        rain_7d = max(rain_24h, rain_7d)
+        rain_30d = max(rain_7d, rain_30d)
+        rain_month = max(rain_24h, rain_month)
+
+        weather_alert_index = (
+            min(rain_24h / 90.0, 1.6) * 40.0
+            + min(rain_7d / 140.0, 1.5) * 30.0
+            + min(rain_30d / 260.0, 1.5) * 20.0
+        )
+        weather_alert_index = max(0.0, min(weather_alert_index, 100.0))
+
+        return {
+            "station_id": "commune_archive_ref",
+            "source": "open_meteo_archive_commune",
+            "commune_station": "centre_commune",
+            "distance_km": 0.0,
+            "date_obs_raw": last_date.strftime("%Y-%m-%d"),
+            "rain_24h_mm": round(rain_24h, 2),
+            "rain_7d_mm": round(rain_7d, 2),
+            "rain_30d_mm": round(rain_30d, 2),
+            "rain_month_mm": round(rain_month, 2),
+            "precipitation_mm": round(rain_24h, 2),
+            "weather_alert_index": round(weather_alert_index, 1),
+            "meteo_operational_level": _weather_level_from_index(weather_alert_index),
+            "meteo_model": used_model,
+            "error": None,
+        }
+    except Exception as exc:
+        return {"error": str(exc), "model": used_model}
+
+
+def _build_commune_weather_reference(
+    commune_row: Dict[str, object],
+    weather_df: pd.DataFrame,
+    snapshot_ts: pd.Timestamp | None,
+    max_station_km: float = 15.0,
+    max_obs_age_h: float = 72.0,
+) -> Dict[str, object]:
+    try:
+        lat = float(commune_row.get("latitude"))
+        lon = float(commune_row.get("longitude"))
+    except Exception:
+        return {
+            "source_mode": "AUCUNE_DONNEE",
+            "source_label": "Coordonnees commune invalides",
+            "source": None,
+            "station_id": None,
+            "commune_station": None,
+            "distance_km": None,
+            "obs_date": None,
+            "rain_24h_mm": None,
+            "rain_7d_mm": None,
+            "rain_30d_mm": None,
+            "rain_month_mm": None,
+            "weather_alert_index": None,
+            "weather_quality_note": None,
+            "weather_data_reliability": "A_VERIFIER",
+        }
+
+    nearest = _nearest_row(weather_df, lat, lon) if isinstance(weather_df, pd.DataFrame) and not weather_df.empty else {}
+    dist_km = pd.to_numeric(nearest.get("_dist_km"), errors="coerce") if nearest else pd.NA
+    obs_age_h = pd.to_numeric(nearest.get("obs_age_h"), errors="coerce") if nearest else pd.NA
+    if (pd.isna(obs_age_h) or obs_age_h is None) and nearest:
+        obs_raw = pd.to_datetime(nearest.get("date_obs_raw"), utc=True, errors="coerce")
+        ref_ts = snapshot_ts if snapshot_ts is not None and not pd.isna(snapshot_ts) else pd.Timestamp.now(tz="UTC")
+        if not pd.isna(obs_raw):
+            obs_age_h = (ref_ts - obs_raw).total_seconds() / 3600.0
+
+    nearest_is_infoclimat = bool(nearest) and _is_infoclimat_station_source(nearest.get("source"))
+    nearest_ok = (
+        bool(nearest)
+        and nearest_is_infoclimat
+        and (pd.isna(dist_km) or float(dist_km) <= float(max_station_km))
+        and (pd.isna(obs_age_h) or float(obs_age_h) <= float(max_obs_age_h))
+    )
+    if nearest_ok:
+        return {
+            "source_mode": "INFOCLIMAT_STATION",
+            "source_label": "InfoClimat/SYNOP station commune",
+            "source": nearest.get("source"),
+            "station_id": nearest.get("station_id"),
+            "commune_station": nearest.get("station_commune_name"),
+            "distance_km": None if pd.isna(dist_km) else round(float(dist_km), 3),
+            "obs_date": nearest.get("date_obs_raw"),
+            "rain_24h_mm": pd.to_numeric(nearest.get("rain_24h_mm"), errors="coerce"),
+            "rain_7d_mm": pd.to_numeric(nearest.get("rain_7d_mm"), errors="coerce"),
+            "rain_30d_mm": pd.to_numeric(nearest.get("rain_30d_mm"), errors="coerce"),
+            "rain_month_mm": pd.to_numeric(nearest.get("rain_month_mm"), errors="coerce"),
+            "weather_alert_index": pd.to_numeric(nearest.get("weather_alert_index"), errors="coerce"),
+            "weather_quality_note": pd.to_numeric(nearest.get("weather_quality_note"), errors="coerce"),
+            "weather_data_reliability": nearest.get("weather_data_reliability"),
+        }
+
+    archive = _load_sector_recent_weather_archive(lat, lon, lookback_days=45)
+    if not archive.get("error"):
+        return {
+            "source_mode": "OPEN_METEO_ARCHIVE_FALLBACK",
+            "source_label": "Fallback fiable (Open-Meteo archive)",
+            "source": archive.get("source"),
+            "station_id": archive.get("station_id"),
+            "commune_station": archive.get("commune_station"),
+            "distance_km": archive.get("distance_km"),
+            "obs_date": archive.get("date_obs_raw"),
+            "rain_24h_mm": pd.to_numeric(archive.get("rain_24h_mm"), errors="coerce"),
+            "rain_7d_mm": pd.to_numeric(archive.get("rain_7d_mm"), errors="coerce"),
+            "rain_30d_mm": pd.to_numeric(archive.get("rain_30d_mm"), errors="coerce"),
+            "rain_month_mm": pd.to_numeric(archive.get("rain_month_mm"), errors="coerce"),
+            "weather_alert_index": pd.to_numeric(archive.get("weather_alert_index"), errors="coerce"),
+            "weather_quality_note": np.nan,
+            "weather_data_reliability": "OK",
+        }
+
+    if nearest:
+        return {
+            "source_mode": "NEAREST_STATION_FALLBACK",
+            "source_label": "Fallback station proche (hors InfoClimat)",
+            "source": nearest.get("source"),
+            "station_id": nearest.get("station_id"),
+            "commune_station": nearest.get("station_commune_name"),
+            "distance_km": None if pd.isna(dist_km) else round(float(dist_km), 3),
+            "obs_date": nearest.get("date_obs_raw"),
+            "rain_24h_mm": pd.to_numeric(nearest.get("rain_24h_mm"), errors="coerce"),
+            "rain_7d_mm": pd.to_numeric(nearest.get("rain_7d_mm"), errors="coerce"),
+            "rain_30d_mm": pd.to_numeric(nearest.get("rain_30d_mm"), errors="coerce"),
+            "rain_month_mm": pd.to_numeric(nearest.get("rain_month_mm"), errors="coerce"),
+            "weather_alert_index": pd.to_numeric(nearest.get("weather_alert_index"), errors="coerce"),
+            "weather_quality_note": pd.to_numeric(nearest.get("weather_quality_note"), errors="coerce"),
+            "weather_data_reliability": nearest.get("weather_data_reliability"),
+        }
+
+    return {
+        "source_mode": "AUCUNE_DONNEE",
+        "source_label": "Aucune source meteo exploitable",
+        "source": None,
+        "station_id": None,
+        "commune_station": None,
+        "distance_km": None,
+        "obs_date": None,
+        "rain_24h_mm": None,
+        "rain_7d_mm": None,
+        "rain_30d_mm": None,
+        "rain_month_mm": None,
+        "weather_alert_index": None,
+        "weather_quality_note": None,
+        "weather_data_reliability": "A_VERIFIER",
+    }
 
 
 @st.cache_data(show_spinner=False, ttl=21600)
@@ -1076,7 +1550,7 @@ def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.D
     df["longitude"] = pd.to_numeric(df.get("longitude"), errors="coerce")
     df["commune_name"] = df.get("commune_name", "Inconnue").fillna("Inconnue")
     df["sector_score"] = pd.to_numeric(df.get("score", 0.0), errors="coerce").fillna(0.0)
-    df["rain_period_mm"] = pd.to_numeric(df.get(commune_rain_col, 0.0), errors="coerce").fillna(0.0)
+    df["rain_period_mm"] = pd.to_numeric(df.get(commune_rain_col, 0.0), errors="coerce").fillna(0.0).clip(lower=0.0)
     df["geotech_points"] = pd.to_numeric(df.get("geotech_points", 0.0), errors="coerce").fillna(0.0)
     df["piezometers"] = pd.to_numeric(df.get("piezometers", 0.0), errors="coerce").fillna(0.0)
     df["hydro_stations"] = pd.to_numeric(df.get("hydro_stations", 0.0), errors="coerce").fillna(0.0)
@@ -1182,6 +1656,22 @@ def _aggregate_communes(sectors_df: pd.DataFrame, commune_rain_col: str) -> pd.D
     return grouped
 
 
+def _extract_lgv_lines_from_snapshot(snapshot: Dict[str, object]) -> List[List[Tuple[float, float]]]:
+    lines: List[List[Tuple[float, float]]] = []
+    raw_lines = snapshot.get("lgv_lines", []) if isinstance(snapshot, dict) else []
+    for line in raw_lines if isinstance(raw_lines, list) else []:
+        coords: List[Tuple[float, float]] = []
+        for pt in line if isinstance(line, list) else []:
+            if isinstance(pt, dict) and "lat" in pt and "lon" in pt:
+                try:
+                    coords.append((float(pt["lat"]), float(pt["lon"])))
+                except Exception:
+                    continue
+        if len(coords) >= 2:
+            lines.append(coords)
+    return lines
+
+
 def _build_map(
     snapshot: Dict[str, object],
     weather_df: pd.DataFrame,
@@ -1207,13 +1697,8 @@ def _build_map(
 ) -> folium.Map:
     m = folium.Map(location=[46.2, 0.2], zoom_start=7, tiles="CartoDB positron")
 
-    for line in snapshot.get("lgv_lines", []) if isinstance(snapshot.get("lgv_lines"), list) else []:
-        coords = []
-        for pt in line if isinstance(line, list) else []:
-            if isinstance(pt, dict) and "lat" in pt and "lon" in pt:
-                coords.append((float(pt["lat"]), float(pt["lon"])))
-        if len(coords) >= 2:
-            folium.PolyLine(coords, color="#1d4ed8", weight=4, opacity=0.9, tooltip="Trace LGV SEA").add_to(m)
+    for coords in _extract_lgv_lines_from_snapshot(snapshot):
+        folium.PolyLine(coords, color="#1d4ed8", weight=4, opacity=0.9, tooltip="Trace LGV SEA").add_to(m)
 
     if show_weather and not weather_df.empty:
         weather_layer = folium.FeatureGroup(name="Meteo", show=True)
@@ -1550,6 +2035,95 @@ def _build_map(
     return m
 
 
+def _build_weather_focus_map(
+    snapshot: Dict[str, object],
+    weather_df: pd.DataFrame,
+    rain_col_weather: str,
+    min_risk: str,
+    max_labels: int = 80,
+) -> folium.Map:
+    lgv_lines = _extract_lgv_lines_from_snapshot(snapshot)
+    center = [46.2, 0.2]
+    if lgv_lines:
+        flat_pts = [pt for line in lgv_lines for pt in line]
+        if flat_pts:
+            center = [float(np.mean([p[0] for p in flat_pts])), float(np.mean([p[1] for p in flat_pts]))]
+
+    m = folium.Map(location=center, zoom_start=7, tiles="CartoDB positron")
+    for coords in lgv_lines:
+        folium.PolyLine(coords, color="#0b4f6c", weight=4, opacity=0.95, tooltip="Trace LGV SEA").add_to(m)
+
+    if weather_df.empty:
+        return m
+
+    wdf = weather_df.copy()
+    wdf["latitude"] = pd.to_numeric(wdf.get("latitude"), errors="coerce")
+    wdf["longitude"] = pd.to_numeric(wdf.get("longitude"), errors="coerce")
+    wdf[rain_col_weather] = pd.to_numeric(wdf.get(rain_col_weather), errors="coerce")
+    wdf = wdf.dropna(subset=["latitude", "longitude", rain_col_weather])
+    if wdf.empty:
+        return m
+
+    lvl_col = wdf.get("meteo_operational_level", wdf.get("risk_level", "INDETERMINE")).astype(str)
+    wdf = wdf.assign(_lvl=lvl_col)
+    if str(min_risk).upper() != "TOUT":
+        wdf = wdf[wdf["_lvl"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(str(min_risk))]
+    if wdf.empty:
+        return m
+
+    wdf["distance_to_lgv_km"] = pd.to_numeric(wdf.get("distance_to_lgv_km"), errors="coerce")
+    wdf = wdf.sort_values(
+        by=["distance_to_lgv_km", rain_col_weather],
+        ascending=[True, False],
+        na_position="last",
+    ).head(max(1, int(max_labels)))
+
+    for i, (_, row) in enumerate(wdf.iterrows()):
+        lat = float(row["latitude"])
+        lon = float(row["longitude"])
+        lvl = str(row.get("_lvl", "INDETERMINE"))
+        rain_val = float(row.get(rain_col_weather, 0.0) or 0.0)
+        station_id = str(row.get("station_id") or "station")
+        commune_station = str(row.get("station_commune_name") or "")
+
+        folium.CircleMarker(
+            [lat, lon],
+            radius=6,
+            color=RISK_COLOR.get(lvl, "#6b7280"),
+            fill=True,
+            fill_opacity=0.9,
+            weight=1,
+            popup=folium.Popup(
+                f"<b>{station_id}</b><br>"
+                f"Commune: {commune_station}<br>"
+                f"Pluie ({rain_col_weather}): {rain_val:.1f} mm<br>"
+                f"Risque meteo: {lvl}<br>"
+                f"Distance LGV: {row.get('distance_to_lgv_km')} km<br>"
+                f"Date obs: {row.get('date_obs_raw')}",
+                max_width=340,
+            ),
+        ).add_to(m)
+
+        lat_off = 0.006 if (i % 2 == 0) else -0.006
+        lon_off = 0.008 if (i % 3 == 0) else 0.012
+        label_txt = f"{station_id} | {rain_val:.1f} mm"
+        safe_txt = label_txt.replace("<", "").replace(">", "")
+        label_html = (
+            "<div style=\""
+            "font-size:11px;font-weight:700;color:#111827;"
+            "background-color:rgba(255,255,255,0.92);"
+            "border:1px solid #d1d5db;border-radius:4px;"
+            "padding:1px 4px;white-space:nowrap;\">"
+            f"{safe_txt}</div>"
+        )
+        folium.Marker(
+            [lat + lat_off, lon + lon_off],
+            icon=folium.features.DivIcon(icon_size=(160, 20), icon_anchor=(0, 0), html=label_html),
+        ).add_to(m)
+
+    return m
+
+
 st.set_page_config(page_title="LGV SEA Pro Monitoring", page_icon=":chart_with_upwards_trend:", layout="wide")
 
 st.markdown(
@@ -1593,6 +2167,7 @@ line_meta = metadata_obj.get("line_monitoring", {}) if isinstance(metadata_obj.g
 sector_base_km_raw = pd.to_numeric(line_meta.get("sector_length_km"), errors="coerce")
 sector_base_km = float(sector_base_km_raw) if not pd.isna(sector_base_km_raw) else 5.0
 snapshot_ts = pd.to_datetime(snapshot.get("timestamp_utc"), utc=True, errors="coerce")
+snapshot_age_h = _snapshot_age_hours(snapshot_ts)
 
 if not weather_df.empty:
     for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "distance_to_lgv_km"]:
@@ -1618,6 +2193,9 @@ if not sectors_df.empty:
     ]:
         if col in sectors_df.columns:
             sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
+    for rain_col in ["weather_max_24h_mm", "weather_max_7d_mm", "weather_max_30d_mm", "weather_max_month_mm"]:
+        if rain_col in sectors_df.columns:
+            sectors_df[rain_col] = pd.to_numeric(sectors_df[rain_col], errors="coerce").fillna(0.0).clip(lower=0.0)
     sectors_df["commune_name"] = sectors_df.get("commune_name", "Inconnue").fillna("Inconnue")
     if "ai_pred_probability" not in sectors_df.columns:
         sectors_df["ai_pred_probability"] = (
@@ -1668,6 +2246,11 @@ if not alerts_df.empty and "level" in alerts_df.columns:
     alerts_df["rank"] = alerts_df["level"].map(lambda x: _risk_rank(str(x))).fillna(0)
     alerts_df = alerts_df.sort_values("rank", ascending=False)
 
+weather_obs_window = "Tout"
+weather_exact_day_enabled = False
+weather_exact_day = datetime.now(timezone.utc).date()
+selected_history_month_labels = MONTH_ORDER_SHORT.copy()
+selected_history_month_numbers = list(MONTH_LABELS_SHORT.keys())
 with st.sidebar:
     st.subheader("Filtres")
     if st.button("Rafraichir snapshot", use_container_width=True):
@@ -1676,6 +2259,33 @@ with st.sidebar:
 
     period_label = st.selectbox("Periode pluvio", list(RAIN_PERIODS.keys()), index=0)
     rain_col_weather, commune_rain_col = RAIN_PERIODS[period_label]
+    weather_obs_window = st.selectbox(
+        "Recherche pluie (fenetre obs)",
+        list(OBS_WINDOW_HOURS.keys()),
+        index=1,
+        help="Filtre les stations meteo selon la date d'observation (1 jour, 7 jours ou mois courant).",
+    )
+    weather_exact_day_enabled = st.checkbox("Filtrer stations sur jour exact", value=False)
+    if weather_exact_day_enabled:
+        weather_exact_day = st.date_input(
+            "Jour exact observations meteo",
+            value=datetime.now(timezone.utc).date(),
+            min_value=datetime(2010, 1, 1, tzinfo=timezone.utc).date(),
+            max_value=datetime.now(timezone.utc).date(),
+        )
+    selected_history_month_labels = _multiselect_with_all(
+        "Mois historiques (Jan-Dec)",
+        MONTH_ORDER_SHORT,
+        key="flt_hist_months",
+    )
+    selected_history_month_numbers = [
+        int(MONTH_SHORT_TO_NUM[m])
+        for m in selected_history_month_labels
+        if str(m) in MONTH_SHORT_TO_NUM
+    ]
+    if not selected_history_month_numbers:
+        selected_history_month_numbers = list(MONTH_LABELS_SHORT.keys())
+
     min_risk = st.selectbox("Risque minimum", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"], index=2)
     weather_risk_mode = st.selectbox(
         "Filtre meteo",
@@ -1750,6 +2360,11 @@ if not weather_for_context.empty and int(weather_max_age_h) > 0 and "obs_age_h" 
     weather_for_context = weather_for_context[
         pd.to_numeric(weather_for_context["obs_age_h"], errors="coerce").fillna(999.0) <= float(weather_max_age_h)
     ]
+if not weather_for_context.empty:
+    weather_for_context = _apply_weather_obs_window(weather_for_context, weather_obs_window, snapshot_ts)
+if not weather_for_context.empty and weather_exact_day_enabled:
+    obs_day = pd.to_datetime(weather_for_context.get("obs_ts_utc"), utc=True, errors="coerce").dt.date
+    weather_for_context = weather_for_context[obs_day == weather_exact_day]
 
 filtered_weather = weather_for_context.copy()
 if not filtered_weather.empty and str(min_risk).upper() != "TOUT":
@@ -1955,6 +2570,9 @@ compare_commune_rows: List[Dict[str, object]] = []
 compare_history_df = pd.DataFrame()
 compare_history_full_df = pd.DataFrame()
 history_models: Dict[str, str] = {}
+selected_daily_day = datetime.now(timezone.utc).date()
+selected_daily_day_precip: Dict[str, object] = {"date": None, "precip_mm": None, "model": "", "error": "pas de commune"}
+selected_commune_weather_reference: Dict[str, object] = {"source_mode": "AUCUNE_DONNEE", "source_label": "pas de commune"}
 if not commune_pool.empty:
     with st.sidebar:
         st.markdown("---")
@@ -1975,6 +2593,13 @@ if not commune_pool.empty:
                 key="analysis_compare_communes",
             )
         history_years = st.slider("Historique mensuel (ans)", min_value=2, max_value=10, value=5, step=1)
+        selected_daily_day = st.date_input(
+            "Recherche pluvio (jour precis)",
+            value=datetime.now(timezone.utc).date(),
+            min_value=datetime(2010, 1, 1, tzinfo=timezone.utc).date(),
+            max_value=datetime.now(timezone.utc).date(),
+            help="Charge la pluie journaliere archivee Open-Meteo pour la commune selectionnee.",
+        )
         history_fetch_limit = st.slider(
             "Max communes historique (0 = toutes)",
             min_value=0,
@@ -2013,6 +2638,32 @@ if not commune_pool.empty:
                 (compare_history_df["ym"].astype(str) >= str(ym_start)) & (compare_history_df["ym"].astype(str) <= str(ym_end))
             ]
 
+    if selected_history_month_numbers:
+        compare_history_df = _filter_history_months(compare_history_df, selected_history_month_numbers)
+        compare_history_full_df = _filter_history_months(compare_history_full_df, selected_history_month_numbers)
+
+    if selected_commune:
+        try:
+            selected_daily_day_precip = _load_sector_daily_precip_on_date(
+                float(selected_commune["latitude"]),
+                float(selected_commune["longitude"]),
+                selected_daily_day.isoformat(),
+            )
+        except Exception as exc:
+            selected_daily_day_precip = {
+                "date": selected_daily_day.isoformat(),
+                "precip_mm": None,
+                "model": "",
+                "error": str(exc),
+            }
+        try:
+            selected_commune_weather_reference = _build_commune_weather_reference(selected_commune, weather_df, snapshot_ts)
+        except Exception as exc:
+            selected_commune_weather_reference = {
+                "source_mode": "AUCUNE_DONNEE",
+                "source_label": f"erreur reference commune: {exc}",
+            }
+
 history_payload = {"monthly": [], "climatology": [], "model": "", "error": "pas de commune"}
 if selected_commune:
     history_payload = _load_sector_monthly_history(
@@ -2050,18 +2701,20 @@ if selected_commune and history_monthly_df.empty:
         history_monthly_df = fallback_monthly.copy()
         history_payload["error"] = None
         history_payload["model"] = str(history_payload.get("model") or "fallback_reference_compare")
-        month_labels = {
-            1: "Jan", 2: "Fev", 3: "Mar", 4: "Avr", 5: "Mai", 6: "Juin",
-            7: "Juil", 8: "Aou", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec",
-        }
         clim_calc = (
             history_monthly_df.groupby("month", as_index=False)["monthly_precip_mm"]
             .mean()
             .rename(columns={"monthly_precip_mm": "climatology_mm"})
         )
         clim_calc["climatology_mm"] = pd.to_numeric(clim_calc["climatology_mm"], errors="coerce").round(1)
-        clim_calc["month_label"] = clim_calc["month"].map(month_labels)
+        clim_calc["month_label"] = clim_calc["month"].map(MONTH_LABELS_SHORT)
         history_clim_df = clim_calc
+
+history_monthly_df = _filter_history_months(history_monthly_df, selected_history_month_numbers)
+history_clim_df = _filter_history_months(history_clim_df, selected_history_month_numbers)
+if history_clim_df.empty and not history_monthly_df.empty:
+    history_clim_df = _build_monthly_climatology(history_monthly_df)
+
 pluvio_ranking_df = _build_pluvio_ranking(
     commune_pool.to_dict(orient="records") if not commune_pool.empty else compare_commune_rows,
     filtered_weather if not filtered_weather.empty else weather_df,
@@ -2098,7 +2751,7 @@ manual_watch_count = (
     else 0
 )
 
-col1, col2, col3, col4, col5, col6, col7, col8, col9, col10 = st.columns(10)
+col1, col2, col3, col4, col5, col6, col7, col8, col9, col10, col11 = st.columns(11)
 col1.metric("Risque global", risk_level)
 col2.metric("Score global", f"{score:.2f}/4")
 col3.metric("Stations meteo", int(len(filtered_weather)))
@@ -2109,6 +2762,18 @@ col7.metric("Secteurs IA critiques", ai_critical_count)
 col8.metric("Secteurs sols fragiles", fragile_soil_count)
 col9.metric("Zones glissement >= seuil", slip_high_count)
 col10.metric("PK surveillance manuelle", manual_watch_count)
+if snapshot_age_h is None:
+    col11.metric("Age snapshot", "N/A")
+else:
+    col11.metric("Age snapshot", f"{snapshot_age_h:.1f} h")
+
+if snapshot_ts is None or pd.isna(snapshot_ts):
+    st.caption(f"Snapshot source: {snapshot_source} | timestamp: inconnu")
+else:
+    st.caption(
+        "Snapshot source: "
+        + f"{snapshot_source} | timestamp_utc={snapshot_ts.isoformat()} | age={0.0 if snapshot_age_h is None else snapshot_age_h:.1f} h"
+    )
 
 tabs = st.tabs(["Vue executive", "Carte dynamique", "Tables et alertes", "Metadata"])
 
@@ -2585,7 +3250,14 @@ with tabs[0]:
             station_rank_title = f"Cumul {effective_period_label} (mm)"
 
         top_stations = filtered_weather.sort_values(station_rank_col, ascending=False).head(25).copy()
-        top_stations["station_display"] = top_stations["station_id"].astype(str) + " (" + top_stations["source"].astype(str) + ")"
+        top_stations["station_commune_name"] = top_stations.get("station_commune_name", "Inconnue").fillna("Inconnue").astype(str)
+        top_stations["station_display"] = (
+            top_stations["station_id"].astype(str)
+            + " | "
+            + top_stations["station_commune_name"]
+            + " | "
+            + top_stations["source"].astype(str)
+        )
         station_color_col = "meteo_operational_level" if "meteo_operational_level" in top_stations.columns else "risk_level"
         station_tooltip = [
             c
@@ -2677,52 +3349,106 @@ with tabs[0]:
     if history_compare_enabled and compare_history_df.empty:
         st.info("Selectionne des communes avec historique disponible pour comparer les pluies mensuelles.")
     elif history_compare_enabled:
-        hist_line = (
-            alt.Chart(compare_history_df)
-            .mark_line(point=True)
-            .encode(
-                x=alt.X("ym:N", sort=None, title="Mois"),
-                y=alt.Y("monthly_precip_mm:Q", title="Pluie mensuelle (mm)"),
-                color=alt.Color("commune_label:N", title="Commune"),
-                tooltip=["ym", "commune_label", "monthly_precip_mm"],
-            )
-        )
-        st.altair_chart(hist_line, use_container_width=True)
+        compare_plot_df = _prepare_monthly_history_chart_df(compare_history_df)
+        if compare_plot_df.empty:
+            st.info("Historique compare inutilisable apres nettoyage des dates/valeurs.")
+        else:
+            commune_count_initial = int(compare_plot_df["commune_label"].nunique())
+            commune_count = commune_count_initial
+            max_plot_communes = commune_count
+            if commune_count > 8:
+                max_plot_communes = st.slider(
+                    "Communes affichees sur le graphe multi-annees",
+                    min_value=3,
+                    max_value=commune_count,
+                    value=min(12, commune_count),
+                    step=1 if commune_count <= 30 else 2,
+                    key="compare_history_plot_communes",
+                )
+            if commune_count > max_plot_communes:
+                latest_by_commune = (
+                    compare_plot_df.sort_values("ym_date")
+                    .groupby("commune_label", as_index=False)
+                    .tail(1)[["commune_label", "monthly_precip_mm"]]
+                    .sort_values("monthly_precip_mm", ascending=False)
+                )
+                keep_labels = latest_by_commune["commune_label"].head(int(max_plot_communes)).astype(str).tolist()
+                compare_plot_df = compare_plot_df[compare_plot_df["commune_label"].astype(str).isin(keep_labels)].copy()
+                commune_count = int(compare_plot_df["commune_label"].nunique())
 
-        month_compare = (
-            compare_history_df.groupby(["commune_label", "month"], as_index=False)["monthly_precip_mm"]
-            .mean()
-            .rename(columns={"monthly_precip_mm": "mean_monthly_mm"})
-        )
-        month_labels = {
-            1: "Jan",
-            2: "Fev",
-            3: "Mar",
-            4: "Avr",
-            5: "Mai",
-            6: "Juin",
-            7: "Juil",
-            8: "Aou",
-            9: "Sep",
-            10: "Oct",
-            11: "Nov",
-            12: "Dec",
-        }
-        month_compare["month_label"] = month_compare["month"].map(month_labels)
-        month_order = ["Jan", "Fev", "Mar", "Avr", "Mai", "Juin", "Juil", "Aou", "Sep", "Oct", "Nov", "Dec"]
-        climat_cmp = (
-            alt.Chart(month_compare)
-            .mark_bar()
-            .encode(
-                x=alt.X("month_label:N", sort=month_order, title="Mois"),
-                y=alt.Y("mean_monthly_mm:Q", title="Moyenne mensuelle (mm)"),
-                color=alt.Color("commune_label:N", title="Commune"),
-                xOffset=alt.XOffset("commune_label:N"),
-                tooltip=["commune_label", "month_label", "mean_monthly_mm"],
+            point_enabled = len(compare_plot_df) <= 900 and commune_count <= 12
+            hist_line_base = (
+                alt.Chart(compare_plot_df)
+                .mark_line(point=point_enabled)
+                .encode(
+                    x=alt.X("ym_date:T", title="Mois", axis=alt.Axis(format="%Y-%m", labelAngle=-55)),
+                    y=alt.Y("monthly_precip_mm:Q", title="Pluie mensuelle (mm)"),
+                    color=alt.Color("commune_label:N", title="Commune"),
+                    tooltip=["commune_label", "ym", "monthly_precip_mm"],
+                )
             )
-        )
-        st.altair_chart(climat_cmp, use_container_width=True)
-        st.caption("Modele historique: " + ", ".join([f"{k}:{v}" for k, v in history_models.items() if v]))
+            chart_obj = hist_line_base
+            if commune_count <= 18:
+                last_points = compare_plot_df.sort_values("ym_date").groupby("commune_label", as_index=False).tail(1).copy()
+                labels = (
+                    alt.Chart(last_points)
+                    .mark_text(align="left", baseline="middle", dx=6, fontSize=11)
+                    .encode(
+                        x=alt.X("ym_date:T"),
+                        y=alt.Y("monthly_precip_mm:Q"),
+                        text=alt.Text("commune_short:N"),
+                        color=alt.Color("commune_label:N", legend=None),
+                        tooltip=["commune_label", "ym", "monthly_precip_mm"],
+                    )
+                )
+                chart_obj = hist_line_base + labels
+            st.altair_chart(chart_obj.interactive(), use_container_width=True)
+            if not point_enabled:
+                st.caption("Points des courbes masques pour ameliorer lisibilite/performance sur gros volumes.")
+            if commune_count > 18:
+                st.caption("Etiquettes fin de courbe desactivees (>18 communes) pour eviter la surcharge visuelle.")
+            if commune_count_initial > commune_count:
+                st.caption(
+                    f"Affichage limite a {commune_count} commune(s) sur {commune_count_initial} pour garder un rendu lisible."
+                )
+
+            month_compare = (
+                compare_plot_df.groupby(["commune_label", "commune_short", "month", "month_label"], as_index=False)["monthly_precip_mm"]
+                .mean()
+                .rename(columns={"monthly_precip_mm": "mean_monthly_mm"})
+            )
+            if commune_count <= 8:
+                climat_cmp = (
+                    alt.Chart(month_compare)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("month_label:N", sort=MONTH_ORDER_SHORT, title="Mois"),
+                        y=alt.Y("mean_monthly_mm:Q", title="Moyenne mensuelle (mm)"),
+                        color=alt.Color("commune_label:N", title="Commune"),
+                        xOffset=alt.XOffset("commune_label:N"),
+                        tooltip=["commune_label", "month_label", "mean_monthly_mm"],
+                    )
+                )
+            else:
+                climat_cmp = (
+                    alt.Chart(month_compare)
+                    .mark_line(point=True)
+                    .encode(
+                        x=alt.X("month_label:N", sort=MONTH_ORDER_SHORT, title="Mois"),
+                        y=alt.Y("mean_monthly_mm:Q", title="Moyenne mensuelle (mm)"),
+                        color=alt.Color("commune_label:N", title="Commune"),
+                        tooltip=["commune_label", "month_label", "mean_monthly_mm"],
+                    )
+                )
+            st.altair_chart(climat_cmp, use_container_width=True)
+            st.caption(
+                f"Comparaison sur {commune_count} commune(s). Modele historique: "
+                + ", ".join([f"{k}:{v}" for k, v in history_models.items() if v])
+            )
+            st.caption(
+                "Historique mensuel multi-annees: Open-Meteo archive (homogene sur toutes les communes). "
+                "Mesures recentes par commune: InfoClimat/SYNOP prioritaire, fallback fiable sinon."
+            )
 
         latest_rows: List[Dict[str, object]] = []
         if selected_compare_commune_labels:
@@ -2731,22 +3457,39 @@ with tabs[0]:
                 if hit.empty:
                     continue
                 com = hit.iloc[0].to_dict()
-                nwx = _nearest_row(weather_df, float(com["latitude"]), float(com["longitude"]))
+                wx_source = filtered_weather if not filtered_weather.empty else weather_df
+                ref = _build_commune_weather_reference(com, wx_source, snapshot_ts)
                 latest_rows.append(
                     {
                         "commune": label,
-                        "station_meteo": nwx.get("station_id"),
-                        "commune_station": nwx.get("station_commune_name"),
-                        "dist_station_km": nwx.get("_dist_km"),
-                        "rain_24h_mm": nwx.get("rain_24h_mm"),
-                        "rain_7d_mm": nwx.get("rain_7d_mm"),
-                        "rain_30d_mm": nwx.get("rain_30d_mm"),
-                        "date_obs": nwx.get("date_obs_raw"),
+                        "mode_source": ref.get("source_mode"),
+                        "source_label": ref.get("source_label"),
+                        "source_brute": ref.get("source"),
+                        "station_meteo": ref.get("station_id"),
+                        "commune_station": ref.get("commune_station"),
+                        "dist_station_km": ref.get("distance_km"),
+                        "rain_24h_mm": ref.get("rain_24h_mm"),
+                        "rain_7d_mm": ref.get("rain_7d_mm"),
+                        "rain_30d_mm": ref.get("rain_30d_mm"),
+                        "rain_month_mm": ref.get("rain_month_mm"),
+                        "date_obs": ref.get("obs_date"),
+                        "reliability": ref.get("weather_data_reliability"),
                     }
                 )
         if latest_rows:
             st.markdown("**Dernieres mesures meteo par commune comparee**")
-            st.dataframe(pd.DataFrame(latest_rows), use_container_width=True, hide_index=True)
+            latest_df = pd.DataFrame(latest_rows)
+            st.dataframe(latest_df, use_container_width=True, hide_index=True)
+            mode_counts = latest_df.get("mode_source", pd.Series(dtype=str)).astype(str).value_counts().to_dict()
+            if mode_counts:
+                st.caption(
+                    "Comparatif sources communes: "
+                    + ", ".join([f"{k}={v}" for k, v in mode_counts.items()])
+                )
+            st.caption(
+                "Regle appliquee: InfoClimat/SYNOP prioritaire si station exploitable pour la commune; "
+                "sinon fallback Open-Meteo archive (source fiable homogène)."
+            )
 
     st.subheader("Classement cumuls pluvio (1J / 1 semaine / 1 mois / hiver / printemps / max mensuel / annees)")
     if pluvio_ranking_df.empty:
@@ -2928,34 +3671,98 @@ with tabs[0]:
             + f"action={selected_commune.get('weather_action_commune', WEATHER_OP_ACTIONS['INDETERMINE'])} | "
             + f"stations utilisees={weather_points_val}"
         )
+        daily_precip_val = selected_daily_day_precip.get("precip_mm")
+        daily_precip_err = selected_daily_day_precip.get("error")
+        if daily_precip_err:
+            st.warning(
+                "Recherche pluvio jour precis indisponible "
+                + f"({selected_daily_day_precip.get('date')}): {daily_precip_err}"
+            )
+        else:
+            st.metric(
+                f"Pluie du {selected_daily_day_precip.get('date')}",
+                f"{0.0 if daily_precip_val is None else float(daily_precip_val):.2f} mm",
+            )
+            st.caption(f"Source jour precis: Open-Meteo archive ({selected_daily_day_precip.get('model')})")
 
-        nearest_weather = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
+        nearest_weather_snapshot = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
         nearest_hydro = _nearest_row(filtered_hydro, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
         nearest_piezo = _nearest_row(piezo_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
 
         cwx, chx, cpx = st.columns(3)
         with cwx:
-            st.markdown("**Derniere mesure meteo proche**")
-            if nearest_weather:
+            st.markdown("**Derniere mesure meteo proche (coherente historique commune)**")
+            ref_mode = str(selected_commune_weather_reference.get("source_mode") or "AUCUNE_DONNEE")
+            if ref_mode != "AUCUNE_DONNEE":
                 st.write(
                     {
-                        "station_id": nearest_weather.get("station_id"),
-                        "source": nearest_weather.get("source"),
-                        "commune_station": nearest_weather.get("station_commune_name"),
-                        "distance_km": nearest_weather.get("_dist_km"),
-                        "rain_24h_mm": nearest_weather.get("rain_24h_mm"),
-                        "rain_7d_mm": nearest_weather.get("rain_7d_mm"),
-                        "rain_30d_mm": nearest_weather.get("rain_30d_mm"),
-                        "weather_alert_index": nearest_weather.get("weather_alert_index"),
-                        "weather_watch_priority": nearest_weather.get("weather_watch_priority"),
-                        "weather_quality_note": nearest_weather.get("weather_quality_note"),
-                        "weather_data_reliability": nearest_weather.get("weather_data_reliability"),
-                        "obs_age_h": nearest_weather.get("obs_age_h"),
-                        "obs_freshness_level": nearest_weather.get("obs_freshness_level"),
-                        "weather_action_label": nearest_weather.get("weather_action_label"),
-                        "date_obs_raw": nearest_weather.get("date_obs_raw"),
+                        "mode_source": ref_mode,
+                        "source_label": selected_commune_weather_reference.get("source_label"),
+                        "source": selected_commune_weather_reference.get("source"),
+                        "station_id": selected_commune_weather_reference.get("station_id"),
+                        "commune_station": selected_commune_weather_reference.get("commune_station"),
+                        "distance_km": selected_commune_weather_reference.get("distance_km"),
+                        "rain_24h_mm": selected_commune_weather_reference.get("rain_24h_mm"),
+                        "rain_7d_mm": selected_commune_weather_reference.get("rain_7d_mm"),
+                        "rain_30d_mm": selected_commune_weather_reference.get("rain_30d_mm"),
+                        "rain_month_mm": selected_commune_weather_reference.get("rain_month_mm"),
+                        "weather_alert_index": selected_commune_weather_reference.get("weather_alert_index"),
+                        "weather_quality_note": selected_commune_weather_reference.get("weather_quality_note"),
+                        "weather_data_reliability": selected_commune_weather_reference.get("weather_data_reliability"),
+                        "date_obs_raw": selected_commune_weather_reference.get("obs_date"),
                     }
                 )
+                if ref_mode == "OPEN_METEO_ARCHIVE_FALLBACK" and not history_monthly_df.empty:
+                    try:
+                        current_ym = str(selected_commune_weather_reference.get("obs_date") or "")[:7]
+                        hist_cur = history_monthly_df[history_monthly_df["ym"].astype(str) == current_ym]
+                        if not hist_cur.empty:
+                            hist_mm = float(pd.to_numeric(hist_cur["monthly_precip_mm"], errors="coerce").fillna(0.0).iloc[-1])
+                            ref_month_mm = float(selected_commune_weather_reference.get("rain_month_mm", 0.0) or 0.0)
+                            delta_mm = abs(hist_mm - ref_month_mm)
+                            st.caption(
+                                f"Controle coherence mois courant ({current_ym}): "
+                                f"historique={hist_mm:.1f} mm | mesure ref={ref_month_mm:.1f} mm | ecart={delta_mm:.1f} mm"
+                            )
+                    except Exception:
+                        pass
+                if nearest_weather_snapshot:
+                    with st.expander("Comparer avec station snapshot la plus proche"):
+                        st.write(
+                            {
+                                "station_id": nearest_weather_snapshot.get("station_id"),
+                                "source": nearest_weather_snapshot.get("source"),
+                                "commune_station": nearest_weather_snapshot.get("station_commune_name"),
+                                "distance_km": nearest_weather_snapshot.get("_dist_km"),
+                                "rain_24h_mm": nearest_weather_snapshot.get("rain_24h_mm"),
+                                "rain_7d_mm": nearest_weather_snapshot.get("rain_7d_mm"),
+                                "rain_30d_mm": nearest_weather_snapshot.get("rain_30d_mm"),
+                                "date_obs_raw": nearest_weather_snapshot.get("date_obs_raw"),
+                            }
+                        )
+            elif nearest_weather_snapshot:
+                st.write(
+                    {
+                        "mode_source": "NEAREST_STATION_FALLBACK",
+                        "source_label": "Fallback station snapshot",
+                        "station_id": nearest_weather_snapshot.get("station_id"),
+                        "source": nearest_weather_snapshot.get("source"),
+                        "commune_station": nearest_weather_snapshot.get("station_commune_name"),
+                        "distance_km": nearest_weather_snapshot.get("_dist_km"),
+                        "rain_24h_mm": nearest_weather_snapshot.get("rain_24h_mm"),
+                        "rain_7d_mm": nearest_weather_snapshot.get("rain_7d_mm"),
+                        "rain_30d_mm": nearest_weather_snapshot.get("rain_30d_mm"),
+                        "weather_alert_index": nearest_weather_snapshot.get("weather_alert_index"),
+                        "weather_watch_priority": nearest_weather_snapshot.get("weather_watch_priority"),
+                        "weather_quality_note": nearest_weather_snapshot.get("weather_quality_note"),
+                        "weather_data_reliability": nearest_weather_snapshot.get("weather_data_reliability"),
+                        "obs_age_h": nearest_weather_snapshot.get("obs_age_h"),
+                        "obs_freshness_level": nearest_weather_snapshot.get("obs_freshness_level"),
+                        "weather_action_label": nearest_weather_snapshot.get("weather_action_label"),
+                        "date_obs_raw": nearest_weather_snapshot.get("date_obs_raw"),
+                    }
+                )
+                st.caption("Reference commune indisponible: fallback station snapshot.")
             else:
                 st.info("Pas de mesure meteo proche.")
         with chx:
@@ -2995,29 +3802,62 @@ with tabs[0]:
         elif history_monthly_df.empty:
             st.info("Pas d'historique mensuel disponible.")
         else:
-            hist_chart = (
-                alt.Chart(history_monthly_df)
-                .mark_line(point=True)
-                .encode(
-                    x=alt.X("ym:N", sort=None, title="Mois"),
-                    y=alt.Y("monthly_precip_mm:Q", title="Pluie mensuelle (mm)"),
-                    color=alt.Color("year:N", title="Annee"),
-                    tooltip=["ym", "year", "monthly_precip_mm"],
-                )
+            selected_commune_label = (
+                f"{commune_name} ({commune_code})" if str(commune_code).strip() and str(commune_code) != "N/A" else commune_name
             )
-            st.altair_chart(hist_chart, use_container_width=True)
+            hist_plot_df = _prepare_monthly_history_chart_df(history_monthly_df, default_commune_label=selected_commune_label)
+            if hist_plot_df.empty:
+                st.info("Historique mensuel non exploitable apres nettoyage des dates/valeurs.")
+            else:
+                point_enabled = len(hist_plot_df) <= 96
+                hist_base = (
+                    alt.Chart(hist_plot_df)
+                    .mark_line(point=point_enabled)
+                    .encode(
+                        x=alt.X("ym_date:T", title="Mois", axis=alt.Axis(format="%Y-%m", labelAngle=-55)),
+                        y=alt.Y("monthly_precip_mm:Q", title="Pluie mensuelle (mm)"),
+                        color=alt.Color("year:N", title="Annee"),
+                        tooltip=["commune_label", "ym", "year", "monthly_precip_mm"],
+                    )
+                )
+                year_count = int(hist_plot_df["year"].nunique())
+                chart_obj = hist_base
+                if year_count <= 8:
+                    last_year_points = hist_plot_df.sort_values("ym_date").groupby("year", as_index=False).tail(1)
+                    year_labels = (
+                        alt.Chart(last_year_points)
+                        .mark_text(align="left", baseline="middle", dx=6, fontSize=11)
+                        .encode(
+                            x=alt.X("ym_date:T"),
+                            y=alt.Y("monthly_precip_mm:Q"),
+                            text=alt.Text("year:N"),
+                            color=alt.Color("year:N", legend=None),
+                        )
+                    )
+                    chart_obj = hist_base + year_labels
+                st.altair_chart(chart_obj.interactive(), use_container_width=True)
+                st.caption(f"Commune: {selected_commune_label}")
+                if not point_enabled:
+                    st.caption("Points des courbes masques pour garder un rendu fluide.")
 
-            if not history_clim_df.empty:
-                clim_chart = (
-                    alt.Chart(history_clim_df)
+            clim_plot_df = history_clim_df.copy()
+            if not clim_plot_df.empty:
+                clim_plot_df = _ensure_month_column(clim_plot_df)
+                clim_plot_df["climatology_mm"] = pd.to_numeric(clim_plot_df.get("climatology_mm"), errors="coerce")
+                clim_plot_df["month_label"] = clim_plot_df["month"].map(MONTH_LABELS_SHORT)
+                clim_plot_df = clim_plot_df.dropna(subset=["month_label", "climatology_mm"]).sort_values("month")
+            if not clim_plot_df.empty:
+                clim_base = (
+                    alt.Chart(clim_plot_df)
                     .mark_bar()
                     .encode(
-                        x=alt.X("month_label:N", title="Mois"),
+                        x=alt.X("month_label:N", sort=MONTH_ORDER_SHORT, title="Mois"),
                         y=alt.Y("climatology_mm:Q", title="Moyenne historique (mm/mois)"),
                         tooltip=["month_label", "climatology_mm"],
                     )
                 )
-                st.altair_chart(clim_chart, use_container_width=True)
+                clim_labels = clim_base.mark_text(dy=-8, fontSize=10).encode(text=alt.Text("climatology_mm:Q", format=".1f"))
+                st.altair_chart(clim_base + clim_labels, use_container_width=True)
             st.caption(f"Source historique: Open-Meteo archive ({history_payload.get('model')})")
 
 with tabs[1]:
@@ -3049,6 +3889,33 @@ with tabs[1]:
             show_fr_layer=show_fr_layer,
         )
         st_folium(m, height=680, use_container_width=True)
+
+    st.markdown("**Carte meteo dediee (etiquettes pluie visibles)**")
+    if filtered_weather.empty or effective_rain_col_weather not in filtered_weather.columns:
+        st.info("Pas de stations meteo disponibles pour la carte dediee.")
+    else:
+        max_label_default = min(80, int(len(filtered_weather)))
+        max_label_default = max(1, max_label_default)
+        max_label_value = st.slider(
+            "Nombre max d'etiquettes meteo visibles",
+            min_value=1,
+            max_value=max(1, int(len(filtered_weather))),
+            value=max_label_default,
+            step=1 if len(filtered_weather) <= 120 else 5,
+            key="weather_focus_label_limit",
+        )
+        m_weather = _build_weather_focus_map(
+            snapshot=snapshot,
+            weather_df=filtered_weather,
+            rain_col_weather=effective_rain_col_weather,
+            min_risk=min_risk,
+            max_labels=int(max_label_value),
+        )
+        st_folium(m_weather, height=640, use_container_width=True, key="weather_focus_map")
+        st.caption(
+            f"Etiquettes affichees: pluie {effective_period_label} en mm, station et valeur. "
+            "Mode de selection: stations les plus proches de la LGV puis cumul le plus eleve."
+        )
 
 with tabs[2]:
     st.subheader("Tableau communes")
