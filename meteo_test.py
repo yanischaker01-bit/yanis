@@ -2472,28 +2472,39 @@ class LGVSeaMonitor:
         }
 
     def fetch_pluviometry_combined(self) -> Dict[str, object]:
-        synop = self.fetch_pluviometry_synop()
-        open_meteo = self.fetch_pluviometry_open_meteo()
-
-        frames_all = [df for df in [synop.get("all"), open_meteo.get("all")] if isinstance(df, pd.DataFrame) and not df.empty]
-        all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
-        synop_selected = synop.get("selected") if isinstance(synop.get("selected"), pd.DataFrame) else pd.DataFrame()
-        open_selected = open_meteo.get("selected") if isinstance(open_meteo.get("selected"), pd.DataFrame) else pd.DataFrame()
         mode = str(getattr(self, "weather_source_mode", "info_climat") or "info_climat").lower()
+        synop = self.fetch_pluviometry_synop()
+        synop_all = synop.get("all") if isinstance(synop.get("all"), pd.DataFrame) else pd.DataFrame()
+        synop_selected = synop.get("selected") if isinstance(synop.get("selected"), pd.DataFrame) else pd.DataFrame()
+        open_meteo = {"all": pd.DataFrame(), "selected": pd.DataFrame(), "notice": "Open-Meteo non sollicite", "source_url": None}
+        open_selected = pd.DataFrame()
 
         if mode in {"info_climat", "infoclimat", "synop_only", "synop"}:
             if not synop_selected.empty:
                 selected_df = synop_selected.copy()
                 selected_df["selection_mode"] = "info_climat_primary_synop"
-                mode_notice = "Mode InfoClimat: SYNOP prioritaire."
-            elif not open_selected.empty:
-                selected_df = open_selected.copy()
-                selected_df["selection_mode"] = "info_climat_fallback_open_meteo"
-                mode_notice = "Mode InfoClimat: fallback Open-Meteo (SYNOP indisponible)."
+                all_df = synop_all.copy()
+                mode_notice = "Mode InfoClimat: SYNOP prioritaire (meme base que InfoClimat)."
             else:
-                selected_df = pd.DataFrame()
-                mode_notice = "Mode InfoClimat: aucune source meteo disponible."
+                open_meteo = self.fetch_pluviometry_open_meteo()
+                open_all = open_meteo.get("all") if isinstance(open_meteo.get("all"), pd.DataFrame) else pd.DataFrame()
+                open_selected = open_meteo.get("selected") if isinstance(open_meteo.get("selected"), pd.DataFrame) else pd.DataFrame()
+                if not open_selected.empty:
+                    selected_df = open_selected.copy()
+                    selected_df["selection_mode"] = "info_climat_fallback_open_meteo"
+                    frames_all = [df for df in [synop_all, open_all] if isinstance(df, pd.DataFrame) and not df.empty]
+                    all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
+                    mode_notice = "Mode InfoClimat: fallback Open-Meteo uniquement car SYNOP indisponible."
+                else:
+                    selected_df = pd.DataFrame()
+                    all_df = synop_all.copy()
+                    mode_notice = "Mode InfoClimat: aucune source meteo disponible."
         else:
+            open_meteo = self.fetch_pluviometry_open_meteo()
+            open_all = open_meteo.get("all") if isinstance(open_meteo.get("all"), pd.DataFrame) else pd.DataFrame()
+            open_selected = open_meteo.get("selected") if isinstance(open_meteo.get("selected"), pd.DataFrame) else pd.DataFrame()
+            frames_all = [df for df in [synop_all, open_all] if isinstance(df, pd.DataFrame) and not df.empty]
+            all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
             frames_sel = [df for df in [synop_selected, open_selected] if isinstance(df, pd.DataFrame) and not df.empty]
             selected_df = pd.concat(frames_sel, ignore_index=True) if frames_sel else pd.DataFrame()
             mode_notice = f"Mode meteo '{mode}': fusion SYNOP + Open-Meteo."

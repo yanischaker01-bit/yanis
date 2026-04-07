@@ -115,6 +115,25 @@ OBS_WINDOW_HOURS = {
     "Mois courant": None,
 }
 
+MAP_TILE_STYLES = {
+    "Google Satellite": {
+        "tiles": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+        "attr": "Google",
+    },
+    "Google Hybrid": {
+        "tiles": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        "attr": "Google",
+    },
+    "OpenStreetMap": {
+        "tiles": "OpenStreetMap",
+        "attr": "OpenStreetMap",
+    },
+    "CartoDB Positron": {
+        "tiles": "CartoDB positron",
+        "attr": "CartoDB",
+    },
+}
+
 
 def _risk_rank(level: str) -> int:
     return RISK_ORDER.get(str(level or "").upper(), 0)
@@ -1291,6 +1310,8 @@ def _build_commune_weather_reference(
     snapshot_ts: pd.Timestamp | None,
     max_station_km: float = 15.0,
     max_obs_age_h: float = 72.0,
+    max_infoclimat_fallback_km: float = 80.0,
+    max_infoclimat_fallback_obs_h: float = 168.0,
 ) -> Dict[str, object]:
     try:
         lat = float(commune_row.get("latitude"))
@@ -1335,6 +1356,32 @@ def _build_commune_weather_reference(
         return {
             "source_mode": "INFOCLIMAT_STATION",
             "source_label": "InfoClimat/SYNOP station commune",
+            "source": nearest.get("source"),
+            "ref_latitude": pd.to_numeric(nearest.get("latitude"), errors="coerce"),
+            "ref_longitude": pd.to_numeric(nearest.get("longitude"), errors="coerce"),
+            "station_id": nearest.get("station_id"),
+            "commune_station": nearest.get("station_commune_name"),
+            "distance_km": None if pd.isna(dist_km) else round(float(dist_km), 3),
+            "obs_date": nearest.get("date_obs_raw"),
+            "rain_24h_mm": pd.to_numeric(nearest.get("rain_24h_mm"), errors="coerce"),
+            "rain_7d_mm": pd.to_numeric(nearest.get("rain_7d_mm"), errors="coerce"),
+            "rain_30d_mm": pd.to_numeric(nearest.get("rain_30d_mm"), errors="coerce"),
+            "rain_month_mm": pd.to_numeric(nearest.get("rain_month_mm"), errors="coerce"),
+            "weather_alert_index": pd.to_numeric(nearest.get("weather_alert_index"), errors="coerce"),
+            "weather_quality_note": pd.to_numeric(nearest.get("weather_quality_note"), errors="coerce"),
+            "weather_data_reliability": nearest.get("weather_data_reliability"),
+        }
+
+    nearest_info_fallback_ok = (
+        bool(nearest)
+        and nearest_is_infoclimat
+        and (pd.isna(dist_km) or float(dist_km) <= float(max_infoclimat_fallback_km))
+        and (pd.isna(obs_age_h) or float(obs_age_h) <= float(max_infoclimat_fallback_obs_h))
+    )
+    if nearest_info_fallback_ok:
+        return {
+            "source_mode": "INFOCLIMAT_NEAREST_FALLBACK",
+            "source_label": "InfoClimat/SYNOP station la plus proche",
             "source": nearest.get("source"),
             "ref_latitude": pd.to_numeric(nearest.get("latitude"), errors="coerce"),
             "ref_longitude": pd.to_numeric(nearest.get("longitude"), errors="coerce"),
@@ -1805,6 +1852,22 @@ def _extract_lgv_lines_from_snapshot(snapshot: Dict[str, object]) -> List[List[T
     return lines
 
 
+def _create_base_map(location: List[float], zoom_start: int, map_style: str) -> folium.Map:
+    style = MAP_TILE_STYLES.get(str(map_style), MAP_TILE_STYLES["Google Satellite"])
+    tile_value = str(style.get("tiles") or "")
+    if tile_value.lower().startswith("http"):
+        m = folium.Map(location=location, zoom_start=zoom_start, tiles=None)
+        folium.TileLayer(
+            tiles=tile_value,
+            attr=str(style.get("attr") or "Map"),
+            name=str(map_style),
+            overlay=False,
+            control=False,
+        ).add_to(m)
+        return m
+    return folium.Map(location=location, zoom_start=zoom_start, tiles=tile_value)
+
+
 def _build_map(
     snapshot: Dict[str, object],
     weather_df: pd.DataFrame,
@@ -1827,8 +1890,9 @@ def _build_map(
     show_slip: bool,
     slip_alert_threshold: float,
     show_fr_layer: bool,
+    map_style: str = "Google Satellite",
 ) -> folium.Map:
-    m = folium.Map(location=[46.2, 0.2], zoom_start=7, tiles="CartoDB positron")
+    m = _create_base_map(location=[46.2, 0.2], zoom_start=7, map_style=map_style)
 
     for coords in _extract_lgv_lines_from_snapshot(snapshot):
         folium.PolyLine(coords, color="#1d4ed8", weight=4, opacity=0.9, tooltip="Trace LGV SEA").add_to(m)
@@ -1858,6 +1922,7 @@ def _build_map(
                 f"<b>Station:</b> {row.get('station_id')}<br>"
                 f"<b>Source:</b> {row.get('source')}<br>"
                 f"<b>Commune station:</b> {row.get('station_commune_name', 'n/a')}<br>"
+                f"<b>Localisation:</b> {float(row.get('latitude')):.6f}, {float(row.get('longitude')):.6f}<br>"
                 f"<b>Risque meteo operationnel:</b> {lvl}<br>"
                 f"<b>Cumul filtre:</b> {rain:.1f} mm<br>"
                 f"<b>Indice alerte meteo:</b> {0.0 if pd.isna(alert_idx) else float(alert_idx):.1f}/100<br>"
@@ -2174,6 +2239,7 @@ def _build_weather_focus_map(
     rain_col_weather: str,
     min_risk: str,
     max_labels: int = 80,
+    map_style: str = "Google Satellite",
 ) -> folium.Map:
     lgv_lines = _extract_lgv_lines_from_snapshot(snapshot)
     center = [46.2, 0.2]
@@ -2182,7 +2248,7 @@ def _build_weather_focus_map(
         if flat_pts:
             center = [float(np.mean([p[0] for p in flat_pts])), float(np.mean([p[1] for p in flat_pts]))]
 
-    m = folium.Map(location=center, zoom_start=7, tiles="CartoDB positron")
+    m = _create_base_map(location=center, zoom_start=7, map_style=map_style)
     for coords in lgv_lines:
         folium.PolyLine(coords, color="#0b4f6c", weight=4, opacity=0.95, tooltip="Trace LGV SEA").add_to(m)
 
@@ -2229,6 +2295,7 @@ def _build_weather_focus_map(
             popup=folium.Popup(
                 f"<b>{station_id}</b><br>"
                 f"Commune: {commune_station}<br>"
+                f"Localisation: {lat:.6f}, {lon:.6f}<br>"
                 f"Pluie ({rain_col_weather}): {rain_val:.1f} mm<br>"
                 f"Risque meteo: {lvl}<br>"
                 f"Distance LGV: {row.get('distance_to_lgv_km')} km<br>"
@@ -2382,6 +2449,7 @@ if not alerts_df.empty and "level" in alerts_df.columns:
 weather_obs_window = "Tout"
 weather_exact_day_enabled = False
 weather_exact_day = datetime.now(timezone.utc).date()
+map_basemap_style = "Google Satellite"
 selected_history_month_labels = MONTH_ORDER_SHORT.copy()
 selected_history_month_numbers = list(MONTH_LABELS_SHORT.keys())
 with st.sidebar:
@@ -2471,6 +2539,11 @@ with st.sidebar:
     st.caption("Toutes les communes filtrees sont affichees (pas de limite a 25).")
 
     st.markdown("---")
+    map_basemap_style = st.selectbox(
+        "Fond de carte",
+        list(MAP_TILE_STYLES.keys()),
+        index=0,
+    )
     show_weather = st.checkbox("Layer meteo", value=True)
     show_communes = st.checkbox("Layer communes", value=True)
     show_sectors = st.checkbox("Layer secteurs IA", value=True)
@@ -3592,7 +3665,8 @@ with tabs[0]:
             )
             st.caption(
                 "Historique mensuel multi-annees: Open-Meteo archive (homogene sur toutes les communes). "
-                "Mesures recentes par commune: InfoClimat/SYNOP prioritaire, fallback fiable sinon."
+                "Mesures recentes par commune: InfoClimat/SYNOP prioritaire, puis station InfoClimat proche, "
+                "puis fallback archive si necessaire."
             )
 
         latest_rows: List[Dict[str, object]] = []
@@ -3612,6 +3686,8 @@ with tabs[0]:
                         "source_brute": ref.get("source"),
                         "station_meteo": ref.get("station_id"),
                         "commune_station": ref.get("commune_station"),
+                        "latitude_ref": ref.get("ref_latitude"),
+                        "longitude_ref": ref.get("ref_longitude"),
                         "dist_station_km": ref.get("distance_km"),
                         "rain_24h_mm": ref.get("rain_24h_mm"),
                         "rain_7d_mm": ref.get("rain_7d_mm"),
@@ -3632,8 +3708,8 @@ with tabs[0]:
                     + ", ".join([f"{k}={v}" for k, v in mode_counts.items()])
                 )
             st.caption(
-                "Regle appliquee: InfoClimat/SYNOP prioritaire si station exploitable pour la commune; "
-                "sinon fallback Open-Meteo archive (source fiable homogene)."
+                "Regle appliquee: InfoClimat/SYNOP prioritaire (station commune), "
+                "puis station InfoClimat la plus proche; Open-Meteo archive uniquement en dernier recours."
             )
             st.caption(
                 "Lecture periodes: 30j = cumul glissant des 30 derniers jours; "
@@ -4059,8 +4135,10 @@ with tabs[1]:
             show_slip=show_slip,
             slip_alert_threshold=float(slip_alert_threshold),
             show_fr_layer=show_fr_layer,
+            map_style=map_basemap_style,
         )
         st_folium(m, height=680, use_container_width=True)
+        st.caption(f"Fond de carte actif: {map_basemap_style}.")
 
     st.markdown("**Carte meteo dediee (etiquettes pluie visibles)**")
     if filtered_weather.empty or effective_rain_col_weather not in filtered_weather.columns:
@@ -4082,6 +4160,7 @@ with tabs[1]:
             rain_col_weather=effective_rain_col_weather,
             min_risk=min_risk,
             max_labels=int(max_label_value),
+            map_style=map_basemap_style,
         )
         st_folium(m_weather, height=640, use_container_width=True, key="weather_focus_map")
         st.caption(
@@ -4206,6 +4285,8 @@ with tabs[2]:
             ("weather_watch_priority", 0.0),
             ("weather_quality_note", 0.0),
             ("obs_age_h", 240.0),
+            ("latitude", np.nan),
+            ("longitude", np.nan),
             ("distance_to_lgv_km", np.nan),
             ("rain_24h_mm", 0.0),
             ("rain_7d_mm", 0.0),
@@ -4260,6 +4341,8 @@ with tabs[2]:
                         "station",
                         "source_meteo",
                         "commune_station",
+                        "latitude",
+                        "longitude",
                         "distance_lgv_km",
                         "rain_24h_mm",
                         "rain_7d_mm",
