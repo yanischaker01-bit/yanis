@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -279,6 +280,20 @@ def _snapshot_age_hours(snapshot_ts: pd.Timestamp | None) -> float | None:
     return max(0.0, float(age_h))
 
 
+def _http_get_with_retry(url: str, params: Dict[str, object], timeout: int = 30, max_attempts: int = 2) -> requests.Response:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(max_attempts))):
+        try:
+            return requests.get(url, params=params, timeout=timeout)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_attempts - 1:
+                time.sleep(0.6)
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("HTTP request failed")
+
+
 def _build_weather_enhanced(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp | None) -> pd.DataFrame:
     if weather_df.empty:
         return weather_df.copy()
@@ -494,7 +509,7 @@ def _load_snapshot(path_str: str, mtime: float) -> Dict[str, object]:
 @st.cache_data(show_spinner=False, ttl=300)
 def _load_remote_snapshot(url: str) -> Dict[str, object]:
     try:
-        response = requests.get(url, timeout=12)
+        response = _http_get_with_retry(url, params={}, timeout=12, max_attempts=2)
         if response.status_code != 200 or not response.text.strip():
             return {}
         payload = response.json()
@@ -974,29 +989,80 @@ def _load_sector_monthly_history(lat: float, lon: float, years_back: int) -> Dic
 
     used_model = OPEN_METEO_MODEL
     try:
-        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30, max_attempts=2)
         if response.status_code != 200:
             fallback_params = dict(params)
             fallback_params.pop("models", None)
-            response = requests.get(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30)
+            response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30, max_attempts=2)
             used_model = "open_meteo_default"
         if response.status_code != 200 or not response.text.strip():
-            return {"monthly": [], "climatology": [], "model": used_model, "error": f"HTTP {response.status_code}"}
+            return {
+                "monthly": [],
+                "climatology": [],
+                "model": used_model,
+                "latest_obs_date": None,
+                "recent_rain_30d_mm": None,
+                "recent_rain_month_mm": None,
+                "error": f"HTTP {response.status_code}",
+            }
 
         payload = response.json()
         entry = payload[0] if isinstance(payload, list) and payload else payload
         if not isinstance(entry, dict):
-            return {"monthly": [], "climatology": [], "model": used_model, "error": "payload invalide"}
+            return {
+                "monthly": [],
+                "climatology": [],
+                "model": used_model,
+                "latest_obs_date": None,
+                "recent_rain_30d_mm": None,
+                "recent_rain_month_mm": None,
+                "error": "payload invalide",
+            }
         daily = entry.get("daily", {}) if isinstance(entry.get("daily"), dict) else {}
         times = daily.get("time", []) or []
         vals = daily.get("precipitation_sum", []) or []
         if not times or not vals:
-            return {"monthly": [], "climatology": [], "model": used_model, "error": "serie vide"}
+            return {
+                "monthly": [],
+                "climatology": [],
+                "model": used_model,
+                "latest_obs_date": None,
+                "recent_rain_30d_mm": None,
+                "recent_rain_month_mm": None,
+                "error": "serie vide",
+            }
 
         df = pd.DataFrame({"date": pd.to_datetime(times, utc=True, errors="coerce"), "precip_mm": pd.to_numeric(vals, errors="coerce")})
         df = df.dropna(subset=["date", "precip_mm"])
         if df.empty:
-            return {"monthly": [], "climatology": [], "model": used_model, "error": "serie vide"}
+            return {
+                "monthly": [],
+                "climatology": [],
+                "model": used_model,
+                "latest_obs_date": None,
+                "recent_rain_30d_mm": None,
+                "recent_rain_month_mm": None,
+                "error": "serie vide",
+            }
+        df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.normalize()
+        df = df.dropna(subset=["date"]).sort_values("date")
+        if df.empty:
+            return {
+                "monthly": [],
+                "climatology": [],
+                "model": used_model,
+                "latest_obs_date": None,
+                "recent_rain_30d_mm": None,
+                "recent_rain_month_mm": None,
+                "error": "serie vide",
+            }
+
+        last_date = pd.Timestamp(df["date"].max()).tz_convert("UTC")
+        lower_30d = last_date - pd.Timedelta(days=29)
+        month_start = pd.Timestamp(year=int(last_date.year), month=int(last_date.month), day=1, tz="UTC")
+        recent_rain_30d = float(df.loc[df["date"] >= lower_30d, "precip_mm"].sum())
+        recent_rain_month = float(df.loc[df["date"] >= month_start, "precip_mm"].sum())
 
         monthly = (
             df.assign(
@@ -1016,10 +1082,21 @@ def _load_sector_monthly_history(lat: float, lon: float, years_back: int) -> Dic
             "monthly": monthly.sort_values("ym").to_dict(orient="records"),
             "climatology": clim.sort_values("month").to_dict(orient="records"),
             "model": used_model,
+            "latest_obs_date": last_date.strftime("%Y-%m-%d"),
+            "recent_rain_30d_mm": round(max(0.0, recent_rain_30d), 2),
+            "recent_rain_month_mm": round(max(0.0, recent_rain_month), 2),
             "error": None,
         }
     except Exception as exc:
-        return {"monthly": [], "climatology": [], "model": used_model, "error": str(exc)}
+        return {
+            "monthly": [],
+            "climatology": [],
+            "model": used_model,
+            "latest_obs_date": None,
+            "recent_rain_30d_mm": None,
+            "recent_rain_month_mm": None,
+            "error": str(exc),
+        }
 
 
 @st.cache_data(show_spinner=False, ttl=21600)
@@ -1035,11 +1112,11 @@ def _load_sector_daily_precip_on_date(lat: float, lon: float, target_day_iso: st
     }
     used_model = OPEN_METEO_MODEL
     try:
-        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30, max_attempts=2)
         if response.status_code != 200:
             fallback_params = dict(params)
             fallback_params.pop("models", None)
-            response = requests.get(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30)
+            response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30, max_attempts=2)
             used_model = "open_meteo_default"
         if response.status_code != 200 or not response.text.strip():
             return {"date": str(target_day_iso), "precip_mm": None, "model": used_model, "error": f"HTTP {response.status_code}"}
@@ -1087,11 +1164,11 @@ def _load_sector_recent_weather_archive(lat: float, lon: float, lookback_days: i
 
     used_model = OPEN_METEO_MODEL
     try:
-        response = requests.get(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30)
+        response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30, max_attempts=2)
         if response.status_code != 200:
             fallback_params = dict(params)
             fallback_params.pop("models", None)
-            response = requests.get(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30)
+            response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30, max_attempts=2)
             used_model = "open_meteo_default"
         if response.status_code != 200 or not response.text.strip():
             return {"error": f"HTTP {response.status_code}", "model": used_model}
@@ -1177,6 +1254,8 @@ def _build_commune_weather_reference(
             "source_mode": "AUCUNE_DONNEE",
             "source_label": "Coordonnees commune invalides",
             "source": None,
+            "ref_latitude": None,
+            "ref_longitude": None,
             "station_id": None,
             "commune_station": None,
             "distance_km": None,
@@ -1211,6 +1290,8 @@ def _build_commune_weather_reference(
             "source_mode": "INFOCLIMAT_STATION",
             "source_label": "InfoClimat/SYNOP station commune",
             "source": nearest.get("source"),
+            "ref_latitude": pd.to_numeric(nearest.get("latitude"), errors="coerce"),
+            "ref_longitude": pd.to_numeric(nearest.get("longitude"), errors="coerce"),
             "station_id": nearest.get("station_id"),
             "commune_station": nearest.get("station_commune_name"),
             "distance_km": None if pd.isna(dist_km) else round(float(dist_km), 3),
@@ -1230,6 +1311,8 @@ def _build_commune_weather_reference(
             "source_mode": "OPEN_METEO_ARCHIVE_FALLBACK",
             "source_label": "Fallback fiable (Open-Meteo archive)",
             "source": archive.get("source"),
+            "ref_latitude": pd.to_numeric(lat, errors="coerce"),
+            "ref_longitude": pd.to_numeric(lon, errors="coerce"),
             "station_id": archive.get("station_id"),
             "commune_station": archive.get("commune_station"),
             "distance_km": archive.get("distance_km"),
@@ -1248,6 +1331,8 @@ def _build_commune_weather_reference(
             "source_mode": "NEAREST_STATION_FALLBACK",
             "source_label": "Fallback station proche (hors InfoClimat)",
             "source": nearest.get("source"),
+            "ref_latitude": pd.to_numeric(nearest.get("latitude"), errors="coerce"),
+            "ref_longitude": pd.to_numeric(nearest.get("longitude"), errors="coerce"),
             "station_id": nearest.get("station_id"),
             "commune_station": nearest.get("station_commune_name"),
             "distance_km": None if pd.isna(dist_km) else round(float(dist_km), 3),
@@ -1265,6 +1350,8 @@ def _build_commune_weather_reference(
         "source_mode": "AUCUNE_DONNEE",
         "source_label": "Aucune source meteo exploitable",
         "source": None,
+        "ref_latitude": None,
+        "ref_longitude": None,
         "station_id": None,
         "commune_station": None,
         "distance_km": None,
@@ -2666,8 +2753,13 @@ if not commune_pool.empty:
 
 history_payload = {"monthly": [], "climatology": [], "model": "", "error": "pas de commune"}
 if selected_commune:
+    hist_lat = pd.to_numeric(selected_commune_weather_reference.get("ref_latitude"), errors="coerce")
+    hist_lon = pd.to_numeric(selected_commune_weather_reference.get("ref_longitude"), errors="coerce")
+    if pd.isna(hist_lat) or pd.isna(hist_lon):
+        hist_lat = pd.to_numeric(selected_commune.get("latitude"), errors="coerce")
+        hist_lon = pd.to_numeric(selected_commune.get("longitude"), errors="coerce")
     history_payload = _load_sector_monthly_history(
-        float(selected_commune["latitude"]), float(selected_commune["longitude"]), int(history_years)
+        float(hist_lat), float(hist_lon), int(history_years)
     )
 history_monthly_df = _safe_df(history_payload.get("monthly"))
 history_clim_df = _safe_df(history_payload.get("climatology"))
@@ -3712,20 +3804,33 @@ with tabs[0]:
                         "date_obs_raw": selected_commune_weather_reference.get("obs_date"),
                     }
                 )
-                if ref_mode == "OPEN_METEO_ARCHIVE_FALLBACK" and not history_monthly_df.empty:
-                    try:
-                        current_ym = str(selected_commune_weather_reference.get("obs_date") or "")[:7]
-                        hist_cur = history_monthly_df[history_monthly_df["ym"].astype(str) == current_ym]
-                        if not hist_cur.empty:
-                            hist_mm = float(pd.to_numeric(hist_cur["monthly_precip_mm"], errors="coerce").fillna(0.0).iloc[-1])
-                            ref_month_mm = float(selected_commune_weather_reference.get("rain_month_mm", 0.0) or 0.0)
-                            delta_mm = abs(hist_mm - ref_month_mm)
-                            st.caption(
-                                f"Controle coherence mois courant ({current_ym}): "
-                                f"historique={hist_mm:.1f} mm | mesure ref={ref_month_mm:.1f} mm | ecart={delta_mm:.1f} mm"
-                            )
-                    except Exception:
-                        pass
+                st.caption(
+                    "Definition periodes: 30j = cumul glissant 30 jours; mois = cumul du mois calendaire en cours."
+                )
+                hist_ref_date = str(history_payload.get("latest_obs_date") or "")
+                hist_ref_30d = pd.to_numeric(history_payload.get("recent_rain_30d_mm"), errors="coerce")
+                hist_ref_month = pd.to_numeric(history_payload.get("recent_rain_month_mm"), errors="coerce")
+                ref_30d = pd.to_numeric(selected_commune_weather_reference.get("rain_30d_mm"), errors="coerce")
+                ref_month = pd.to_numeric(selected_commune_weather_reference.get("rain_month_mm"), errors="coerce")
+                if ref_mode == "OPEN_METEO_ARCHIVE_FALLBACK":
+                    if not pd.isna(hist_ref_30d) and not pd.isna(ref_30d):
+                        delta_30d = abs(float(hist_ref_30d) - float(ref_30d))
+                        st.caption(
+                            f"Controle coherence 30j ({hist_ref_date}): "
+                            f"historique={float(hist_ref_30d):.1f} mm | mesure ref={float(ref_30d):.1f} mm | ecart={delta_30d:.1f} mm"
+                        )
+                    if not pd.isna(hist_ref_month) and not pd.isna(ref_month):
+                        delta_month = abs(float(hist_ref_month) - float(ref_month))
+                        st.caption(
+                            f"Controle coherence mois courant ({hist_ref_date}): "
+                            f"historique={float(hist_ref_month):.1f} mm | mesure ref={float(ref_month):.1f} mm | ecart={delta_month:.1f} mm"
+                        )
+                elif not pd.isna(hist_ref_30d):
+                    st.caption(
+                        f"Reference archive commune ({hist_ref_date}): 30j={float(hist_ref_30d):.1f} mm | "
+                        f"mois={0.0 if pd.isna(hist_ref_month) else float(hist_ref_month):.1f} mm "
+                        "(source secondaire comparee a la station)."
+                    )
                 if nearest_weather_snapshot:
                     with st.expander("Comparer avec station snapshot la plus proche"):
                         st.write(
@@ -3858,7 +3963,12 @@ with tabs[0]:
                 )
                 clim_labels = clim_base.mark_text(dy=-8, fontSize=10).encode(text=alt.Text("climatology_mm:Q", format=".1f"))
                 st.altair_chart(clim_base + clim_labels, use_container_width=True)
-            st.caption(f"Source historique: Open-Meteo archive ({history_payload.get('model')})")
+            st.caption(
+                "Source historique: Open-Meteo archive "
+                + f"({history_payload.get('model')}) | point_ref="
+                + f"{selected_commune_weather_reference.get('source_mode')} "
+                + f"({selected_commune_weather_reference.get('source_label')})"
+            )
 
 with tabs[1]:
     st.subheader("Carte multi-couches")
