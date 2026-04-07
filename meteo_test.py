@@ -141,9 +141,13 @@ class LGVSeaMonitor:
         self.open_meteo_sample_step_km = 3.0
         self.open_meteo_max_points = 120
         self.weather_source_mode = str(os.getenv("LGV_WEATHER_SOURCE_MODE", "info_climat")).strip().lower()
+        self.synop_history_days = max(30, min(45, int(os.getenv("LGV_SYNOP_HISTORY_DAYS", "35"))))
+        self.synop_cache_ttl_hours = max(1, min(48, int(os.getenv("LGV_SYNOP_CACHE_TTL_HOURS", "12"))))
 
         os.makedirs("data", exist_ok=True)
         os.makedirs("reports", exist_ok=True)
+        self.synop_cache_dir = os.path.join("data", "synop_cache")
+        os.makedirs(self.synop_cache_dir, exist_ok=True)
 
         self.session = requests.Session()
         self.session.headers.update(self.headers)
@@ -1973,6 +1977,125 @@ class LGVSeaMonitor:
                 return row[key]
         return None
 
+    @staticmethod
+    def _clean_synop_rain_value(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            x = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(x):
+            return None
+        if x < 0.0 or x >= 900.0:
+            return None
+        return x
+
+    def _parse_synop_obs_datetime(self, raw: Optional[str]) -> Optional[datetime]:
+        if raw is None:
+            return None
+        txt = str(raw).strip()
+        if not txt:
+            return None
+        dt = pd.to_datetime(txt, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+        if pd.isna(dt):
+            dt = pd.to_datetime(txt, errors="coerce", utc=True)
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+
+    def _synop_daily_rain_candidate(self, row: Dict[str, str]) -> Optional[float]:
+        rr1 = self._clean_synop_rain_value(self._safe_float(row.get("rr1")))
+        rr3 = self._clean_synop_rain_value(self._safe_float(row.get("rr3")))
+        rr12 = self._clean_synop_rain_value(self._safe_float(row.get("rr12")))
+        rr24 = self._clean_synop_rain_value(self._safe_float(row.get("rr24")))
+        generic = self._clean_synop_rain_value(self._safe_float(row.get("precipitation")))
+        candidates = [v for v in [rr24, rr12, rr3, rr1, generic] if v is not None]
+        if not candidates:
+            return None
+        return float(max(candidates))
+
+    def _load_synop_csv_text(self, day: datetime) -> Tuple[Optional[str], str]:
+        url = self._synop_url_for_date(day)
+        cache_path = os.path.join(self.synop_cache_dir, f"synop.{day.strftime('%Y%m%d')}.csv")
+
+        def _read_cache() -> Optional[str]:
+            if not os.path.exists(cache_path):
+                return None
+            for enc in ("utf-8", "latin-1"):
+                try:
+                    with open(cache_path, "r", encoding=enc, errors="ignore") as f:
+                        txt = f.read()
+                    if txt and txt.strip():
+                        return txt
+                except Exception:
+                    continue
+            return None
+
+        cached_text = _read_cache()
+        if cached_text is not None:
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(cache_path), tz=timezone.utc)
+                age_h = (self._now_utc() - mtime).total_seconds() / 3600.0
+                if age_h <= float(self.synop_cache_ttl_hours):
+                    return cached_text, url
+            except Exception:
+                pass
+
+        try:
+            response = self.session.get(url, timeout=30)
+            if response.status_code == 200 and response.text.strip():
+                try:
+                    with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
+                        f.write(response.text)
+                except Exception:
+                    pass
+                return response.text, url
+        except Exception as exc:
+            logging.warning("Chargement SYNOP impossible (%s): %s", url, exc)
+
+        if cached_text is not None:
+            return cached_text, url
+        return None, url
+
+    def _build_synop_station_daily_history(self, ref_day: datetime, history_days: int) -> pd.DataFrame:
+        station_day_rain: Dict[Tuple[str, str], float] = {}
+        for offset in range(max(1, int(history_days))):
+            day = ref_day - timedelta(days=offset)
+            text, _ = self._load_synop_csv_text(day)
+            if not text:
+                continue
+            try:
+                reader = csv.DictReader(StringIO(text), delimiter=";")
+            except Exception:
+                continue
+            for row in reader:
+                station_id = self._row_get(row, ["numer_sta", "station", "id", "ID"])
+                if not station_id:
+                    continue
+                rain_day = self._synop_daily_rain_candidate(row)
+                if rain_day is None:
+                    continue
+                dt_obs = self._parse_synop_obs_datetime(self._row_get(row, ["date", "Date"]))
+                day_iso = (dt_obs.date().isoformat() if dt_obs is not None else day.date().isoformat())
+                key = (str(station_id), day_iso)
+                prev = station_day_rain.get(key)
+                if prev is None or rain_day > prev:
+                    station_day_rain[key] = float(rain_day)
+
+        if not station_day_rain:
+            return pd.DataFrame(columns=["station_id", "day", "rain_day_mm"])
+        out = pd.DataFrame(
+            [
+                {"station_id": sid, "day": day_iso, "rain_day_mm": mm}
+                for (sid, day_iso), mm in station_day_rain.items()
+            ]
+        )
+        out["day"] = pd.to_datetime(out["day"], errors="coerce")
+        out["rain_day_mm"] = pd.to_numeric(out["rain_day_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        out = out.dropna(subset=["station_id", "day"]).sort_values(["station_id", "day"])
+        return out
+
     def _extract_synop_record(self, row: Dict[str, str]) -> Optional[Dict[str, object]]:
         station_id = self._row_get(row, ["numer_sta", "station", "id", "ID"])
         date_obs_raw = self._row_get(row, ["date", "Date"])
@@ -2039,14 +2162,12 @@ class LGVSeaMonitor:
         for day in candidates:
             url = self._synop_url_for_date(day)
             try:
-                response = self.session.get(url, timeout=30)
-                if response.status_code != 200:
-                    logging.warning("SYNOP non disponible (%s): %s", response.status_code, url)
-                    continue
-                if not response.text.strip():
+                text, source_url = self._load_synop_csv_text(day)
+                if not text:
+                    logging.warning("SYNOP non disponible: %s", url)
                     continue
 
-                reader = csv.DictReader(StringIO(response.text), delimiter=";")
+                reader = csv.DictReader(StringIO(text), delimiter=";")
                 rows = [rec for rec in (self._extract_synop_record(row) for row in reader) if rec]
                 if not rows:
                     continue
@@ -2090,6 +2211,45 @@ class LGVSeaMonitor:
                 ]:
                     all_df[col] = all_df[col].fillna(0.0).clip(lower=0.0)
 
+                # Enrich SYNOP with daily history-based cumulative rainfall per station.
+                daily_hist = self._build_synop_station_daily_history(day, history_days=self.synop_history_days)
+                if not daily_hist.empty:
+                    ref_day = pd.Timestamp(day.date())
+                    lower_7 = ref_day - pd.Timedelta(days=6)
+                    lower_30 = ref_day - pd.Timedelta(days=29)
+                    month_start = pd.Timestamp(year=ref_day.year, month=ref_day.month, day=1)
+                    daily_hist["day"] = pd.to_datetime(daily_hist["day"], errors="coerce")
+                    daily_hist = daily_hist.dropna(subset=["day"])
+                    daily_hist = daily_hist[daily_hist["day"] <= ref_day]
+                    if not daily_hist.empty:
+                        rain_7_map: Dict[str, float] = {}
+                        rain_30_map: Dict[str, float] = {}
+                        rain_month_map: Dict[str, float] = {}
+                        for station_id, grp in daily_hist.groupby("station_id"):
+                            sid = str(station_id)
+                            grp_rain = pd.to_numeric(grp["rain_day_mm"], errors="coerce").fillna(0.0)
+                            grp_day = pd.to_datetime(grp["day"], errors="coerce")
+                            rain_7_map[sid] = float(grp_rain[grp_day >= lower_7].sum())
+                            rain_30_map[sid] = float(grp_rain[grp_day >= lower_30].sum())
+                            rain_month_map[sid] = float(grp_rain[grp_day >= month_start].sum())
+
+                        sid_series = all_df["station_id"].astype(str)
+                        all_df["rain_7d_mm"] = sid_series.map(rain_7_map).fillna(all_df["rain_7d_mm"])
+                        all_df["rain_30d_mm"] = sid_series.map(rain_30_map).fillna(all_df["rain_30d_mm"])
+                        all_df["rain_month_mm"] = sid_series.map(rain_month_map).fillna(all_df["rain_month_mm"])
+
+                all_df["rain_7d_mm"] = all_df[["rain_7d_mm", "rain_24h_mm"]].max(axis=1)
+                all_df["rain_30d_mm"] = all_df[["rain_30d_mm", "rain_7d_mm"]].max(axis=1)
+                all_df["rain_month_mm"] = all_df[["rain_month_mm", "rain_24h_mm"]].max(axis=1)
+                all_df["rain_class"] = [
+                    self._station_pluvio_class(float(r24), float(r7), float(r30))
+                    for r24, r7, r30 in zip(
+                        pd.to_numeric(all_df["rain_24h_mm"], errors="coerce").fillna(0.0).tolist(),
+                        pd.to_numeric(all_df["rain_7d_mm"], errors="coerce").fillna(0.0).tolist(),
+                        pd.to_numeric(all_df["rain_30d_mm"], errors="coerce").fillna(0.0).tolist(),
+                    )
+                ]
+
                 selected_df = all_df[all_df["distance_to_lgv_km"] <= self.weather_corridor_km].copy()
                 notice = None
                 if selected_df.empty:
@@ -2104,6 +2264,7 @@ class LGVSeaMonitor:
                     logging.warning(notice)
                 else:
                     selected_df["selection_mode"] = "within_1km"
+                selected_df["rain_calc_method"] = "synop_daily_history_aggregate"
 
                 ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
                 all_path = os.path.join("data", f"synop_all_stations_{ts}.csv")
@@ -2114,10 +2275,11 @@ class LGVSeaMonitor:
                 self._save_json(
                     {
                         "timestamp_utc": self._now_utc().isoformat(),
-                        "source_url": url,
+                        "source_url": source_url,
                         "corridor_km": self.weather_corridor_km,
                         "all_station_count": int(len(all_df)),
                         "selected_station_count": int(len(selected_df)),
+                        "history_days_used": int(self.synop_history_days),
                         "notice": notice,
                         "all_csv": all_path,
                         "selected_csv": selected_path,
@@ -2128,7 +2290,7 @@ class LGVSeaMonitor:
                     "all": all_df,
                     "selected": selected_df,
                     "notice": notice,
-                    "source_url": url,
+                    "source_url": source_url,
                     "summary_path": summary_path,
                 }
             except Exception as exc:

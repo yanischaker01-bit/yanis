@@ -673,6 +673,52 @@ def _prepare_monthly_history_chart_df(df: pd.DataFrame, default_commune_label: s
     return out.sort_values(["commune_label", "ym_date"]).reset_index(drop=True)
 
 
+def _align_history_month_with_reference(history_df: pd.DataFrame, reference: Dict[str, object]) -> Tuple[pd.DataFrame, bool]:
+    if history_df.empty or not isinstance(reference, dict):
+        return history_df.copy(), False
+    obs_date_raw = str(reference.get("obs_date") or "").strip()
+    ref_month = pd.to_numeric(reference.get("rain_month_mm"), errors="coerce")
+    if not obs_date_raw or pd.isna(ref_month):
+        return history_df.copy(), False
+
+    obs_ts = pd.to_datetime(obs_date_raw, utc=True, errors="coerce")
+    if pd.isna(obs_ts):
+        return history_df.copy(), False
+    ym = f"{int(obs_ts.year):04d}-{int(obs_ts.month):02d}"
+
+    out = history_df.copy()
+    if "ym" not in out.columns:
+        if "year" in out.columns and "month" in out.columns:
+            yy = pd.to_numeric(out.get("year"), errors="coerce").fillna(0).astype(int).astype(str)
+            mm = pd.to_numeric(out.get("month"), errors="coerce").fillna(0).astype(int).map(lambda v: f"{int(v):02d}")
+            out["ym"] = yy + "-" + mm
+        else:
+            return out, False
+
+    out["ym"] = out["ym"].astype(str)
+    out["monthly_precip_mm"] = pd.to_numeric(out.get("monthly_precip_mm"), errors="coerce")
+    month_mask = out["ym"] == ym
+    if month_mask.any():
+        out.loc[month_mask, "monthly_precip_mm"] = float(ref_month)
+        return out, True
+
+    new_row: Dict[str, object] = {
+        "ym": ym,
+        "year": int(obs_ts.year),
+        "month": int(obs_ts.month),
+        "monthly_precip_mm": float(ref_month),
+    }
+    for col in ["commune_label", "commune_name", "history_imputed"]:
+        if col in out.columns:
+            if col == "history_imputed":
+                new_row[col] = False
+            else:
+                vals = out[col].dropna().astype(str).tolist()
+                new_row[col] = vals[0] if vals else ""
+    out = pd.concat([out, pd.DataFrame([new_row])], ignore_index=True)
+    return out, True
+
+
 def _is_infoclimat_station_source(source: object) -> bool:
     src = str(source or "").strip().lower()
     if not src:
@@ -2752,6 +2798,7 @@ if not commune_pool.empty:
             }
 
 history_payload = {"monthly": [], "climatology": [], "model": "", "error": "pas de commune"}
+history_month_aligned = False
 if selected_commune:
     hist_lat = pd.to_numeric(selected_commune_weather_reference.get("ref_latitude"), errors="coerce")
     hist_lon = pd.to_numeric(selected_commune_weather_reference.get("ref_longitude"), errors="coerce")
@@ -2801,6 +2848,12 @@ if selected_commune and history_monthly_df.empty:
         clim_calc["climatology_mm"] = pd.to_numeric(clim_calc["climatology_mm"], errors="coerce").round(1)
         clim_calc["month_label"] = clim_calc["month"].map(MONTH_LABELS_SHORT)
         history_clim_df = clim_calc
+
+if selected_commune and not history_monthly_df.empty:
+    history_monthly_df, history_month_aligned = _align_history_month_with_reference(
+        history_monthly_df,
+        selected_commune_weather_reference,
+    )
 
 history_monthly_df = _filter_history_months(history_monthly_df, selected_history_month_numbers)
 history_clim_df = _filter_history_months(history_clim_df, selected_history_month_numbers)
@@ -3580,7 +3633,11 @@ with tabs[0]:
                 )
             st.caption(
                 "Regle appliquee: InfoClimat/SYNOP prioritaire si station exploitable pour la commune; "
-                "sinon fallback Open-Meteo archive (source fiable homogène)."
+                "sinon fallback Open-Meteo archive (source fiable homogene)."
+            )
+            st.caption(
+                "Lecture periodes: 30j = cumul glissant des 30 derniers jours; "
+                "mois = cumul du mois calendaire courant."
             )
 
     st.subheader("Classement cumuls pluvio (1J / 1 semaine / 1 mois / hiver / printemps / max mensuel / annees)")
@@ -3969,6 +4026,11 @@ with tabs[0]:
                 + f"{selected_commune_weather_reference.get('source_mode')} "
                 + f"({selected_commune_weather_reference.get('source_label')})"
             )
+            if history_month_aligned:
+                st.caption(
+                    "Mois courant aligne sur la mesure de reference commune pour coherence de lecture "
+                    "(derniere mesure vs historique mensuel)."
+                )
 
 with tabs[1]:
     st.subheader("Carte multi-couches")
