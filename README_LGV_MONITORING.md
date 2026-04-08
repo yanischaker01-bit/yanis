@@ -42,6 +42,23 @@ ou
 streamlit run streamlit_lgv_pro.py
 ```
 
+## 5 bis) Lancer la version simple (sources fiables)
+
+```powershell
+python run_streamlit_simple.py
+```
+
+ou
+
+```powershell
+streamlit run streamlit_lgv_simple.py
+```
+
+Cette version simple:
+- privilegie InfoClimat/SYNOP (Meteo-France)
+- utilise une distance max LGV simple (15 km par defaut)
+- n'active le fallback Open-Meteo que si tu coches l'option
+
 Fonctions:
 - filtres interactifs (periode pluvio, niveau de risque, source, communes)
 - carte dynamique multicouche (LGV, meteo, secteurs IA, hydro, piezometres, geotech, couche geographique FR)
@@ -66,6 +83,8 @@ Fonctions:
    - Branch: `main`
    - Main file path: `streamlit_lgv_pro.py`
 5. Clique `Deploy`.
+
+Pour la version simple, mets `streamlit_lgv_simple.py` dans `Main file path`.
 
 Sur Streamlit Cloud, l'app lit en priorite le snapshot publie par GitHub Pages:
 `https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json`.
