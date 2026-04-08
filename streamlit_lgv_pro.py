@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -114,6 +115,22 @@ OBS_WINDOW_HOURS = {
     "7 jours": 24.0 * 7.0,
     "Mois courant": None,
 }
+
+WEATHER_SOURCE_FILTER_MODES = [
+    "Toutes sources",
+    "InfoClimat/SYNOP",
+    "InfoClimat/SYNOP proches LGV SEA",
+]
+
+WEATHER_SOURCE_PROFILE_OPTIONS = [
+    "Auto (recommande)",
+    "Open-Meteo uniquement",
+    "InfoClimat/SYNOP uniquement",
+    "InfoClimat/SYNOP <= distance LGV",
+]
+
+DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM = 10.0
+DEFAULT_STRICT_RELIABLE_MODE = True
 
 MAP_TILE_STYLES = {
     "Google Satellite": {
@@ -333,6 +350,10 @@ def _build_weather_enhanced(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp 
         return weather_df.copy()
 
     df = weather_df.copy()
+    raw_24_input = pd.to_numeric(df["rain_24h_mm"], errors="coerce") if "rain_24h_mm" in df.columns else pd.Series(np.nan, index=df.index)
+    raw_7_input = pd.to_numeric(df["rain_7d_mm"], errors="coerce") if "rain_7d_mm" in df.columns else pd.Series(np.nan, index=df.index)
+    raw_30_input = pd.to_numeric(df["rain_30d_mm"], errors="coerce") if "rain_30d_mm" in df.columns else pd.Series(np.nan, index=df.index)
+    raw_month_input = pd.to_numeric(df["rain_month_mm"], errors="coerce") if "rain_month_mm" in df.columns else pd.Series(np.nan, index=df.index)
     rain_cols, completeness = _normalize_weather_rain_columns(df)
     for col, series in rain_cols.items():
         df[col] = series
@@ -378,6 +399,20 @@ def _build_weather_enhanced(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp 
         + df["completeness_note"] * 0.20
         + df["proximity_note"] * 0.15
     ).round(1)
+
+    inconsistency_penalty = (
+        (raw_7_input.notna() & raw_24_input.notna() & (raw_7_input + 0.10 < raw_24_input)).astype(float) * 8.0
+        + (raw_30_input.notna() & raw_7_input.notna() & (raw_30_input + 0.10 < raw_7_input)).astype(float) * 8.0
+        + (raw_month_input.notna() & raw_24_input.notna() & (raw_month_input + 0.10 < raw_24_input)).astype(float) * 6.0
+    )
+    extreme_penalty = (
+        (raw_24_input.notna() & (raw_24_input > 350.0)).astype(float) * 18.0
+        + (raw_7_input.notna() & (raw_7_input > 700.0)).astype(float) * 14.0
+        + (raw_30_input.notna() & (raw_30_input > 1200.0)).astype(float) * 12.0
+        + (raw_month_input.notna() & (raw_month_input > 1500.0)).astype(float) * 10.0
+    )
+    df["pluvio_quality_penalty"] = (inconsistency_penalty + extreme_penalty).clip(lower=0.0, upper=35.0)
+    df["weather_quality_note"] = (df["weather_quality_note"] - df["pluvio_quality_penalty"]).clip(lower=0.0, upper=100.0).round(1)
 
     r24 = pd.to_numeric(df.get("rain_24h_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
     r7 = pd.to_numeric(df.get("rain_7d_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
@@ -671,6 +706,34 @@ def _commune_short_label(label: object) -> str:
     return txt[:19].rstrip() + "..."
 
 
+def _normalize_text_for_match(value: object) -> str:
+    txt = str(value or "").strip().lower()
+    if not txt:
+        return ""
+    txt = unicodedata.normalize("NFKD", txt)
+    txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
+    txt = re.sub(r"[^a-z0-9]+", " ", txt).strip()
+    return txt
+
+
+def _location_match_strength(commune_name: object, station_commune_name: object) -> float:
+    a = _normalize_text_for_match(commune_name)
+    b = _normalize_text_for_match(station_commune_name)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+
+    tokens_a = {tok for tok in a.split(" ") if tok}
+    tokens_b = {tok for tok in b.split(" ") if tok}
+    if not tokens_a or not tokens_b:
+        return 0.0
+    overlap = len(tokens_a.intersection(tokens_b))
+    if overlap <= 0:
+        return 0.0
+    return float(overlap) / float(max(len(tokens_a), len(tokens_b)))
+
+
 def _prepare_monthly_history_chart_df(df: pd.DataFrame, default_commune_label: str = "") -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame()
@@ -741,6 +804,22 @@ def _build_history_month_lookup(history_df: pd.DataFrame) -> Tuple[Dict[Tuple[st
 def _align_history_month_with_reference(history_df: pd.DataFrame, reference: Dict[str, object]) -> Tuple[pd.DataFrame, bool]:
     if history_df.empty or not isinstance(reference, dict):
         return history_df.copy(), False
+
+    source_mode = str(reference.get("source_mode") or "").upper()
+    source = reference.get("source")
+    reliability = str(reference.get("weather_data_reliability") or "").upper()
+    dist_km = pd.to_numeric(reference.get("distance_km"), errors="coerce")
+    is_infoclimat_source = _is_infoclimat_station_source(source)
+    if source_mode not in {"INFOCLIMAT_STATION", "INFOCLIMAT_NEAREST_FALLBACK"}:
+        return history_df.copy(), False
+    if not is_infoclimat_source:
+        return history_df.copy(), False
+    if reliability == "A_VERIFIER":
+        return history_df.copy(), False
+    if source_mode == "INFOCLIMAT_NEAREST_FALLBACK":
+        if not pd.isna(dist_km) and float(dist_km) > float(DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM):
+            return history_df.copy(), False
+
     obs_date_raw = str(reference.get("obs_date") or "").strip()
     ref_month = pd.to_numeric(reference.get("rain_month_mm"), errors="coerce")
     if not obs_date_raw or pd.isna(ref_month):
@@ -764,6 +843,11 @@ def _align_history_month_with_reference(history_df: pd.DataFrame, reference: Dic
     out["monthly_precip_mm"] = pd.to_numeric(out.get("monthly_precip_mm"), errors="coerce")
     month_mask = out["ym"] == ym
     if month_mask.any():
+        hist_vals = pd.to_numeric(out.loc[month_mask, "monthly_precip_mm"], errors="coerce").dropna()
+        if not hist_vals.empty and source_mode == "INFOCLIMAT_NEAREST_FALLBACK":
+            hist_val = float(hist_vals.iloc[-1])
+            if abs(float(ref_month) - hist_val) > 25.0:
+                return out, False
         out.loc[month_mask, "monthly_precip_mm"] = float(ref_month)
         return out, True
 
@@ -789,6 +873,177 @@ def _is_infoclimat_station_source(source: object) -> bool:
     if not src:
         return False
     return ("infoclimat" in src) or ("synop" in src)
+
+
+def _apply_weather_source_filter(
+    weather_df: pd.DataFrame,
+    source_mode: str,
+    infoclimat_max_distance_km: float,
+) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+
+    mode = str(source_mode or WEATHER_SOURCE_FILTER_MODES[0])
+    if mode == "Toutes sources":
+        return weather_df.copy()
+
+    out = weather_df.copy()
+    src_series = out.get("source", pd.Series("", index=out.index)).fillna("").astype(str)
+    is_infoclimat = src_series.map(_is_infoclimat_station_source).fillna(False)
+
+    if mode == "InfoClimat/SYNOP":
+        return out[is_infoclimat].copy()
+
+    if mode == "InfoClimat/SYNOP proches LGV SEA":
+        dist = pd.to_numeric(out.get("distance_to_lgv_km"), errors="coerce")
+        max_km = max(0.5, float(infoclimat_max_distance_km or DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM))
+        return out[is_infoclimat & dist.notna() & (dist <= max_km)].copy()
+
+    return out
+
+
+def _apply_weather_source_profile(
+    weather_df: pd.DataFrame,
+    profile: str,
+    infoclimat_max_distance_km: float,
+) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+
+    mode = str(profile or WEATHER_SOURCE_PROFILE_OPTIONS[0])
+    out = weather_df.copy()
+    src_series = out.get("source", pd.Series("", index=out.index)).fillna("").astype(str)
+    src_lc = src_series.str.lower()
+    is_infoclimat = src_series.map(_is_infoclimat_station_source).fillna(False)
+    is_open_meteo = src_lc.str.contains("open") & src_lc.str.contains("meteo")
+
+    if mode == "Open-Meteo uniquement":
+        return out[is_open_meteo.fillna(False)].copy()
+    if mode == "InfoClimat/SYNOP uniquement":
+        return out[is_infoclimat].copy()
+    if mode == "InfoClimat/SYNOP <= distance LGV":
+        dist = pd.to_numeric(out.get("distance_to_lgv_km"), errors="coerce")
+        max_km = max(0.5, float(infoclimat_max_distance_km or DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM))
+        return out[is_infoclimat & dist.notna() & (dist <= max_km)].copy()
+    return out
+
+
+def _apply_pluvio_quality_gate(weather_df: pd.DataFrame, enabled: bool) -> pd.DataFrame:
+    if weather_df.empty or not enabled:
+        return weather_df.copy()
+
+    out = weather_df.copy()
+    quality = pd.to_numeric(out.get("weather_quality_note"), errors="coerce").fillna(0.0)
+    age_h = pd.to_numeric(out.get("obs_age_h"), errors="coerce").fillna(9999.0)
+    rain_24h = pd.to_numeric(out.get("rain_24h_mm"), errors="coerce")
+    rain_7d = pd.to_numeric(out.get("rain_7d_mm"), errors="coerce")
+    rain_30d = pd.to_numeric(out.get("rain_30d_mm"), errors="coerce")
+    rain_month = pd.to_numeric(out.get("rain_month_mm"), errors="coerce")
+
+    coherence_ok = (
+        (rain_7d.isna() | rain_24h.isna() | (rain_7d + 0.10 >= rain_24h))
+        & (rain_30d.isna() | rain_7d.isna() | (rain_30d + 0.10 >= rain_7d))
+        & (rain_month.isna() | rain_24h.isna() | (rain_month + 0.10 >= rain_24h))
+    )
+    extreme_ok = (
+        (rain_24h.fillna(0.0) >= 0.0)
+        & (rain_24h.fillna(0.0) <= 350.0)
+        & (rain_7d.fillna(0.0) >= 0.0)
+        & (rain_7d.fillna(0.0) <= 700.0)
+        & (rain_30d.fillna(0.0) >= 0.0)
+        & (rain_30d.fillna(0.0) <= 1200.0)
+        & (rain_month.fillna(0.0) >= 0.0)
+        & (rain_month.fillna(0.0) <= 1500.0)
+    )
+
+    strict_mask = (quality >= 50.0) & (age_h <= 96.0) & coherence_ok.fillna(False) & extreme_ok.fillna(False)
+    strict_out = out[strict_mask].copy()
+    if not strict_out.empty:
+        return strict_out
+
+    fallback_mask = (quality >= 40.0) & (age_h <= 144.0) & extreme_ok.fillna(False)
+    fallback_out = out[fallback_mask].copy()
+    return fallback_out if not fallback_out.empty else out
+
+
+def _select_weather_pool_for_ui(
+    filtered_weather: pd.DataFrame,
+    weather_for_context: pd.DataFrame,
+    weather_df: pd.DataFrame,
+    strict_reliable_mode: bool,
+) -> pd.DataFrame:
+    if strict_reliable_mode:
+        if not filtered_weather.empty:
+            return filtered_weather.copy()
+        return weather_for_context.copy()
+
+    if not filtered_weather.empty:
+        return filtered_weather.copy()
+    if not weather_for_context.empty:
+        return weather_for_context.copy()
+    return weather_df.copy()
+
+
+def _deduplicate_weather_rows(weather_df: pd.DataFrame) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+
+    out = weather_df.copy()
+    source_norm = out.get("source", pd.Series("", index=out.index)).fillna("").astype(str).str.strip().str.lower()
+    lat_round = pd.to_numeric(out.get("latitude"), errors="coerce").round(5)
+    lon_round = pd.to_numeric(out.get("longitude"), errors="coerce").round(5)
+
+    obs_ts = pd.to_datetime(out.get("obs_ts_utc"), utc=True, errors="coerce")
+    if obs_ts.isna().all():
+        obs_ts = pd.to_datetime(out.get("date_obs_raw"), utc=True, errors="coerce")
+    obs_key = obs_ts.dt.strftime("%Y-%m-%dT%H:%M")
+    station_id = out.get("station_id", pd.Series("", index=out.index)).fillna("").astype(str)
+
+    lat_key = lat_round.map(lambda v: f"{v:.5f}" if pd.notna(v) else "nan")
+    lon_key = lon_round.map(lambda v: f"{v:.5f}" if pd.notna(v) else "nan")
+    geo_key = source_norm + "|" + lat_key + "|" + lon_key + "|" + obs_key.fillna("")
+    geo_key = geo_key.where(~(lat_round.isna() | lon_round.isna() | obs_key.isna()), source_norm + "|sid|" + station_id)
+
+    out["_geo_dedup_key"] = geo_key
+    out["_sort_quality"] = pd.to_numeric(out.get("weather_quality_note"), errors="coerce").fillna(0.0)
+    out["_sort_alert"] = pd.to_numeric(out.get("weather_alert_index"), errors="coerce").fillna(0.0)
+    out["_sort_age"] = pd.to_numeric(out.get("obs_age_h"), errors="coerce").fillna(9999.0)
+    out["_sort_dist"] = pd.to_numeric(out.get("distance_to_lgv_km"), errors="coerce").fillna(9999.0)
+
+    out = out.sort_values(
+        ["_sort_quality", "_sort_alert", "_sort_age", "_sort_dist"],
+        ascending=[False, False, True, True],
+        kind="mergesort",
+    )
+    out = out.drop_duplicates(subset=["_geo_dedup_key"], keep="first").copy()
+    out = out.drop(columns=["_geo_dedup_key", "_sort_quality", "_sort_alert", "_sort_age", "_sort_dist"], errors="ignore")
+    return out
+
+
+def _stabilize_weather_station_ids(weather_df: pd.DataFrame) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+
+    out = weather_df.copy()
+    if "station_id" not in out.columns:
+        out["station_id"] = "station_inconnue"
+    if "station_id_raw" not in out.columns:
+        out["station_id_raw"] = out["station_id"]
+
+    station_id = out["station_id"].fillna("").astype(str).str.strip()
+    station_id = station_id.replace("", "station_inconnue")
+    dup_mask = station_id.duplicated(keep=False)
+    if dup_mask.any():
+        lat = pd.to_numeric(out.get("latitude"), errors="coerce").round(4)
+        lon = pd.to_numeric(out.get("longitude"), errors="coerce").round(4)
+        suffix = (
+            lat.map(lambda v: f"{v:.4f}" if pd.notna(v) else "na")
+            + ","
+            + lon.map(lambda v: f"{v:.4f}" if pd.notna(v) else "na")
+        )
+        station_id = station_id.where(~dup_mask, station_id + "@" + suffix)
+    out["station_id"] = station_id
+    return out
 
 
 def _apply_weather_obs_window(
@@ -1052,6 +1307,63 @@ def _build_slip_corridors(
     grouped["max_weather_30d_mm"] = pd.to_numeric(grouped["max_weather_30d_mm"], errors="coerce").round(1)
     grouped["max_soil_fragility"] = pd.to_numeric(grouped["max_soil_fragility"], errors="coerce").round(3)
     return grouped.sort_values(["slip_index_max", "corridor_length_km"], ascending=[False, False]).reset_index(drop=True)
+
+
+def _select_best_weather_row(
+    df: pd.DataFrame,
+    lat: float,
+    lon: float,
+    commune_name: object = "",
+) -> Dict[str, object]:
+    if df.empty or "latitude" not in df.columns or "longitude" not in df.columns:
+        return {}
+    work = df.copy()
+    lat_series = pd.to_numeric(work["latitude"], errors="coerce")
+    lon_series = pd.to_numeric(work["longitude"], errors="coerce")
+    valid_mask = lat_series.notna() & lon_series.notna()
+    if not valid_mask.any():
+        return {}
+    work = work.loc[valid_mask].reset_index(drop=True)
+    lat_vals = lat_series.loc[valid_mask].astype(float).to_numpy()
+    lon_vals = lon_series.loc[valid_mask].astype(float).to_numpy()
+
+    r = 6371.0
+    p1 = np.radians(float(lat))
+    p2 = np.radians(lat_vals)
+    dlat = np.radians(lat_vals - float(lat))
+    dlon = np.radians(lon_vals - float(lon))
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlon / 2.0) ** 2
+    dist_km = 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    if dist_km.size == 0:
+        return {}
+
+    work["_dist_km"] = pd.Series(dist_km, index=work.index, dtype=float)
+    quality = pd.to_numeric(work.get("weather_quality_note"), errors="coerce").fillna(55.0)
+    obs_age = pd.to_numeric(work.get("obs_age_h"), errors="coerce").fillna(120.0)
+    src = work.get("source", pd.Series("", index=work.index)).fillna("").astype(str)
+    infoclimat_flag = src.map(_is_infoclimat_station_source).astype(int)
+    infoclimat_bonus = np.where(
+        infoclimat_flag == 1,
+        np.where(work["_dist_km"] <= 10.0, 180.0, np.where(work["_dist_km"] <= 20.0, 135.0, 70.0)),
+        0.0,
+    )
+    reliability = work.get("weather_data_reliability", pd.Series("A_VERIFIER", index=work.index)).fillna("A_VERIFIER").astype(str)
+    reliability_bonus = reliability.map({"OK": 20.0, "SURVEILLER": 8.0, "A_VERIFIER": -12.0}).fillna(0.0)
+    station_commune = work.get("station_commune_name", pd.Series("", index=work.index)).fillna("").astype(str)
+    loc_match = station_commune.map(lambda s: _location_match_strength(commune_name, s))
+
+    work["_selection_score"] = (
+        infoclimat_bonus
+        + quality * 1.2
+        + reliability_bonus
+        + loc_match * 45.0
+        - work["_dist_km"] * 3.2
+        - obs_age * 0.22
+    )
+    work = work.sort_values(["_selection_score", "_dist_km"], ascending=[False, True], kind="mergesort")
+    row = work.iloc[0].to_dict()
+    row["_dist_km"] = round(float(row.get("_dist_km", np.nan)), 3) if pd.notna(pd.to_numeric(row.get("_dist_km"), errors="coerce")) else np.nan
+    return row
 
 
 def _nearest_row(df: pd.DataFrame, lat: float, lon: float) -> Dict[str, object]:
@@ -1358,6 +1670,7 @@ def _build_commune_weather_reference(
     max_obs_age_h: float = 72.0,
     max_infoclimat_fallback_km: float = 80.0,
     max_infoclimat_fallback_obs_h: float = 168.0,
+    allow_open_meteo_fallback: bool = True,
 ) -> Dict[str, object]:
     try:
         lat = float(commune_row.get("latitude"))
@@ -1382,7 +1695,12 @@ def _build_commune_weather_reference(
             "weather_data_reliability": "A_VERIFIER",
         }
 
-    nearest = _nearest_row(weather_df, lat, lon) if isinstance(weather_df, pd.DataFrame) and not weather_df.empty else {}
+    commune_name = str(commune_row.get("commune_name") or commune_row.get("commune_label") or "")
+    nearest = (
+        _select_best_weather_row(weather_df, lat, lon, commune_name=commune_name)
+        if isinstance(weather_df, pd.DataFrame) and not weather_df.empty
+        else {}
+    )
     dist_km = pd.to_numeric(nearest.get("_dist_km"), errors="coerce") if nearest else pd.NA
     obs_age_h = pd.to_numeric(nearest.get("obs_age_h"), errors="coerce") if nearest else pd.NA
     if (pd.isna(obs_age_h) or obs_age_h is None) and nearest:
@@ -1444,28 +1762,29 @@ def _build_commune_weather_reference(
             "weather_data_reliability": nearest.get("weather_data_reliability"),
         }
 
-    archive = _load_sector_recent_weather_archive(lat, lon, lookback_days=45)
-    if not archive.get("error"):
-        return {
-            "source_mode": "OPEN_METEO_ARCHIVE_FALLBACK",
-            "source_label": "Fallback fiable (Open-Meteo archive)",
-            "source": archive.get("source"),
-            "ref_latitude": pd.to_numeric(lat, errors="coerce"),
-            "ref_longitude": pd.to_numeric(lon, errors="coerce"),
-            "station_id": archive.get("station_id"),
-            "commune_station": archive.get("commune_station"),
-            "distance_km": archive.get("distance_km"),
-            "obs_date": archive.get("date_obs_raw"),
-            "rain_24h_mm": pd.to_numeric(archive.get("rain_24h_mm"), errors="coerce"),
-            "rain_7d_mm": pd.to_numeric(archive.get("rain_7d_mm"), errors="coerce"),
-            "rain_30d_mm": pd.to_numeric(archive.get("rain_30d_mm"), errors="coerce"),
-            "rain_month_mm": pd.to_numeric(archive.get("rain_month_mm"), errors="coerce"),
-            "weather_alert_index": pd.to_numeric(archive.get("weather_alert_index"), errors="coerce"),
-            "weather_quality_note": np.nan,
-            "weather_data_reliability": "OK",
-        }
+    if allow_open_meteo_fallback:
+        archive = _load_sector_recent_weather_archive(lat, lon, lookback_days=45)
+        if not archive.get("error"):
+            return {
+                "source_mode": "OPEN_METEO_ARCHIVE_FALLBACK",
+                "source_label": "Fallback fiable (Open-Meteo archive)",
+                "source": archive.get("source"),
+                "ref_latitude": pd.to_numeric(lat, errors="coerce"),
+                "ref_longitude": pd.to_numeric(lon, errors="coerce"),
+                "station_id": archive.get("station_id"),
+                "commune_station": archive.get("commune_station"),
+                "distance_km": archive.get("distance_km"),
+                "obs_date": archive.get("date_obs_raw"),
+                "rain_24h_mm": pd.to_numeric(archive.get("rain_24h_mm"), errors="coerce"),
+                "rain_7d_mm": pd.to_numeric(archive.get("rain_7d_mm"), errors="coerce"),
+                "rain_30d_mm": pd.to_numeric(archive.get("rain_30d_mm"), errors="coerce"),
+                "rain_month_mm": pd.to_numeric(archive.get("rain_month_mm"), errors="coerce"),
+                "weather_alert_index": pd.to_numeric(archive.get("weather_alert_index"), errors="coerce"),
+                "weather_quality_note": np.nan,
+                "weather_data_reliability": "OK",
+            }
 
-    if nearest:
+    if nearest and allow_open_meteo_fallback:
         return {
             "source_mode": "NEAREST_STATION_FALLBACK",
             "source_label": "Fallback station proche (hors InfoClimat)",
@@ -1689,7 +2008,11 @@ def _build_pluvio_ranking(
         except (TypeError, ValueError):
             continue
 
-        wx = _nearest_row(weather_df, lat, lon) if isinstance(weather_df, pd.DataFrame) else {}
+        wx = (
+            _select_best_weather_row(weather_df, lat, lon, commune_name=cname)
+            if isinstance(weather_df, pd.DataFrame)
+            else {}
+        )
         r1j = pd.to_numeric(wx.get("rain_24h_mm"), errors="coerce")
         r7j = pd.to_numeric(wx.get("rain_7d_mm"), errors="coerce")
         r30j = pd.to_numeric(wx.get("rain_30d_mm"), errors="coerce")
@@ -2440,6 +2763,8 @@ if not weather_df.empty:
         weather_df["station_commune_name"] = "Inconnue"
     weather_df["station_commune_name"] = weather_df["station_commune_name"].fillna("Inconnue")
     weather_df = _build_weather_enhanced(weather_df, snapshot_ts)
+    weather_df = _deduplicate_weather_rows(weather_df)
+    weather_df = _stabilize_weather_station_ids(weather_df)
 
 if not sectors_df.empty:
     for col in [
@@ -2511,6 +2836,11 @@ if not alerts_df.empty and "level" in alerts_df.columns:
 weather_obs_window = "Tout"
 weather_exact_day_enabled = False
 weather_exact_day = datetime.now(timezone.utc).date()
+weather_source_profile = WEATHER_SOURCE_PROFILE_OPTIONS[0]
+weather_source_mode = WEATHER_SOURCE_FILTER_MODES[2]
+infoclimat_max_distance_km = DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM
+enforce_pluvio_quality = True
+strict_reliable_mode = DEFAULT_STRICT_RELIABLE_MODE
 map_basemap_style = "Google Satellite"
 selected_history_month_labels = MONTH_ORDER_SHORT.copy()
 selected_history_month_numbers = list(MONTH_LABELS_SHORT.keys())
@@ -2569,6 +2899,40 @@ with st.sidebar:
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
     selected_sources = _multiselect_with_all("Sources meteo", sources, key="flt_sources")
+    weather_source_profile = st.selectbox(
+        "Source de data meteo",
+        WEATHER_SOURCE_PROFILE_OPTIONS,
+        index=0,
+        help="Choix rapide de la source: Open-Meteo, InfoClimat/SYNOP, ou mode auto.",
+    )
+    weather_source_mode = st.selectbox(
+        "Mode source meteo",
+        WEATHER_SOURCE_FILTER_MODES,
+        index=2,
+        help="Permet de cibler les stations InfoClimat/SYNOP, avec option proximite LGV SEA.",
+        disabled=(weather_source_profile != "Auto (recommande)"),
+    )
+    infoclimat_max_distance_km = st.slider(
+        "Distance max InfoClimat a la LGV (km)",
+        min_value=1.0,
+        max_value=50.0,
+        value=float(DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM),
+        step=0.5,
+        disabled=not (
+            weather_source_profile == "InfoClimat/SYNOP <= distance LGV"
+            or (weather_source_profile == "Auto (recommande)" and weather_source_mode == "InfoClimat/SYNOP proches LGV SEA")
+        ),
+    )
+    enforce_pluvio_quality = st.checkbox(
+        "Qualite pluvio renforcee (recommande)",
+        value=True,
+        help="Exclut automatiquement les observations pluvio les moins fiables (age, incoherences, valeurs extremes).",
+    )
+    strict_reliable_mode = st.checkbox(
+        "Mode donnees fiables strict",
+        value=bool(DEFAULT_STRICT_RELIABLE_MODE),
+        help="Si active: pas de fallback Open-Meteo quand aucune station InfoClimat/SYNOP fiable n'est disponible.",
+    )
 
     commune_values: List[str] = []
     if "commune_name" in sectors_df.columns:
@@ -2626,8 +2990,22 @@ with st.sidebar:
     show_fr_layer = st.checkbox("Layer geographie FR", value=False)
 
 weather_for_context = weather_df.copy()
+if not weather_for_context.empty:
+    weather_for_context = _apply_weather_source_profile(
+        weather_for_context,
+        weather_source_profile,
+        float(infoclimat_max_distance_km),
+    )
 if not weather_for_context.empty and selected_sources:
     weather_for_context = weather_for_context[weather_for_context["source"].astype(str).isin(selected_sources)]
+if not weather_for_context.empty and weather_source_profile == "Auto (recommande)":
+    weather_for_context = _apply_weather_source_filter(
+        weather_for_context,
+        weather_source_mode,
+        float(infoclimat_max_distance_km),
+    )
+if not weather_for_context.empty:
+    weather_for_context = _apply_pluvio_quality_gate(weather_for_context, bool(enforce_pluvio_quality))
 if not weather_for_context.empty and selected_station_communes:
     weather_for_context = weather_for_context[weather_for_context["station_commune_name"].astype(str).isin(selected_station_communes)]
 if not weather_for_context.empty and int(weather_min_quality) > 0 and "weather_quality_note" in weather_for_context.columns:
@@ -2651,7 +3029,32 @@ if not filtered_weather.empty and str(min_risk).upper() != "TOUT":
         weather_risk_col = "risk_level"
     filtered_weather = filtered_weather[filtered_weather[weather_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
-weather_signal_df = filtered_weather if not filtered_weather.empty else weather_df
+if weather_for_context.empty and not weather_df.empty:
+    if weather_source_profile == "Open-Meteo uniquement":
+        st.warning("Aucune donnee Open-Meteo disponible dans ce snapshot.")
+    elif weather_source_profile in {"InfoClimat/SYNOP uniquement", "InfoClimat/SYNOP <= distance LGV"}:
+        if weather_source_profile == "InfoClimat/SYNOP <= distance LGV":
+            st.warning(
+                f"Aucune station InfoClimat/SYNOP <= {float(infoclimat_max_distance_km):.1f} km de la LGV SEA dans ce snapshot."
+            )
+        else:
+            st.warning("Aucune station InfoClimat/SYNOP disponible dans ce snapshot.")
+    elif weather_source_mode != "Toutes sources":
+        if weather_source_mode == "InfoClimat/SYNOP proches LGV SEA":
+            st.warning(
+                f"Aucune station InfoClimat/SYNOP <= {float(infoclimat_max_distance_km):.1f} km de la LGV SEA dans ce snapshot."
+            )
+        else:
+            st.warning("Aucune station InfoClimat/SYNOP disponible dans ce snapshot.")
+    if strict_reliable_mode:
+        st.info("Mode strict actif: les estimations Open-Meteo ne sont pas utilisees pour remplacer ces donnees.")
+
+weather_signal_df = _select_weather_pool_for_ui(
+    filtered_weather,
+    weather_for_context,
+    weather_df,
+    strict_reliable_mode=bool(strict_reliable_mode),
+)
 effective_rain_col_weather = _choose_weather_signal_column(
     weather_signal_df,
     rain_col_weather,
@@ -2757,7 +3160,12 @@ if not commune_pool.empty:
         axis=1,
     )
 
-    weather_ctx_source = weather_for_context if not weather_for_context.empty else weather_df
+    weather_ctx_source = _select_weather_pool_for_ui(
+        filtered_weather,
+        weather_for_context,
+        weather_df,
+        strict_reliable_mode=bool(strict_reliable_mode),
+    )
     weather_context_df = _build_commune_weather_context(
         commune_pool[["commune_label", "latitude", "longitude"]],
         weather_ctx_source,
@@ -2940,7 +3348,18 @@ if not commune_pool.empty:
                 "error": str(exc),
             }
         try:
-            selected_commune_weather_reference = _build_commune_weather_reference(selected_commune, weather_df, snapshot_ts)
+            weather_reference_pool = _select_weather_pool_for_ui(
+                filtered_weather,
+                weather_for_context,
+                weather_df,
+                strict_reliable_mode=bool(strict_reliable_mode),
+            )
+            selected_commune_weather_reference = _build_commune_weather_reference(
+                selected_commune,
+                weather_reference_pool,
+                snapshot_ts,
+                allow_open_meteo_fallback=not bool(strict_reliable_mode),
+            )
         except Exception as exc:
             selected_commune_weather_reference = {
                 "source_mode": "AUCUNE_DONNEE",
@@ -3012,7 +3431,12 @@ if history_clim_df.empty and not history_monthly_df.empty:
 
 pluvio_ranking_df = _build_pluvio_ranking(
     commune_pool.to_dict(orient="records") if not commune_pool.empty else compare_commune_rows,
-    filtered_weather if not filtered_weather.empty else weather_df,
+    _select_weather_pool_for_ui(
+        filtered_weather,
+        weather_for_context,
+        weather_df,
+        strict_reliable_mode=bool(strict_reliable_mode),
+    ),
     compare_history_full_df,
 )
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
@@ -3754,8 +4178,18 @@ with tabs[0]:
                 if hit.empty:
                     continue
                 com = hit.iloc[0].to_dict()
-                wx_source = filtered_weather if not filtered_weather.empty else weather_df
-                ref = _build_commune_weather_reference(com, wx_source, snapshot_ts)
+                wx_source = _select_weather_pool_for_ui(
+                    filtered_weather,
+                    weather_for_context,
+                    weather_df,
+                    strict_reliable_mode=bool(strict_reliable_mode),
+                )
+                ref = _build_commune_weather_reference(
+                    com,
+                    wx_source,
+                    snapshot_ts,
+                    allow_open_meteo_fallback=not bool(strict_reliable_mode),
+                )
                 ref_obs = pd.to_datetime(ref.get("obs_date"), utc=True, errors="coerce")
                 ref_ym = (
                     f"{int(ref_obs.year):04d}-{int(ref_obs.month):02d}"
@@ -4034,7 +4468,18 @@ with tabs[0]:
             )
             st.caption(f"Source jour precis: Open-Meteo archive ({selected_daily_day_precip.get('model')})")
 
-        nearest_weather_snapshot = _nearest_row(weather_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
+        detail_weather_pool = _select_weather_pool_for_ui(
+            filtered_weather,
+            weather_for_context,
+            weather_df,
+            strict_reliable_mode=bool(strict_reliable_mode),
+        )
+        nearest_weather_snapshot = _select_best_weather_row(
+            detail_weather_pool,
+            float(selected_commune["latitude"]),
+            float(selected_commune["longitude"]),
+            commune_name=selected_commune.get("commune_name"),
+        )
         nearest_hydro = _nearest_row(filtered_hydro, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
         nearest_piezo = _nearest_row(piezo_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
 
