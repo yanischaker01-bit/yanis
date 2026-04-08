@@ -1,4 +1,5 @@
 import csv
+import gzip
 import html
 import json
 import logging
@@ -74,7 +75,7 @@ class LGVSeaMonitor:
         self.lgv_lines_latlon = self._load_lgv_lines(self.lgv_geometry_candidates)
         if not self.lgv_lines_latlon:
             self.lgv_lines_latlon = [self.default_lgv_coordinates_latlon]
-        self.weather_corridor_km = 1.0
+        self.weather_corridor_km = max(1.0, min(50.0, float(os.getenv("LGV_WEATHER_CORRIDOR_KM", "15"))))
         self.alert_thresholds_mm = {
             "catastrophique_24h": 120.0,
             "extreme_24h": 80.0,
@@ -143,6 +144,12 @@ class LGVSeaMonitor:
         self.weather_source_mode = str(os.getenv("LGV_WEATHER_SOURCE_MODE", "info_climat")).strip().lower()
         self.synop_history_days = max(30, min(45, int(os.getenv("LGV_SYNOP_HISTORY_DAYS", "35"))))
         self.synop_cache_ttl_hours = max(1, min(48, int(os.getenv("LGV_SYNOP_CACHE_TTL_HOURS", "12"))))
+        self.synop_archive_dataset_id = str(os.getenv("LGV_SYNOP_ARCHIVE_DATASET_ID", "686f8595b351c06a3a790867")).strip()
+        self.synop_archive_lookback_days = max(
+            35,
+            min(120, int(os.getenv("LGV_SYNOP_ARCHIVE_LOOKBACK_DAYS", str(max(45, self.synop_history_days + 10))))),
+        )
+        self._synop_archive_urls_by_year: Dict[int, str] = {}
 
         os.makedirs("data", exist_ok=True)
         os.makedirs("reports", exist_ok=True)
@@ -151,6 +158,8 @@ class LGVSeaMonitor:
 
         self.session = requests.Session()
         self.session.headers.update(self.headers)
+        # Ignore broken system proxies by default; opt-in with LGV_REQUESTS_TRUST_ENV=1 if needed.
+        self.session.trust_env = str(os.getenv("LGV_REQUESTS_TRUST_ENV", "0")).strip().lower() in {"1", "true", "yes", "on"}
 
         self.station_cache_file = os.path.join("data", "river_station_cache.json")
         self.station_cache = self._load_station_cache()
@@ -2006,14 +2015,298 @@ class LGVSeaMonitor:
 
     def _synop_daily_rain_candidate(self, row: Dict[str, str]) -> Optional[float]:
         rr1 = self._clean_synop_rain_value(self._safe_float(row.get("rr1")))
+        rr6 = self._clean_synop_rain_value(self._safe_float(row.get("rr6")))
         rr3 = self._clean_synop_rain_value(self._safe_float(row.get("rr3")))
         rr12 = self._clean_synop_rain_value(self._safe_float(row.get("rr12")))
         rr24 = self._clean_synop_rain_value(self._safe_float(row.get("rr24")))
+        rr = self._clean_synop_rain_value(self._safe_float(row.get("rr")))
         generic = self._clean_synop_rain_value(self._safe_float(row.get("precipitation")))
-        candidates = [v for v in [rr24, rr12, rr3, rr1, generic] if v is not None]
+        candidates = [v for v in [rr24, rr12, rr6, rr3, rr1, rr, generic] if v is not None]
         if not candidates:
             return None
         return float(max(candidates))
+
+    @staticmethod
+    def _looks_like_synop_csv(text: Optional[str]) -> bool:
+        if text is None:
+            return False
+        sample = str(text or "").strip()
+        if not sample:
+            return False
+        head = sample[:1200].lower()
+        if "<!doctype" in head or "<html" in head or "donnee_indisponible" in head:
+            return False
+        return (";" in head) and (
+            ("numer_sta" in head)
+            or ("geo_id_wmo" in head)
+            or ("lat;lon;" in head)
+        )
+
+    def _synop_archive_url_for_year(self, year: int) -> str:
+        y = int(year)
+        if y in self._synop_archive_urls_by_year:
+            return self._synop_archive_urls_by_year[y]
+
+        api_url = f"https://www.data.gouv.fr/api/1/datasets/{self.synop_archive_dataset_id}/"
+        try:
+            resp = self.session.get(api_url, timeout=30)
+            if resp.status_code == 200:
+                payload = resp.json()
+                for resource in payload.get("resources", []):
+                    if not isinstance(resource, dict):
+                        continue
+                    title = str(resource.get("title") or "").strip().lower()
+                    url = str(resource.get("url") or "").strip()
+                    if not title or not url:
+                        continue
+                    match = re.search(r"synop[_\\-\\s]?(\\d{4})", title)
+                    if not match:
+                        continue
+                    try:
+                        ry = int(match.group(1))
+                    except Exception:
+                        continue
+                    self._synop_archive_urls_by_year[ry] = url
+        except Exception as exc:
+            logging.warning("Resolution URL archive SYNOP impossible (data.gouv): %s", exc)
+
+        if y in self._synop_archive_urls_by_year:
+            return self._synop_archive_urls_by_year[y]
+
+        fallback_url = f"https://object.files.data.gouv.fr/meteofrance/data/synchro_ftp/OBS/SYNOP/synop_{y}.csv.gz"
+        self._synop_archive_urls_by_year[y] = fallback_url
+        return fallback_url
+
+    def _download_synop_archive_gz(self, year: int) -> Tuple[Optional[str], str]:
+        y = int(year)
+        url = self._synop_archive_url_for_year(y)
+        cache_path = os.path.join(self.synop_cache_dir, f"synop_{y}.csv.gz")
+
+        if os.path.exists(cache_path):
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(cache_path), tz=timezone.utc)
+                age_h = (self._now_utc() - mtime).total_seconds() / 3600.0
+                if age_h <= float(self.synop_cache_ttl_hours):
+                    return cache_path, url
+            except Exception:
+                pass
+
+        try:
+            resp = self.session.get(url, timeout=120)
+            if resp.status_code == 200 and resp.content[:2] == b"\x1f\x8b":
+                with open(cache_path, "wb") as f:
+                    f.write(resp.content)
+                return cache_path, url
+            logging.warning("Archive SYNOP inattendue (%s): HTTP %s", url, resp.status_code)
+        except Exception as exc:
+            logging.warning("Telechargement archive SYNOP impossible (%s): %s", url, exc)
+
+        if os.path.exists(cache_path):
+            return cache_path, url
+        return None, url
+
+    def _load_synop_archive_history(self, ref_day: datetime, history_days: int) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
+        lookback_days = max(int(history_days), int(self.synop_archive_lookback_days))
+        floor_dt = (ref_day - timedelta(days=lookback_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        years = sorted({int(ref_day.year), int(floor_dt.year)})
+
+        all_records: List[Dict[str, object]] = []
+        hist_frames: List[pd.DataFrame] = []
+        source_urls: List[str] = []
+
+        for year in years:
+            gz_path, src_url = self._download_synop_archive_gz(year)
+            if src_url:
+                source_urls.append(src_url)
+            if not gz_path:
+                continue
+
+            try:
+                preview = pd.read_csv(gz_path, sep=";", nrows=1, dtype=str, compression="gzip")
+                available_cols = set(preview.columns.tolist())
+                wanted_cols = [
+                    "numer_sta",
+                    "geo_id_wmo",
+                    "station",
+                    "id",
+                    "ID",
+                    "lat",
+                    "latitude",
+                    "Latitude",
+                    "LAT",
+                    "lon",
+                    "longitude",
+                    "Longitude",
+                    "LON",
+                    "date",
+                    "Date",
+                    "validity_time",
+                    "reference_time",
+                    "rr1",
+                    "rr3",
+                    "rr6",
+                    "rr12",
+                    "rr24",
+                    "rr",
+                    "precipitation",
+                ]
+                usecols = [c for c in wanted_cols if c in available_cols]
+                if not usecols:
+                    continue
+
+                raw = pd.read_csv(
+                    gz_path,
+                    sep=";",
+                    dtype=str,
+                    usecols=usecols,
+                    compression="gzip",
+                    low_memory=False,
+                )
+                if raw.empty:
+                    continue
+
+                def _coalesce_text(frame: pd.DataFrame, cols: List[str]) -> pd.Series:
+                    out = pd.Series("", index=frame.index, dtype="string")
+                    for c in cols:
+                        if c not in frame.columns:
+                            continue
+                        cur = frame[c].astype("string").fillna("").str.strip()
+                        out = out.where(out.str.len() > 0, cur)
+                    return out
+
+                sid = _coalesce_text(raw, ["numer_sta", "geo_id_wmo", "station", "id", "ID"])
+                obs_raw = _coalesce_text(raw, ["date", "Date", "validity_time", "reference_time"])
+                lat_raw = _coalesce_text(raw, ["lat", "latitude", "Latitude", "LAT"])
+                lon_raw = _coalesce_text(raw, ["lon", "longitude", "Longitude", "LON"])
+
+                obs_dt = pd.to_datetime(obs_raw, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+                obs_fallback = pd.to_datetime(obs_raw, errors="coerce", utc=True)
+                obs_dt = obs_dt.where(obs_dt.notna(), obs_fallback)
+
+                lat = pd.to_numeric(lat_raw, errors="coerce")
+                lon = pd.to_numeric(lon_raw, errors="coerce")
+                lat = lat.where(~(lat.abs().gt(90.0) & lat.abs().le(9000.0)), lat / 100.0)
+                lon = lon.where(~(lon.abs().gt(180.0) & lon.abs().le(18000.0)), lon / 100.0)
+
+                recent_mask = obs_dt.notna() & (obs_dt >= pd.Timestamp(floor_dt))
+                if not recent_mask.any():
+                    continue
+
+                rr_cols = [c for c in ["rr24", "rr12", "rr6", "rr3", "rr1", "rr", "precipitation"] if c in raw.columns]
+                rain_daily = pd.Series(float("nan"), index=raw.index, dtype="float64")
+                if rr_cols:
+                    rr_num = raw[rr_cols].apply(pd.to_numeric, errors="coerce")
+                    rr_num = rr_num.where((rr_num >= 0.0) & (rr_num < 900.0))
+                    rain_daily = rr_num.max(axis=1, skipna=True)
+
+                recent = pd.DataFrame(
+                    {
+                        "station_id": sid,
+                        "date_obs_raw": obs_raw,
+                        "obs_dt": obs_dt,
+                        "lat": lat,
+                        "lon": lon,
+                        "rr1": pd.to_numeric(raw.get("rr1"), errors="coerce"),
+                        "rr3": pd.to_numeric(raw.get("rr3"), errors="coerce"),
+                        "rr6": pd.to_numeric(raw.get("rr6"), errors="coerce"),
+                        "rr12": pd.to_numeric(raw.get("rr12"), errors="coerce"),
+                        "rr24": pd.to_numeric(raw.get("rr24"), errors="coerce"),
+                        "rr": pd.to_numeric(raw.get("rr"), errors="coerce"),
+                        "precipitation": pd.to_numeric(raw.get("precipitation"), errors="coerce"),
+                        "rain_day_mm": rain_daily,
+                    }
+                )
+                recent = recent[recent_mask].copy()
+                recent = recent[(recent["station_id"].astype(str).str.len() > 0) & recent["lat"].notna() & recent["lon"].notna()]
+                if recent.empty:
+                    continue
+
+                hist_df = recent[["station_id", "obs_dt", "rain_day_mm"]].copy()
+                hist_df = hist_df.dropna(subset=["obs_dt", "rain_day_mm"])
+                if not hist_df.empty:
+                    hist_df["day"] = pd.to_datetime(hist_df["obs_dt"], errors="coerce").dt.floor("D")
+                    hist_df = hist_df.dropna(subset=["day"])
+                    if not hist_df.empty:
+                        hist_df = (
+                            hist_df.groupby(["station_id", "day"], as_index=False)["rain_day_mm"]
+                            .max()
+                            .rename(columns={"rain_day_mm": "rain_day_mm"})
+                        )
+                        hist_frames.append(hist_df[["station_id", "day", "rain_day_mm"]].copy())
+
+                latest = recent.sort_values("obs_dt").drop_duplicates(subset=["station_id"], keep="last")
+                if latest.empty:
+                    continue
+
+                for row in latest.itertuples(index=False):
+                    try:
+                        lat_v = float(row.lat)
+                        lon_v = float(row.lon)
+                    except Exception:
+                        continue
+                    if not (math.isfinite(lat_v) and math.isfinite(lon_v)):
+                        continue
+                    rr1 = self._safe_float(row.rr1)
+                    rr3 = self._safe_float(row.rr3)
+                    rr6 = self._safe_float(row.rr6)
+                    rr12 = self._safe_float(row.rr12)
+                    rr24 = self._safe_float(row.rr24)
+                    rr = self._safe_float(row.rr)
+                    generic_rain = self._safe_float(row.precipitation)
+
+                    rain_pack = self._normalize_rain_bundle(
+                        rain_instant=rr1 if rr1 is not None else (rr if rr is not None else (rr3 if rr3 is not None else generic_rain)),
+                        rain_12h=rr12,
+                        rain_24h=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_7d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_30d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_month=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_forecast=rr1 if rr1 is not None else (rr if rr is not None else rr3),
+                    )
+
+                    all_records.append(
+                        {
+                            "station_id": str(row.station_id),
+                            "date_obs_raw": str(row.date_obs_raw),
+                            "latitude": round(lat_v, 6),
+                            "longitude": round(lon_v, 6),
+                            "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(lat_v, lon_v)), 3),
+                            "precipitation_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                            "rain_24h_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                            "rain_7d_mm": round(float(rain_pack["rain_7d_mm"]), 3),
+                            "rain_30d_mm": round(float(rain_pack["rain_30d_mm"]), 3),
+                            "rain_month_mm": round(float(rain_pack["rain_month_mm"]), 3),
+                            "rain_12h_mm": round(float(rain_pack["rain_12h_mm"]), 3),
+                            "rain_instant_mm": round(float(rain_pack["rain_instant_mm"]), 3),
+                            "rain_forecast_mm": round(float(rain_pack["rain_forecast_mm"]), 3),
+                            "rain_class": self._station_pluvio_class(
+                                float(rain_pack["rain_24h_mm"]),
+                                float(rain_pack["rain_7d_mm"]),
+                                float(rain_pack["rain_30d_mm"]),
+                            ),
+                            "source": DataSource.SYNOP_METEOFRANCE.value,
+                        }
+                    )
+            except Exception as exc:
+                logging.warning("Lecture archive SYNOP impossible (%s): %s", gz_path, exc)
+
+        all_df = pd.DataFrame(all_records)
+        if not all_df.empty:
+            all_df["date"] = pd.to_datetime(all_df.get("date_obs_raw"), errors="coerce", utc=True)
+            all_df = all_df.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+            all_df = all_df.sort_values("distance_to_lgv_km")
+
+        if hist_frames:
+            daily_hist = pd.concat(hist_frames, ignore_index=True)
+            daily_hist = daily_hist.sort_values("day").drop_duplicates(subset=["station_id", "day"], keep="last")
+            daily_hist["day"] = pd.to_datetime(daily_hist["day"], errors="coerce")
+            daily_hist["rain_day_mm"] = pd.to_numeric(daily_hist["rain_day_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            daily_hist = daily_hist.dropna(subset=["station_id", "day"]).sort_values(["station_id", "day"])
+        else:
+            daily_hist = pd.DataFrame(columns=["station_id", "day", "rain_day_mm"])
+
+        source_label = ", ".join(sorted(set(source_urls))) if source_urls else None
+        return all_df, daily_hist, source_label
 
     def _load_synop_csv_text(self, day: datetime) -> Tuple[Optional[str], str]:
         url = self._synop_url_for_date(day)
@@ -2026,7 +2319,7 @@ class LGVSeaMonitor:
                 try:
                     with open(cache_path, "r", encoding=enc, errors="ignore") as f:
                         txt = f.read()
-                    if txt and txt.strip():
+                    if txt and txt.strip() and self._looks_like_synop_csv(txt):
                         return txt
                 except Exception:
                     continue
@@ -2044,13 +2337,15 @@ class LGVSeaMonitor:
 
         try:
             response = self.session.get(url, timeout=30)
-            if response.status_code == 200 and response.text.strip():
+            if response.status_code == 200 and response.text.strip() and self._looks_like_synop_csv(response.text):
                 try:
                     with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
                         f.write(response.text)
                 except Exception:
                     pass
                 return response.text, url
+            if response.status_code == 200 and response.text.strip():
+                logging.warning("SYNOP journalier indisponible (%s): reponse non CSV", url)
         except Exception as exc:
             logging.warning("Chargement SYNOP impossible (%s): %s", url, exc)
 
@@ -2070,13 +2365,13 @@ class LGVSeaMonitor:
             except Exception:
                 continue
             for row in reader:
-                station_id = self._row_get(row, ["numer_sta", "station", "id", "ID"])
+                station_id = self._row_get(row, ["numer_sta", "geo_id_wmo", "station", "id", "ID"])
                 if not station_id:
                     continue
                 rain_day = self._synop_daily_rain_candidate(row)
                 if rain_day is None:
                     continue
-                dt_obs = self._parse_synop_obs_datetime(self._row_get(row, ["date", "Date"]))
+                dt_obs = self._parse_synop_obs_datetime(self._row_get(row, ["date", "Date", "validity_time", "reference_time"]))
                 day_iso = (dt_obs.date().isoformat() if dt_obs is not None else day.date().isoformat())
                 key = (str(station_id), day_iso)
                 prev = station_day_rain.get(key)
@@ -2097,10 +2392,10 @@ class LGVSeaMonitor:
         return out
 
     def _extract_synop_record(self, row: Dict[str, str]) -> Optional[Dict[str, object]]:
-        station_id = self._row_get(row, ["numer_sta", "station", "id", "ID"])
-        date_obs_raw = self._row_get(row, ["date", "Date"])
-        lat = self._safe_float(self._row_get(row, ["lat", "latitude", "LAT"]))
-        lon = self._safe_float(self._row_get(row, ["lon", "longitude", "LON"]))
+        station_id = self._row_get(row, ["numer_sta", "geo_id_wmo", "station", "id", "ID"])
+        date_obs_raw = self._row_get(row, ["date", "Date", "validity_time", "reference_time"])
+        lat = self._safe_float(self._row_get(row, ["lat", "latitude", "Latitude", "LAT"]))
+        lon = self._safe_float(self._row_get(row, ["lon", "longitude", "Longitude", "LON"]))
 
         if lat is None or lon is None:
             values = list(row.values())
@@ -2115,19 +2410,21 @@ class LGVSeaMonitor:
             lon = lon / 100.0
 
         rr1 = self._safe_float(row.get("rr1"))
+        rr6 = self._safe_float(row.get("rr6"))
         rr3 = self._safe_float(row.get("rr3"))
         rr12 = self._safe_float(row.get("rr12"))
         rr24 = self._safe_float(row.get("rr24"))
+        rr = self._safe_float(row.get("rr"))
         generic_rain = self._safe_float(row.get("precipitation"))
 
         rain_pack = self._normalize_rain_bundle(
-            rain_instant=rr1 if rr1 is not None else (rr3 if rr3 is not None else generic_rain),
+            rain_instant=rr1 if rr1 is not None else (rr if rr is not None else (rr3 if rr3 is not None else generic_rain)),
             rain_12h=rr12,
-            rain_24h=rr24,
-            rain_7d=rr24,
-            rain_30d=rr24,
-            rain_month=rr24,
-            rain_forecast=rr1 if rr1 is not None else rr3,
+            rain_24h=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_7d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_30d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_month=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_forecast=rr1 if rr1 is not None else (rr if rr is not None else rr3),
         )
         rain_class = self._station_pluvio_class(
             float(rain_pack["rain_24h_mm"]),
@@ -2158,11 +2455,15 @@ class LGVSeaMonitor:
         logging.info("Pluviometrie: recuperation SYNOP Meteo-France.")
         candidates = [self._now_utc(), self._now_utc() - timedelta(days=1)]
         last_error = None
+        all_df = pd.DataFrame()
+        daily_hist = pd.DataFrame(columns=["station_id", "day", "rain_day_mm"])
+        source_url: Optional[str] = None
+        archive_used = False
 
         for day in candidates:
             url = self._synop_url_for_date(day)
             try:
-                text, source_url = self._load_synop_csv_text(day)
+                text, source_url_candidate = self._load_synop_csv_text(day)
                 if not text:
                     logging.warning("SYNOP non disponible: %s", url)
                     continue
@@ -2173,133 +2474,161 @@ class LGVSeaMonitor:
                     continue
 
                 all_df = pd.DataFrame(rows)
-                all_df["date"] = pd.to_datetime(all_df["date_obs_raw"], format="%Y%m%d%H%M%S", errors="coerce", utc=True)
-                fallback_mask = all_df["date"].isna()
-                if fallback_mask.any():
-                    all_df.loc[fallback_mask, "date"] = pd.to_datetime(
-                        all_df.loc[fallback_mask, "date_obs_raw"],
-                        errors="coerce",
-                        utc=True,
-                    )
-                all_df = all_df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
                 if all_df.empty:
                     continue
-
-                # Keep one freshest record per station and coerce numeric rain fields.
-                all_df = all_df.sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
-                for col in [
-                    "precipitation_mm",
-                    "rain_24h_mm",
-                    "rain_7d_mm",
-                    "rain_30d_mm",
-                    "rain_month_mm",
-                    "rain_12h_mm",
-                    "rain_instant_mm",
-                    "rain_forecast_mm",
-                    "distance_to_lgv_km",
-                ]:
-                    all_df[col] = pd.to_numeric(all_df.get(col), errors="coerce")
-                for col in [
-                    "precipitation_mm",
-                    "rain_24h_mm",
-                    "rain_7d_mm",
-                    "rain_30d_mm",
-                    "rain_month_mm",
-                    "rain_12h_mm",
-                    "rain_instant_mm",
-                    "rain_forecast_mm",
-                ]:
-                    all_df[col] = all_df[col].fillna(0.0).clip(lower=0.0)
-
-                # Enrich SYNOP with daily history-based cumulative rainfall per station.
                 daily_hist = self._build_synop_station_daily_history(day, history_days=self.synop_history_days)
-                if not daily_hist.empty:
-                    ref_day = pd.Timestamp(day.date())
-                    lower_7 = ref_day - pd.Timedelta(days=6)
-                    lower_30 = ref_day - pd.Timedelta(days=29)
-                    month_start = pd.Timestamp(year=ref_day.year, month=ref_day.month, day=1)
-                    daily_hist["day"] = pd.to_datetime(daily_hist["day"], errors="coerce")
-                    daily_hist = daily_hist.dropna(subset=["day"])
-                    daily_hist = daily_hist[daily_hist["day"] <= ref_day]
-                    if not daily_hist.empty:
-                        rain_7_map: Dict[str, float] = {}
-                        rain_30_map: Dict[str, float] = {}
-                        rain_month_map: Dict[str, float] = {}
-                        for station_id, grp in daily_hist.groupby("station_id"):
-                            sid = str(station_id)
-                            grp_rain = pd.to_numeric(grp["rain_day_mm"], errors="coerce").fillna(0.0)
-                            grp_day = pd.to_datetime(grp["day"], errors="coerce")
-                            rain_7_map[sid] = float(grp_rain[grp_day >= lower_7].sum())
-                            rain_30_map[sid] = float(grp_rain[grp_day >= lower_30].sum())
-                            rain_month_map[sid] = float(grp_rain[grp_day >= month_start].sum())
-
-                        sid_series = all_df["station_id"].astype(str)
-                        all_df["rain_7d_mm"] = sid_series.map(rain_7_map).fillna(all_df["rain_7d_mm"])
-                        all_df["rain_30d_mm"] = sid_series.map(rain_30_map).fillna(all_df["rain_30d_mm"])
-                        all_df["rain_month_mm"] = sid_series.map(rain_month_map).fillna(all_df["rain_month_mm"])
-
-                all_df["rain_7d_mm"] = all_df[["rain_7d_mm", "rain_24h_mm"]].max(axis=1)
-                all_df["rain_30d_mm"] = all_df[["rain_30d_mm", "rain_7d_mm"]].max(axis=1)
-                all_df["rain_month_mm"] = all_df[["rain_month_mm", "rain_24h_mm"]].max(axis=1)
-                all_df["rain_class"] = [
-                    self._station_pluvio_class(float(r24), float(r7), float(r30))
-                    for r24, r7, r30 in zip(
-                        pd.to_numeric(all_df["rain_24h_mm"], errors="coerce").fillna(0.0).tolist(),
-                        pd.to_numeric(all_df["rain_7d_mm"], errors="coerce").fillna(0.0).tolist(),
-                        pd.to_numeric(all_df["rain_30d_mm"], errors="coerce").fillna(0.0).tolist(),
-                    )
-                ]
-
-                selected_df = all_df[all_df["distance_to_lgv_km"] <= self.weather_corridor_km].copy()
-                notice = None
-                if selected_df.empty:
-                    selected_df = all_df.nsmallest(5, "distance_to_lgv_km").copy()
-                    selected_df["selection_mode"] = "nearest_fallback_top5"
-                    nearest = selected_df.iloc[0]
-                    notice = (
-                        "Aucune station meteo <= 1 km de la LGV. "
-                        f"Fallback: top 5 stations les plus proches (plus proche: {nearest['station_id']} "
-                        f"a {nearest['distance_to_lgv_km']:.2f} km)."
-                    )
-                    logging.warning(notice)
-                else:
-                    selected_df["selection_mode"] = "within_1km"
-                selected_df["rain_calc_method"] = "synop_daily_history_aggregate"
-
-                ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
-                all_path = os.path.join("data", f"synop_all_stations_{ts}.csv")
-                selected_path = os.path.join("data", f"synop_selected_lgv_{ts}.csv")
-                all_df.to_csv(all_path, index=False)
-                selected_df.to_csv(selected_path, index=False)
-                summary_path = os.path.join("data", f"weather_summary_{ts}.json")
-                self._save_json(
-                    {
-                        "timestamp_utc": self._now_utc().isoformat(),
-                        "source_url": source_url,
-                        "corridor_km": self.weather_corridor_km,
-                        "all_station_count": int(len(all_df)),
-                        "selected_station_count": int(len(selected_df)),
-                        "history_days_used": int(self.synop_history_days),
-                        "notice": notice,
-                        "all_csv": all_path,
-                        "selected_csv": selected_path,
-                    },
-                    summary_path,
-                )
-                return {
-                    "all": all_df,
-                    "selected": selected_df,
-                    "notice": notice,
-                    "source_url": source_url,
-                    "summary_path": summary_path,
-                }
+                source_url = source_url_candidate
+                break
             except Exception as exc:
                 last_error = exc
                 logging.warning("Erreur SYNOP (%s): %s", url, exc)
 
-        logging.error("Pluviometrie indisponible. Derniere erreur: %s", last_error)
-        empty = pd.DataFrame()
-        return {"all": empty, "selected": empty, "notice": "SYNOP indisponible", "source_url": None, "summary_path": None}
+        if all_df.empty:
+            try:
+                archive_day = self._now_utc()
+                archive_df, archive_hist, archive_source = self._load_synop_archive_history(
+                    archive_day,
+                    history_days=self.synop_history_days,
+                )
+                if not archive_df.empty:
+                    all_df = archive_df.copy()
+                    daily_hist = archive_hist.copy()
+                    source_url = archive_source
+                    archive_used = True
+                    logging.info("SYNOP archive data.gouv utilise: %s station(s)", len(all_df))
+            except Exception as exc:
+                last_error = exc
+                logging.warning("Fallback archive SYNOP impossible: %s", exc)
+
+        if all_df.empty:
+            logging.error("Pluviometrie indisponible. Derniere erreur: %s", last_error)
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "SYNOP indisponible", "source_url": source_url, "summary_path": None}
+
+        all_df["date"] = pd.to_datetime(all_df.get("date_obs_raw"), format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+        fallback_mask = all_df["date"].isna()
+        if fallback_mask.any():
+            all_df.loc[fallback_mask, "date"] = pd.to_datetime(
+                all_df.loc[fallback_mask, "date_obs_raw"],
+                errors="coerce",
+                utc=True,
+            )
+        all_df = all_df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
+        if all_df.empty:
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "SYNOP parse vide", "source_url": source_url, "summary_path": None}
+
+        # Keep one freshest record per station and coerce numeric rain fields.
+        all_df = all_df.sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+        for col in [
+            "precipitation_mm",
+            "rain_24h_mm",
+            "rain_7d_mm",
+            "rain_30d_mm",
+            "rain_month_mm",
+            "rain_12h_mm",
+            "rain_instant_mm",
+            "rain_forecast_mm",
+            "distance_to_lgv_km",
+        ]:
+            all_df[col] = pd.to_numeric(all_df.get(col), errors="coerce")
+        for col in [
+            "precipitation_mm",
+            "rain_24h_mm",
+            "rain_7d_mm",
+            "rain_30d_mm",
+            "rain_month_mm",
+            "rain_12h_mm",
+            "rain_instant_mm",
+            "rain_forecast_mm",
+        ]:
+            all_df[col] = all_df[col].fillna(0.0).clip(lower=0.0)
+
+        # Enrich SYNOP with daily history-based cumulative rainfall per station.
+        if not daily_hist.empty:
+            ref_day = pd.Timestamp(self._now_utc()).tz_convert("UTC").normalize()
+            lower_7 = ref_day - pd.Timedelta(days=6)
+            lower_30 = ref_day - pd.Timedelta(days=29)
+            month_start = pd.Timestamp(year=ref_day.year, month=ref_day.month, day=1, tz="UTC")
+            daily_hist["day"] = pd.to_datetime(daily_hist["day"], errors="coerce", utc=True)
+            daily_hist = daily_hist.dropna(subset=["day"])
+            daily_hist = daily_hist[daily_hist["day"] <= ref_day]
+            if not daily_hist.empty:
+                rain_7_map: Dict[str, float] = {}
+                rain_30_map: Dict[str, float] = {}
+                rain_month_map: Dict[str, float] = {}
+                for station_id, grp in daily_hist.groupby("station_id"):
+                    sid = str(station_id)
+                    grp_rain = pd.to_numeric(grp["rain_day_mm"], errors="coerce").fillna(0.0)
+                    grp_day = pd.to_datetime(grp["day"], errors="coerce")
+                    rain_7_map[sid] = float(grp_rain[grp_day >= lower_7].sum())
+                    rain_30_map[sid] = float(grp_rain[grp_day >= lower_30].sum())
+                    rain_month_map[sid] = float(grp_rain[grp_day >= month_start].sum())
+
+                sid_series = all_df["station_id"].astype(str)
+                all_df["rain_7d_mm"] = sid_series.map(rain_7_map).fillna(all_df["rain_7d_mm"])
+                all_df["rain_30d_mm"] = sid_series.map(rain_30_map).fillna(all_df["rain_30d_mm"])
+                all_df["rain_month_mm"] = sid_series.map(rain_month_map).fillna(all_df["rain_month_mm"])
+
+        all_df["rain_7d_mm"] = all_df[["rain_7d_mm", "rain_24h_mm"]].max(axis=1)
+        all_df["rain_30d_mm"] = all_df[["rain_30d_mm", "rain_7d_mm"]].max(axis=1)
+        all_df["rain_month_mm"] = all_df[["rain_month_mm", "rain_24h_mm"]].max(axis=1)
+        all_df["rain_class"] = [
+            self._station_pluvio_class(float(r24), float(r7), float(r30))
+            for r24, r7, r30 in zip(
+                pd.to_numeric(all_df["rain_24h_mm"], errors="coerce").fillna(0.0).tolist(),
+                pd.to_numeric(all_df["rain_7d_mm"], errors="coerce").fillna(0.0).tolist(),
+                pd.to_numeric(all_df["rain_30d_mm"], errors="coerce").fillna(0.0).tolist(),
+            )
+        ]
+
+        selected_df = all_df[all_df["distance_to_lgv_km"] <= self.weather_corridor_km].copy()
+        notice_parts: List[str] = []
+        if archive_used:
+            notice_parts.append("SYNOP via archive data.gouv (source officielle Meteo-France).")
+        if selected_df.empty:
+            top_n = min(10, max(1, int(len(all_df))))
+            selected_df = all_df.nsmallest(top_n, "distance_to_lgv_km").copy()
+            selected_df["selection_mode"] = "nearest_fallback_topn"
+            nearest = selected_df.iloc[0]
+            notice_parts.append(
+                f"Aucune station meteo <= {self.weather_corridor_km:.1f} km de la LGV. "
+                f"Fallback: top {top_n} stations les plus proches (plus proche: {nearest['station_id']} "
+                f"a {nearest['distance_to_lgv_km']:.2f} km)."
+            )
+            logging.warning(notice_parts[-1])
+        else:
+            selected_df["selection_mode"] = "within_lgv_corridor"
+        selected_df["rain_calc_method"] = "synop_daily_history_aggregate"
+        notice = " | ".join([x for x in notice_parts if x]) if notice_parts else None
+
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        all_path = os.path.join("data", f"synop_all_stations_{ts}.csv")
+        selected_path = os.path.join("data", f"synop_selected_lgv_{ts}.csv")
+        all_df.to_csv(all_path, index=False)
+        selected_df.to_csv(selected_path, index=False)
+        summary_path = os.path.join("data", f"weather_summary_{ts}.json")
+        self._save_json(
+            {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "source_url": source_url,
+                "corridor_km": self.weather_corridor_km,
+                "all_station_count": int(len(all_df)),
+                "selected_station_count": int(len(selected_df)),
+                "history_days_used": int(self.synop_history_days),
+                "notice": notice,
+                "all_csv": all_path,
+                "selected_csv": selected_path,
+            },
+            summary_path,
+        )
+        return {
+            "all": all_df,
+            "selected": selected_df,
+            "notice": notice,
+            "source_url": source_url,
+            "summary_path": summary_path,
+        }
 
     def _fetch_open_meteo_batch(self, batch_points: List[Tuple[float, float]]) -> List[Dict[str, object]]:
         if not batch_points:
