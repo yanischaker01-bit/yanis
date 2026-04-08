@@ -627,6 +627,24 @@ def _safe_df(records: object) -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _prepare_weather_df(weather_df: pd.DataFrame, snapshot_ts: pd.Timestamp | None) -> pd.DataFrame:
+    if weather_df.empty:
+        return weather_df.copy()
+
+    out = weather_df.copy()
+    for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "distance_to_lgv_km", "latitude", "longitude"]:
+        if col in out.columns:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
+    out["risk_level"] = out.get("rain_class", "INDETERMINE")
+    if "station_commune_name" not in out.columns:
+        out["station_commune_name"] = "Inconnue"
+    out["station_commune_name"] = out["station_commune_name"].fillna("Inconnue")
+    out = _build_weather_enhanced(out, snapshot_ts)
+    out = _deduplicate_weather_rows(out)
+    out = _stabilize_weather_station_ids(out)
+    return out
+
+
 def _unique_text_values(values: List[object]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -873,6 +891,13 @@ def _is_infoclimat_station_source(source: object) -> bool:
     if not src:
         return False
     return ("infoclimat" in src) or ("synop" in src)
+
+
+def _is_open_meteo_station_source(source: object) -> bool:
+    src = str(source or "").strip().lower()
+    if not src:
+        return False
+    return ("open" in src) and ("meteo" in src)
 
 
 def _apply_weather_source_filter(
@@ -1660,6 +1685,282 @@ def _load_sector_recent_weather_archive(lat: float, lon: float, lookback_days: i
         }
     except Exception as exc:
         return {"error": str(exc), "model": used_model}
+
+
+@st.cache_data(show_spinner=False, ttl=1200)
+def _load_live_synop_weather_pack() -> Tuple[pd.DataFrame, str]:
+    try:
+        from meteo_test import LGVSeaMonitor
+
+        monitor = LGVSeaMonitor()
+        pack = monitor.fetch_pluviometry_synop()
+        df = pack.get("all") if isinstance(pack.get("all"), pd.DataFrame) else pd.DataFrame()
+        notice = str(pack.get("notice") or "").strip()
+        src_url = str(pack.get("source_url") or "").strip()
+        if src_url:
+            notice = f"{notice} | source={src_url}" if notice else f"source={src_url}"
+        return df.copy(), notice
+    except Exception as exc:
+        return pd.DataFrame(), f"SYNOP live indisponible: {exc}"
+
+
+@st.cache_data(show_spinner=False, ttl=1200)
+def _load_live_open_meteo_weather_pack() -> Tuple[pd.DataFrame, str]:
+    try:
+        from meteo_test import LGVSeaMonitor
+
+        monitor = LGVSeaMonitor()
+        pack = monitor.fetch_pluviometry_open_meteo()
+        df = pack.get("all") if isinstance(pack.get("all"), pd.DataFrame) else pd.DataFrame()
+        notice = str(pack.get("notice") or "").strip()
+        src_url = str(pack.get("source_url") or "").strip()
+        if src_url:
+            notice = f"{notice} | source={src_url}" if notice else f"source={src_url}"
+        return df.copy(), notice
+    except Exception as exc:
+        return pd.DataFrame(), f"Open-Meteo live indisponible: {exc}"
+
+
+def _target_march_year(reference_ts: pd.Timestamp | None) -> int:
+    ts = reference_ts
+    if ts is None or pd.isna(ts):
+        ts = pd.Timestamp.now(tz="UTC")
+    if int(ts.month) < 3:
+        return int(ts.year) - 1
+    return int(ts.year)
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def _synop_month_totals_for_stations(year: int, month: int, station_ids: Tuple[str, ...]) -> pd.DataFrame:
+    wanted_ids = sorted({str(s).strip() for s in station_ids if str(s).strip()})
+    if not wanted_ids:
+        return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+
+    try:
+        from meteo_test import LGVSeaMonitor
+
+        monitor = LGVSeaMonitor()
+        gz_path, _ = monitor._download_synop_archive_gz(int(year))
+        if not gz_path:
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+    except Exception:
+        return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+
+    try:
+        preview = pd.read_csv(gz_path, sep=";", nrows=1, dtype=str, compression="gzip")
+        available = set(preview.columns.tolist())
+        wanted_cols = [
+            "numer_sta",
+            "geo_id_wmo",
+            "station",
+            "id",
+            "ID",
+            "date",
+            "Date",
+            "validity_time",
+            "reference_time",
+            "rr1",
+            "rr3",
+            "rr6",
+            "rr12",
+            "rr24",
+            "rr",
+            "precipitation",
+        ]
+        usecols = [c for c in wanted_cols if c in available]
+        if not usecols:
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+
+        raw = pd.read_csv(
+            gz_path,
+            sep=";",
+            dtype=str,
+            usecols=usecols,
+            compression="gzip",
+            low_memory=False,
+        )
+        if raw.empty:
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+
+        def _coalesce_text(frame: pd.DataFrame, cols: List[str]) -> pd.Series:
+            out = pd.Series("", index=frame.index, dtype="string")
+            for c in cols:
+                if c not in frame.columns:
+                    continue
+                cur = frame[c].astype("string").fillna("").str.strip()
+                out = out.where(out.str.len() > 0, cur)
+            return out
+
+        sid = _coalesce_text(raw, ["numer_sta", "geo_id_wmo", "station", "id", "ID"]).astype(str).str.strip()
+        obs_raw = _coalesce_text(raw, ["date", "Date", "validity_time", "reference_time"])
+        obs_dt = pd.to_datetime(obs_raw, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+        obs_fallback = pd.to_datetime(obs_raw, errors="coerce", utc=True)
+        obs_dt = obs_dt.where(obs_dt.notna(), obs_fallback)
+
+        mask = sid.isin(wanted_ids) & obs_dt.notna()
+        if not mask.any():
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+        mask = mask & (obs_dt.dt.year == int(year)) & (obs_dt.dt.month == int(month))
+        if not mask.any():
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+
+        rr_cols = [c for c in ["rr24", "rr12", "rr6", "rr3", "rr1", "rr", "precipitation"] if c in raw.columns]
+        if not rr_cols:
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+        rr = raw[rr_cols].apply(pd.to_numeric, errors="coerce")
+        rr = rr.where((rr >= 0.0) & (rr < 900.0))
+        rain_day = rr.max(axis=1, skipna=True)
+
+        subset = pd.DataFrame(
+            {
+                "station_id": sid,
+                "day": obs_dt.dt.strftime("%Y-%m-%d"),
+                "rain_day_mm": pd.to_numeric(rain_day, errors="coerce"),
+            }
+        )
+        subset = subset[mask].dropna(subset=["station_id", "day", "rain_day_mm"])
+        if subset.empty:
+            return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+        subset["rain_day_mm"] = subset["rain_day_mm"].clip(lower=0.0)
+        subset = subset.groupby(["station_id", "day"], as_index=False)["rain_day_mm"].max()
+
+        out = (
+            subset.groupby("station_id", as_index=False)
+            .agg(synop_month_mm=("rain_day_mm", "sum"), synop_obs_days=("day", "nunique"))
+            .sort_values("station_id")
+        )
+        out["synop_month_mm"] = pd.to_numeric(out["synop_month_mm"], errors="coerce").round(2)
+        out["synop_obs_days"] = pd.to_numeric(out["synop_obs_days"], errors="coerce").fillna(0).astype(int)
+        return out
+    except Exception:
+        return pd.DataFrame(columns=["station_id", "synop_month_mm", "synop_obs_days"])
+
+
+@st.cache_data(show_spinner=False, ttl=43200)
+def _open_meteo_month_total_at_point(lat: float, lon: float, year: int, month: int) -> Dict[str, object]:
+    start = pd.Timestamp(year=int(year), month=int(month), day=1, tz="UTC")
+    end = (start + pd.offsets.MonthEnd(1)).tz_convert("UTC")
+    params = {
+        "latitude": f"{float(lat):.6f}",
+        "longitude": f"{float(lon):.6f}",
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+        "daily": "precipitation_sum",
+        "timezone": "UTC",
+        "models": OPEN_METEO_MODEL,
+    }
+    used_model = OPEN_METEO_MODEL
+    try:
+        response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30, max_attempts=2)
+        if response.status_code != 200:
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            response = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30, max_attempts=2)
+            used_model = "open_meteo_default"
+        if response.status_code != 200 or not response.text.strip():
+            return {"month_mm": np.nan, "model": used_model, "error": f"HTTP {response.status_code}"}
+
+        payload = response.json()
+        entry = payload[0] if isinstance(payload, list) and payload else payload
+        if not isinstance(entry, dict):
+            return {"month_mm": np.nan, "model": used_model, "error": "payload invalide"}
+        daily = entry.get("daily", {}) if isinstance(entry.get("daily"), dict) else {}
+        vals = daily.get("precipitation_sum", []) or []
+        if not vals:
+            return {"month_mm": np.nan, "model": used_model, "error": "serie vide"}
+        series = pd.to_numeric(pd.Series(vals), errors="coerce").dropna()
+        if series.empty:
+            return {"month_mm": np.nan, "model": used_model, "error": "serie vide"}
+        return {"month_mm": round(float(series.clip(lower=0.0).sum()), 2), "model": used_model, "error": None}
+    except Exception as exc:
+        return {"month_mm": np.nan, "model": used_model, "error": str(exc)}
+
+
+def _build_march_source_comparison(
+    infoclimat_df: pd.DataFrame,
+    open_meteo_df: pd.DataFrame,
+    march_year: int,
+    top_n: int = 3,
+) -> pd.DataFrame:
+    info = infoclimat_df.copy() if isinstance(infoclimat_df, pd.DataFrame) else pd.DataFrame()
+    open_df = open_meteo_df.copy() if isinstance(open_meteo_df, pd.DataFrame) else pd.DataFrame()
+
+    if info.empty and open_df.empty:
+        return pd.DataFrame()
+
+    if not info.empty:
+        info["distance_to_lgv_km"] = pd.to_numeric(info.get("distance_to_lgv_km"), errors="coerce")
+        info = info.dropna(subset=["distance_to_lgv_km"]).sort_values("distance_to_lgv_km").head(max(1, int(top_n))).copy()
+
+    if not open_df.empty:
+        open_df["distance_to_lgv_km"] = pd.to_numeric(open_df.get("distance_to_lgv_km"), errors="coerce")
+        open_df = open_df.dropna(subset=["distance_to_lgv_km"]).sort_values("distance_to_lgv_km").head(max(1, int(top_n))).copy()
+
+    info_ids = tuple(sorted({str(s).strip() for s in info.get("station_id", pd.Series(dtype=str)).astype(str).tolist() if str(s).strip()}))
+    synop_month = _synop_month_totals_for_stations(int(march_year), 3, info_ids) if info_ids else pd.DataFrame()
+    synop_map: Dict[str, float] = {}
+    synop_days_map: Dict[str, int] = {}
+    if not synop_month.empty:
+        for row in synop_month.to_dict(orient="records"):
+            sid = str(row.get("station_id") or "").strip()
+            synop_map[sid] = float(pd.to_numeric(row.get("synop_month_mm"), errors="coerce"))
+            synop_days_map[sid] = int(pd.to_numeric(row.get("synop_obs_days"), errors="coerce"))
+
+    max_rows = max(len(info), len(open_df), 1)
+    rows: List[Dict[str, object]] = []
+    for i in range(max_rows):
+        info_row = info.iloc[i].to_dict() if i < len(info) else {}
+        open_row = open_df.iloc[i].to_dict() if i < len(open_df) else {}
+
+        info_station = str(info_row.get("station_id") or "") if info_row else ""
+        info_dist = pd.to_numeric(info_row.get("distance_to_lgv_km"), errors="coerce") if info_row else np.nan
+        info_lat = pd.to_numeric(info_row.get("latitude"), errors="coerce") if info_row else np.nan
+        info_lon = pd.to_numeric(info_row.get("longitude"), errors="coerce") if info_row else np.nan
+
+        open_station = str(open_row.get("station_id") or "") if open_row else ""
+        open_dist = pd.to_numeric(open_row.get("distance_to_lgv_km"), errors="coerce") if open_row else np.nan
+        open_lat = pd.to_numeric(open_row.get("latitude"), errors="coerce") if open_row else np.nan
+        open_lon = pd.to_numeric(open_row.get("longitude"), errors="coerce") if open_row else np.nan
+
+        if (not open_row) and info_row:
+            open_station = f"openmeteo@{info_station}" if info_station else "openmeteo@coord_infoclimat"
+            open_dist = info_dist
+            open_lat = info_lat
+            open_lon = info_lon
+
+        synop_mm = synop_map.get(info_station, np.nan) if info_station else np.nan
+        synop_days = synop_days_map.get(info_station, 0) if info_station else 0
+
+        open_mm = np.nan
+        open_model = ""
+        if pd.notna(open_lat) and pd.notna(open_lon):
+            om = _open_meteo_month_total_at_point(float(open_lat), float(open_lon), int(march_year), 3)
+            open_mm = pd.to_numeric(om.get("month_mm"), errors="coerce")
+            open_model = str(om.get("model") or "")
+
+        delta = np.nan
+        if pd.notna(synop_mm) and pd.notna(open_mm):
+            delta = float(synop_mm) - float(open_mm)
+
+        rows.append(
+            {
+                "rang": int(i + 1),
+                "station_infoclimat": info_station or None,
+                "distance_infoclimat_km": None if pd.isna(info_dist) else round(float(info_dist), 3),
+                f"mars_{int(march_year)}_infoclimat_mm": None if pd.isna(synop_mm) else round(float(synop_mm), 2),
+                "jours_synop_mars": int(synop_days),
+                "station_openmeteo": open_station or None,
+                "distance_openmeteo_km": None if pd.isna(open_dist) else round(float(open_dist), 3),
+                f"mars_{int(march_year)}_openmeteo_mm": None if pd.isna(open_mm) else round(float(open_mm), 2),
+                "modele_openmeteo": open_model or None,
+                "ecart_infoclimat_moins_openmeteo_mm": None if pd.isna(delta) else round(float(delta), 2),
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out
 
 
 def _build_commune_weather_reference(
@@ -2754,17 +3055,7 @@ sector_base_km = float(sector_base_km_raw) if not pd.isna(sector_base_km_raw) el
 snapshot_ts = pd.to_datetime(snapshot.get("timestamp_utc"), utc=True, errors="coerce")
 snapshot_age_h = _snapshot_age_hours(snapshot_ts)
 
-if not weather_df.empty:
-    for col in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm", "distance_to_lgv_km"]:
-        if col in weather_df.columns:
-            weather_df[col] = pd.to_numeric(weather_df[col], errors="coerce")
-    weather_df["risk_level"] = weather_df.get("rain_class", "INDETERMINE")
-    if "station_commune_name" not in weather_df.columns:
-        weather_df["station_commune_name"] = "Inconnue"
-    weather_df["station_commune_name"] = weather_df["station_commune_name"].fillna("Inconnue")
-    weather_df = _build_weather_enhanced(weather_df, snapshot_ts)
-    weather_df = _deduplicate_weather_rows(weather_df)
-    weather_df = _stabilize_weather_station_ids(weather_df)
+weather_df = _prepare_weather_df(weather_df, snapshot_ts)
 
 if not sectors_df.empty:
     for col in [
@@ -2841,6 +3132,13 @@ weather_source_mode = WEATHER_SOURCE_FILTER_MODES[2]
 infoclimat_max_distance_km = DEFAULT_INFOCLIMAT_LGV_MAX_DISTANCE_KM
 enforce_pluvio_quality = True
 strict_reliable_mode = DEFAULT_STRICT_RELIABLE_MODE
+enable_live_synop_assist = True
+march_compare_top_n = 3
+auto_live_open_meteo_compare = True
+live_synop_notice = ""
+live_synop_added_count = 0
+live_open_meteo_notice = ""
+live_open_meteo_added_count = 0
 map_basemap_style = "Google Satellite"
 selected_history_month_labels = MONTH_ORDER_SHORT.copy()
 selected_history_month_numbers = list(MONTH_LABELS_SHORT.keys())
@@ -2896,6 +3194,35 @@ with st.sidebar:
         step=5,
         help="Filtre les secteurs selon la probabilite IA predictive.",
     )
+    enable_live_synop_assist = st.checkbox(
+        "Secours SYNOP live si snapshot incomplet",
+        value=True,
+        help="Ajoute des stations SYNOP live (source officielle Meteo-France) si le snapshot est incomplet ou stale.",
+    )
+    march_compare_top_n = st.slider(
+        "Comparatif Mars: nb stations proches",
+        min_value=1,
+        max_value=5,
+        value=3,
+        step=1,
+    )
+    auto_live_open_meteo_compare = st.checkbox(
+        "Comparatif Mars: completer Open-Meteo live si absent",
+        value=True,
+    )
+
+    if enable_live_synop_assist:
+        src_series_for_count = weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str)
+        snapshot_infoclimat_count = int(src_series_for_count.map(_is_infoclimat_station_source).fillna(False).sum())
+        if snapshot_infoclimat_count <= 0:
+            live_synop_df, live_synop_notice = _load_live_synop_weather_pack()
+            if not live_synop_df.empty:
+                live_ref_ts = snapshot_ts if snapshot_ts is not None and not pd.isna(snapshot_ts) else pd.Timestamp.now(tz="UTC")
+                live_synop_df = _prepare_weather_df(live_synop_df, live_ref_ts)
+                before_rows = int(len(weather_df))
+                weather_df = pd.concat([weather_df, live_synop_df], ignore_index=True)
+                weather_df = _prepare_weather_df(weather_df, live_ref_ts)
+                live_synop_added_count = max(0, int(len(weather_df)) - before_rows)
 
     sources = sorted(weather_df["source"].dropna().astype(str).unique().tolist()) if "source" in weather_df.columns else []
     selected_sources = _multiselect_with_all("Sources meteo", sources, key="flt_sources")
@@ -3029,23 +3356,32 @@ if not filtered_weather.empty and str(min_risk).upper() != "TOUT":
         weather_risk_col = "risk_level"
     filtered_weather = filtered_weather[filtered_weather[weather_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
 
+if int(live_synop_added_count) > 0:
+    st.info(
+        f"Secours SYNOP live actif: +{int(live_synop_added_count)} station(s) ajoutee(s) "
+        "depuis la source officielle Meteo-France."
+    )
+elif enable_live_synop_assist and live_synop_notice:
+    st.caption(f"Notice SYNOP live: {live_synop_notice}")
+
+scope_label = "snapshot + secours live" if enable_live_synop_assist else "snapshot"
 if weather_for_context.empty and not weather_df.empty:
     if weather_source_profile == "Open-Meteo uniquement":
-        st.warning("Aucune donnee Open-Meteo disponible dans ce snapshot.")
+        st.warning(f"Aucune donnee Open-Meteo disponible dans ce {scope_label}.")
     elif weather_source_profile in {"InfoClimat/SYNOP uniquement", "InfoClimat/SYNOP <= distance LGV"}:
         if weather_source_profile == "InfoClimat/SYNOP <= distance LGV":
             st.warning(
-                f"Aucune station InfoClimat/SYNOP <= {float(infoclimat_max_distance_km):.1f} km de la LGV SEA dans ce snapshot."
+                f"Aucune station InfoClimat/SYNOP <= {float(infoclimat_max_distance_km):.1f} km de la LGV SEA dans ce {scope_label}."
             )
         else:
-            st.warning("Aucune station InfoClimat/SYNOP disponible dans ce snapshot.")
+            st.warning(f"Aucune station InfoClimat/SYNOP disponible dans ce {scope_label}.")
     elif weather_source_mode != "Toutes sources":
         if weather_source_mode == "InfoClimat/SYNOP proches LGV SEA":
             st.warning(
-                f"Aucune station InfoClimat/SYNOP <= {float(infoclimat_max_distance_km):.1f} km de la LGV SEA dans ce snapshot."
+                f"Aucune station InfoClimat/SYNOP <= {float(infoclimat_max_distance_km):.1f} km de la LGV SEA dans ce {scope_label}."
             )
         else:
-            st.warning("Aucune station InfoClimat/SYNOP disponible dans ce snapshot.")
+            st.warning(f"Aucune station InfoClimat/SYNOP disponible dans ce {scope_label}.")
     if strict_reliable_mode:
         st.info("Mode strict actif: les estimations Open-Meteo ne sont pas utilisees pour remplacer ces donnees.")
 
@@ -3068,6 +3404,50 @@ RAIN_COL_LABELS = {
 }
 effective_period_label = RAIN_COL_LABELS.get(effective_rain_col_weather, period_label)
 weather_signal_fallback = effective_rain_col_weather != rain_col_weather
+
+march_year = _target_march_year(snapshot_ts)
+march_period_start = pd.Timestamp(year=int(march_year), month=3, day=1).strftime("%Y-%m-%d")
+march_period_end = (pd.Timestamp(year=int(march_year), month=3, day=1) + pd.offsets.MonthEnd(1)).strftime("%Y-%m-%d")
+infoclimat_candidates = weather_df[
+    weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str).map(_is_infoclimat_station_source).fillna(False)
+].copy() if not weather_df.empty else pd.DataFrame()
+open_meteo_candidates = weather_df[
+    weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str).map(_is_open_meteo_station_source).fillna(False)
+].copy() if not weather_df.empty else pd.DataFrame()
+
+if open_meteo_candidates.empty and auto_live_open_meteo_compare:
+    live_open_meteo_df, live_open_meteo_notice = _load_live_open_meteo_weather_pack()
+    if not live_open_meteo_df.empty:
+        live_ref_ts = snapshot_ts if snapshot_ts is not None and not pd.isna(snapshot_ts) else pd.Timestamp.now(tz="UTC")
+        live_open_meteo_df = _prepare_weather_df(live_open_meteo_df, live_ref_ts)
+        open_meteo_candidates = live_open_meteo_df.copy()
+        live_open_meteo_added_count = int(len(live_open_meteo_df))
+
+march_comparison_df = _build_march_source_comparison(
+    infoclimat_df=infoclimat_candidates,
+    open_meteo_df=open_meteo_candidates,
+    march_year=int(march_year),
+    top_n=int(march_compare_top_n),
+)
+
+st.subheader("Comparatif Mars - InfoClimat vs Open-Meteo (stations proches)")
+st.caption(
+    f"Periode comparee: {march_period_start} -> {march_period_end} | "
+    f"Top {int(march_compare_top_n)} station(s) les plus proches par source."
+)
+if int(live_open_meteo_added_count) > 0:
+    st.caption(
+        f"Open-Meteo live ajoute pour comparatif: {int(live_open_meteo_added_count)} point(s)."
+    )
+elif auto_live_open_meteo_compare and live_open_meteo_notice:
+    st.caption(f"Notice Open-Meteo live: {live_open_meteo_notice}")
+
+if march_comparison_df.empty:
+    st.warning(
+        "Comparatif Mars indisponible: source InfoClimat/SYNOP ou Open-Meteo manquante."
+    )
+else:
+    st.dataframe(march_comparison_df, use_container_width=True, hide_index=True)
 
 manual_pk_ranges = _parse_manual_pk_ranges(manual_pk_watch_text) if enable_manual_pk_watch else []
 if not sectors_df.empty:
