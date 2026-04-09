@@ -8,7 +8,6 @@ import folium
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import plotly.graph_objects as go
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
@@ -32,11 +31,9 @@ RAIN_METRICS = {
 }
 HISTORY_SOURCES = [
     "Open-Meteo MeteoFrance",
-    "Open-Meteo Standard",
 ]
 HISTORY_SOURCE_COLORS = {
     "Open-Meteo MeteoFrance": "#1d4ed8",
-    "Open-Meteo Standard": "#0f766e",
 }
 SOURCE_RELIABILITY_HINTS = {
     "SYNOP": 95.0,
@@ -419,11 +416,6 @@ def _fetch_open_meteo_reference_points(
         used_model = str(model)
         try:
             resp = _http_get_with_retry(OPEN_METEO_FORECAST_URL, params=params, timeout=35, max_attempts=2)
-            if resp.status_code != 200:
-                fallback_params = dict(params)
-                fallback_params.pop("models", None)
-                resp = _http_get_with_retry(OPEN_METEO_FORECAST_URL, params=fallback_params, timeout=35, max_attempts=2)
-                used_model = "open_meteo_default"
             if resp.status_code != 200:
                 notices.append(f"Open-Meteo reference batch HTTP {resp.status_code}")
                 continue
@@ -1018,7 +1010,7 @@ def _build_map(
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
-    "Version pro: fiabilisation des mesures, comparaison entre stations proches, historique multi-sources (depuis 2026) et carte operative."
+    "Version pro: Open-Meteo MeteoFrance uniquement, fiabilisation des mesures, suivi stations et carte operative."
 )
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
 
@@ -1066,7 +1058,19 @@ if not infoclimat_local_df.empty:
         raw_weather_rows = [row for row in raw_weather_rows if not _is_open_meteo_source(row.get("source"))]
         raw_weather_rows.extend(open_meteo_ref_df.to_dict(orient="records"))
 
-weather_df = _safe_weather_df({"weather": raw_weather_rows})
+# Mode force: Open-Meteo MeteoFrance uniquement.
+open_meteo_only_rows = [
+    row
+    for row in raw_weather_rows
+    if _is_open_meteo_source(row.get("source"))
+    and ("meteofrance" in str(row.get("meteo_model") or "").strip().lower())
+]
+weather_df = _safe_weather_df({"weather": open_meteo_only_rows})
+if weather_df.empty:
+    st.warning(
+        "Aucune donnee Open-Meteo MeteoFrance disponible pour le moment."
+    )
+    st.stop()
 
 with st.sidebar:
     st.subheader("Filtres stations")
@@ -1101,16 +1105,8 @@ with st.sidebar:
         step=5,
         help="Ecart relatif (vs mediane des stations proches) au-dela duquel la station est marquee incoherente.",
     )
-    pair_radius_km = st.slider(
-        "Rayon appariement Open-Meteo vs InfoClimat (km)",
-        min_value=2.0,
-        max_value=60.0,
-        value=20.0,
-        step=1.0,
-    )
-
-    src_options = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-    selected_sources = _multiselect_all("Sources stations", src_options, key="plv_sources")
+    selected_sources = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    st.caption("Source active: Open-Meteo MeteoFrance uniquement")
 
     commune_options = sorted(weather_df.get("station_commune_name", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_communes = _multiselect_all("Communes stations", commune_options, key="plv_communes")
@@ -1163,11 +1159,8 @@ with st.sidebar:
         options=history_station_options,
         index=history_station_options.index(history_station_default),
     )
-    history_sources = st.multiselect(
-        "Sources historiques",
-        options=HISTORY_SOURCES,
-        default=HISTORY_SOURCES,
-    )
+    history_sources = list(HISTORY_SOURCES)
+    st.caption("Historique: Open-Meteo MeteoFrance")
     today_utc = datetime.now(timezone.utc).date()
     history_start = st.date_input(
         "Date debut",
@@ -1317,100 +1310,7 @@ if not worst_df.empty:
     worst_chart.update_layout(height=480, margin=dict(l=10, r=10, t=45, b=10))
     st.plotly_chart(worst_chart, use_container_width=True)
 
-st.subheader("Comparaison Open-Meteo vs InfoClimat (stations proches)")
-pairs_df = _build_openmeteo_vs_infoclimat_pairs(
-    stations_df=filtered_stations,
-    metric_col=metric_col,
-    max_pair_distance_km=float(pair_radius_km),
-)
-if pairs_df.empty:
-    st.info("Aucune paire Open-Meteo/InfoClimat disponible sur ce filtre. Elargis les sources ou le rayon d'appariement.")
-else:
-    pairs_df = pairs_df.copy()
-    pairs_df["delta_abs_mm"] = pd.to_numeric(pairs_df.get("delta_open_minus_info_mm"), errors="coerce").abs()
-    pairs_df["pair_label"] = pairs_df["infoclimat_station"].astype(str)
-
-    p1, p2, p3, p4 = st.columns(4)
-    p1.metric("Paires comparees", int(len(pairs_df)))
-    p2.metric("Distance moyenne paires", f"{float(pd.to_numeric(pairs_df['pair_distance_km'], errors='coerce').mean()):.1f} km")
-    p3.metric("Ecart moyen absolu", f"{float(pd.to_numeric(pairs_df['delta_abs_mm'], errors='coerce').mean()):.1f} mm")
-    p4.metric("Ecart median absolu", f"{float(pd.to_numeric(pairs_df['delta_abs_mm'], errors='coerce').median()):.1f} mm")
-
-    pair_scatter = px.scatter(
-        pairs_df,
-        x="infoclimat_mm",
-        y="open_meteo_mm",
-        color="delta_abs_pct",
-        color_continuous_scale="RdYlGn_r",
-        hover_data=[
-            "infoclimat_station",
-            "open_meteo_station",
-            "pair_distance_km",
-            "delta_open_minus_info_mm",
-            "delta_abs_pct",
-        ],
-        labels={
-            "infoclimat_mm": f"InfoClimat - {metric_label} (mm)",
-            "open_meteo_mm": f"Open-Meteo - {metric_label} (mm)",
-            "delta_abs_pct": "Ecart absolu (%)",
-        },
-        title="Comparaison point a point Open-Meteo vs InfoClimat",
-    )
-    max_axis = float(
-        max(
-            1.0,
-            pd.to_numeric(pairs_df["infoclimat_mm"], errors="coerce").max(),
-            pd.to_numeric(pairs_df["open_meteo_mm"], errors="coerce").max(),
-        )
-    )
-    pair_scatter.add_trace(
-        go.Scatter(
-            x=[0.0, max_axis],
-            y=[0.0, max_axis],
-            mode="lines",
-            name="Reference y=x",
-            line=dict(color="#111827", width=2, dash="dash"),
-            hoverinfo="skip",
-        )
-    )
-    pair_scatter.update_layout(height=430, margin=dict(l=10, r=10, t=45, b=10))
-    st.plotly_chart(pair_scatter, use_container_width=True)
-
-    pair_bar = px.bar(
-        pairs_df.sort_values("delta_abs_mm", ascending=True).tail(30),
-        x="delta_abs_mm",
-        y="pair_label",
-        orientation="h",
-        color="delta_abs_pct",
-        color_continuous_scale="RdYlGn_r",
-        hover_data=[
-            "open_meteo_station",
-            "pair_distance_km",
-            "infoclimat_mm",
-            "open_meteo_mm",
-            "delta_open_minus_info_mm",
-        ],
-        labels={"delta_abs_mm": f"Ecart absolu {metric_label} (mm)", "pair_label": "Station InfoClimat"},
-        title="Top ecarts entre stations appariees",
-    )
-    pair_bar.update_layout(height=520, margin=dict(l=10, r=10, t=45, b=10))
-    st.plotly_chart(pair_bar, use_container_width=True)
-
-    pairs_cols = [
-        "infoclimat_station",
-        "open_meteo_station",
-        "pair_distance_km",
-        "infoclimat_mm",
-        "open_meteo_mm",
-        "delta_open_minus_info_mm",
-        "delta_abs_pct",
-    ]
-    pairs_cols = [c for c in pairs_cols if c in pairs_df.columns]
-    st.dataframe(
-        pairs_df[pairs_cols].sort_values("delta_abs_pct", ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+st.caption("Comparatif Open-Meteo vs InfoClimat desactive: application verrouillee sur Open-Meteo MeteoFrance.")
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
