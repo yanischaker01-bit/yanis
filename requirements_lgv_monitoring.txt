@@ -3,6 +3,7 @@ pandas
 requests
 schedule
 shapely
-streamlit
+streamlit==1.54.0
 streamlit-folium
-
+altair==5.5.0
+typing_extensions>=4.12.2
