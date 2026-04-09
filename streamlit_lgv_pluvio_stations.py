@@ -7,20 +7,11 @@ from typing import Dict, List, Tuple
 import folium
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
-
-try:
-    import altair as alt
-
-    ALT_AVAILABLE = True
-    ALT_IMPORT_ERROR = ""
-except Exception as exc:  # pragma: no cover - defensive import fallback for cloud env mismatches
-    alt = None
-    ALT_AVAILABLE = False
-    ALT_IMPORT_ERROR = str(exc)
-
 
 SNAPSHOT_LATEST = Path("reports/streamlit_snapshot_latest.json")
 REMOTE_SNAPSHOT_URLS = [
@@ -55,6 +46,20 @@ SOURCE_RELIABILITY_HINTS = {
     "METEOFRANCE": 93.0,
     "OPEN_METEO": 82.0,
     "NASA": 78.0,
+}
+MAP_TILE_STYLES = {
+    "Google Hybrid": {
+        "tiles": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+        "attr": "Google",
+    },
+    "Google Satellite": {
+        "tiles": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+        "attr": "Google",
+    },
+    "OpenStreetMap": {
+        "tiles": "OpenStreetMap",
+        "attr": "OpenStreetMap",
+    },
 }
 
 
@@ -115,6 +120,34 @@ def _safe_weather_df(payload: Dict[str, object]) -> pd.DataFrame:
             df[col] = default
         else:
             df[col] = df[col].fillna(default).astype(str)
+    station_name_candidates = []
+    for name_col in ["station_name", "name", "nom", "libelle_station", "libelle", "nom_station"]:
+        if name_col in df.columns:
+            station_name_candidates.append(df[name_col].fillna("").astype(str).str.strip())
+    if station_name_candidates:
+        station_name = station_name_candidates[0].copy()
+        for ser in station_name_candidates[1:]:
+            station_name = station_name.where(station_name.astype(str).str.len() > 0, ser)
+    else:
+        station_name = pd.Series("", index=df.index, dtype=str)
+    commune_name = df["station_commune_name"].fillna("Inconnue").astype(str).str.strip()
+    station_id = df["station_id"].fillna("station_inconnue").astype(str).str.strip()
+    station_name = station_name.fillna("").astype(str).str.strip()
+    invalid_name = (
+        (station_name.str.len() <= 0)
+        | (station_name.str.lower() == station_id.str.lower())
+        | (station_name.str.lower().isin({"station_inconnue", "inconnue", "unknown"}))
+    )
+    station_name = station_name.where(~invalid_name, commune_name)
+    station_name = station_name.where(station_name.astype(str).str.len() > 0, commune_name)
+    df["station_name"] = station_name.astype(str)
+
+    same_as_commune = station_name.str.lower() == commune_name.str.lower()
+    df["station_display"] = np.where(
+        same_as_commune,
+        commune_name + " (" + station_id + ")",
+        station_name + " (" + commune_name + " - " + station_id + ")",
+    )
     if "obs_ts_utc" in df.columns:
         obs_ts = pd.to_datetime(df["obs_ts_utc"], utc=True, errors="coerce")
     else:
@@ -135,6 +168,32 @@ def _multiselect_all(label: str, options: List[str], key: str) -> List[str]:
     if not picked or "Tout" in picked:
         return clean
     return [v for v in clean if v in picked]
+
+
+def _is_infoclimat_source(source: object) -> bool:
+    txt = str(source or "").strip().lower()
+    return ("infoclimat" in txt) or ("synop" in txt)
+
+
+def _is_open_meteo_source(source: object) -> bool:
+    txt = str(source or "").strip().lower()
+    return ("open" in txt) and ("meteo" in txt)
+
+
+def _create_base_map(location: List[float], zoom_start: int, map_style: str) -> folium.Map:
+    style = MAP_TILE_STYLES.get(str(map_style), MAP_TILE_STYLES["Google Hybrid"])
+    tile_value = str(style.get("tiles") or "")
+    if tile_value.lower().startswith("http"):
+        fmap = folium.Map(location=location, zoom_start=zoom_start, tiles=None)
+        folium.TileLayer(
+            tiles=tile_value,
+            attr=str(style.get("attr") or "Map"),
+            name=str(map_style),
+            overlay=False,
+            control=False,
+        ).add_to(fmap)
+        return fmap
+    return folium.Map(location=location, zoom_start=zoom_start, tiles=tile_value)
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -364,6 +423,68 @@ def _nearest_neighbors_for_station(
     return work
 
 
+def _build_openmeteo_vs_infoclimat_pairs(
+    stations_df: pd.DataFrame,
+    metric_col: str,
+    max_pair_distance_km: float,
+) -> pd.DataFrame:
+    if stations_df.empty:
+        return pd.DataFrame()
+    work = stations_df.copy()
+    work["latitude"] = pd.to_numeric(work.get("latitude"), errors="coerce")
+    work["longitude"] = pd.to_numeric(work.get("longitude"), errors="coerce")
+    work[metric_col] = pd.to_numeric(work.get(metric_col), errors="coerce")
+    work = work.dropna(subset=["latitude", "longitude", metric_col]).copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    infoclimat_df = work[work["source"].map(_is_infoclimat_source)].copy()
+    open_meteo_df = work[work["source"].map(_is_open_meteo_source)].copy()
+    if infoclimat_df.empty or open_meteo_df.empty:
+        return pd.DataFrame()
+
+    pairs: List[Dict[str, object]] = []
+    max_dist = float(max_pair_distance_km)
+    for _, info_row in infoclimat_df.iterrows():
+        info_lat = float(info_row["latitude"])
+        info_lon = float(info_row["longitude"])
+        candidates = open_meteo_df.copy()
+        candidates["pair_dist_km"] = candidates.apply(
+            lambda r: _haversine_km(info_lat, info_lon, float(r["latitude"]), float(r["longitude"])),
+            axis=1,
+        )
+        candidates = candidates[candidates["pair_dist_km"] <= max_dist].copy()
+        if candidates.empty:
+            continue
+        candidates = candidates.sort_values("pair_dist_km", ascending=True)
+        open_row = candidates.iloc[0]
+        info_val = float(pd.to_numeric(info_row.get(metric_col), errors="coerce"))
+        open_val = float(pd.to_numeric(open_row.get(metric_col), errors="coerce"))
+        delta = open_val - info_val
+        rel_pct = 100.0 * abs(delta) / max(5.0, info_val)
+        pairs.append(
+            {
+                "infoclimat_station_id": str(info_row.get("station_id") or ""),
+                "infoclimat_station": str(info_row.get("station_display") or info_row.get("station_id") or ""),
+                "infoclimat_commune": str(info_row.get("station_commune_name") or ""),
+                "infoclimat_source": str(info_row.get("source") or ""),
+                "infoclimat_mm": info_val,
+                "open_meteo_station_id": str(open_row.get("station_id") or ""),
+                "open_meteo_station": str(open_row.get("station_display") or open_row.get("station_id") or ""),
+                "open_meteo_commune": str(open_row.get("station_commune_name") or ""),
+                "open_meteo_source": str(open_row.get("source") or ""),
+                "open_meteo_mm": open_val,
+                "pair_distance_km": float(pd.to_numeric(open_row.get("pair_dist_km"), errors="coerce")),
+                "delta_open_minus_info_mm": delta,
+                "delta_abs_pct": rel_pct,
+            }
+        )
+    if not pairs:
+        return pd.DataFrame()
+    out = pd.DataFrame(pairs).sort_values("delta_abs_pct", ascending=False).reset_index(drop=True)
+    return out
+
+
 @st.cache_data(show_spinner=False, ttl=300)
 def _load_snapshot_payload() -> Tuple[Dict[str, object], str]:
     errors: List[str] = []
@@ -528,12 +649,17 @@ def _load_history_multi_source(
     return history, notices
 
 
-def _build_map(lgv_lines: List[List[Tuple[float, float]]], stations_df: pd.DataFrame, rain_col: str) -> folium.Map:
+def _build_map(
+    lgv_lines: List[List[Tuple[float, float]]],
+    stations_df: pd.DataFrame,
+    rain_col: str,
+    map_style: str,
+) -> folium.Map:
     center = [46.2, 0.2]
     all_pts = [pt for line in lgv_lines for pt in line]
     if all_pts:
         center = [float(np.mean([p[0] for p in all_pts])), float(np.mean([p[1] for p in all_pts]))]
-    m = folium.Map(location=center, zoom_start=7, tiles="CartoDB positron")
+    m = _create_base_map(location=center, zoom_start=7, map_style=map_style)
 
     for line in lgv_lines:
         folium.PolyLine(line, color="#1d4ed8", weight=4, opacity=0.85, tooltip="Trace LGV SEA").add_to(m)
@@ -561,7 +687,7 @@ def _build_map(lgv_lines: List[List[Tuple[float, float]]], stations_df: pd.DataF
         rel_score = pd.to_numeric(row.get("reliability_score"), errors="coerce")
         near_delta_pct = pd.to_numeric(row.get("near_delta_metric_pct"), errors="coerce")
         popup = (
-            f"<b>Station:</b> {row.get('station_id')}<br>"
+            f"<b>Station:</b> {row.get('station_display')}<br>"
             f"<b>Commune:</b> {row.get('station_commune_name')}<br>"
             f"<b>Source:</b> {row.get('source')}<br>"
             f"<b>Distance LGV:</b> {row.get('distance_to_lgv_km')} km<br>"
@@ -578,7 +704,7 @@ def _build_map(lgv_lines: List[List[Tuple[float, float]]], stations_df: pd.DataF
             fill_opacity=0.85,
             weight=1,
             popup=folium.Popup(popup, max_width=380),
-            tooltip=f"{row.get('station_id')} | {float(val):.1f} mm",
+            tooltip=f"{row.get('station_display')} | {float(val):.1f} mm",
         ).add_to(m)
 
     return m
@@ -589,11 +715,7 @@ st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
     "Version pro: fiabilisation des mesures, comparaison entre stations proches, historique multi-sources (depuis 2026) et carte operative."
 )
-if not ALT_AVAILABLE:
-    st.warning(
-        "Altair indisponible sur cet environnement Cloud: bascule automatique en mode graphique Streamlit natif. "
-        + f"Detail import: {ALT_IMPORT_ERROR}"
-    )
+st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
 
 try:
     snapshot, snapshot_source = _load_snapshot_payload()
@@ -613,6 +735,7 @@ with st.sidebar:
 
     metric_label = st.selectbox("Indicateur pluvio", list(RAIN_METRICS.keys()), index=1)
     metric_col = RAIN_METRICS[metric_label]
+    map_style = st.selectbox("Fond de carte", list(MAP_TILE_STYLES.keys()), index=0)
 
     max_distance_km = st.slider("Distance max a la LGV (km)", min_value=1.0, max_value=80.0, value=25.0, step=0.5)
     compare_radius_km = st.slider(
@@ -637,6 +760,13 @@ with st.sidebar:
         step=5,
         help="Ecart relatif (vs mediane des stations proches) au-dela duquel la station est marquee incoherente.",
     )
+    pair_radius_km = st.slider(
+        "Rayon appariement Open-Meteo vs InfoClimat (km)",
+        min_value=2.0,
+        max_value=60.0,
+        value=20.0,
+        step=1.0,
+    )
 
     src_options = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_sources = _multiselect_all("Sources snapshot", src_options, key="plv_sources")
@@ -654,12 +784,12 @@ if not filtered_stations.empty and selected_sources:
 if not filtered_stations.empty and selected_communes:
     filtered_stations = filtered_stations[filtered_stations["station_commune_name"].astype(str).isin(selected_communes)]
 
-station_options = filtered_stations.get("station_id", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+station_options = filtered_stations.get("station_display", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
 station_options = sorted(station_options)
 with st.sidebar:
-    selected_stations = _multiselect_all("Stations", station_options, key="plv_station_ids")
+    selected_stations = _multiselect_all("Stations (nom commune)", station_options, key="plv_station_display")
 if not filtered_stations.empty and selected_stations:
-    filtered_stations = filtered_stations[filtered_stations["station_id"].astype(str).isin(selected_stations)]
+    filtered_stations = filtered_stations[filtered_stations["station_display"].astype(str).isin(selected_stations)]
 
 if filtered_stations.empty:
     st.warning("Aucune station sur ce filtre.")
@@ -685,11 +815,12 @@ with st.sidebar:
     top_n = st.slider("Top stations (graphe)", min_value=1, max_value=top_n_max, value=min(25, top_n_max), step=1)
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
-    history_station_default = str(filtered_stations.iloc[0]["station_id"])
-    history_station_id = st.selectbox(
+    history_station_default = str(filtered_stations.iloc[0]["station_display"])
+    history_station_options = sorted(filtered_stations["station_display"].astype(str).unique().tolist())
+    history_station_display = st.selectbox(
         "Station historique",
-        options=sorted(filtered_stations["station_id"].astype(str).unique().tolist()),
-        index=sorted(filtered_stations["station_id"].astype(str).unique().tolist()).index(history_station_default),
+        options=history_station_options,
+        index=history_station_options.index(history_station_default),
     )
     history_sources = st.multiselect(
         "Sources historiques",
@@ -713,8 +844,9 @@ with st.sidebar:
 if history_end < history_start:
     history_start, history_end = history_end, history_start
 
-selected_station_df = filtered_stations[filtered_stations["station_id"].astype(str) == str(history_station_id)].copy()
+selected_station_df = filtered_stations[filtered_stations["station_display"].astype(str) == str(history_station_display)].copy()
 selected_station = selected_station_df.iloc[0].to_dict() if not selected_station_df.empty else filtered_stations.iloc[0].to_dict()
+history_station_id = str(selected_station.get("station_id") or "")
 
 reliability_series = pd.to_numeric(filtered_stations.get("reliability_score"), errors="coerce").fillna(0.0)
 reliability_class = filtered_stations.get("reliability_class", pd.Series("A_VERIFIER", index=filtered_stations.index)).astype(str)
@@ -736,32 +868,25 @@ else:
     st.caption(f"Snapshot: {snapshot_source} | timestamp inconnu")
 
 st.subheader("Carte stations pluvio autour de la LGV SEA")
-map_obj = _build_map(lgv_lines, filtered_stations, metric_col)
+map_obj = _build_map(lgv_lines, filtered_stations, metric_col, map_style=map_style)
 st_folium(map_obj, height=640, use_container_width=True)
+st.caption(f"Fond de carte actif: {map_style}")
 
 st.subheader(f"Top {int(top_n)} stations - {metric_label}")
 top_df = filtered_stations.head(int(top_n)).copy()
-top_df["station_label"] = top_df["station_id"].astype(str) + " | " + top_df["station_commune_name"].astype(str)
-if ALT_AVAILABLE:
-    bar_chart = (
-        alt.Chart(top_df)
-        .mark_bar()
-        .encode(
-            x=alt.X(f"{metric_col}:Q", title=f"Pluie {metric_label} (mm)"),
-            y=alt.Y("station_label:N", sort="-x", title="Station"),
-            color=alt.Color("source:N", title="Source snapshot"),
-            tooltip=["station_id", "station_commune_name", "source", "distance_to_lgv_km", metric_col, "date_obs_raw"],
-        )
-    )
-    st.altair_chart(bar_chart, use_container_width=True)
-else:
-    st.caption("Mode fallback sans Altair: classement tabulaire.")
-    fallback_top = top_df[["station_label", metric_col, "source", "distance_to_lgv_km"]].copy()
-    st.dataframe(
-        fallback_top.sort_values(metric_col, ascending=False),
-        use_container_width=True,
-        hide_index=True,
-    )
+top_df["station_label"] = top_df.get("station_display", top_df["station_id"].astype(str))
+top_bar = px.bar(
+    top_df.sort_values(metric_col, ascending=True),
+    x=metric_col,
+    y="station_label",
+    color="source",
+    orientation="h",
+    title=f"Top stations - {metric_label}",
+    labels={metric_col: f"Pluie {metric_label} (mm)", "station_label": "Station"},
+    hover_data=["station_id", "station_commune_name", "distance_to_lgv_km", "date_obs_raw"],
+)
+top_bar.update_layout(height=460, margin=dict(l=10, r=10, t=45, b=10))
+st.plotly_chart(top_bar, use_container_width=True)
 
 st.subheader("Comparaison inter-stations de proximite (mode pro)")
 pro_view = filtered_stations.copy()
@@ -777,87 +902,141 @@ scatter_df = pro_view.dropna(subset=["metric_station_mm", "metric_mediane_voisin
 if scatter_df.empty:
     st.info("Comparaison proximite indisponible sur ce filtre.")
 else:
-    if ALT_AVAILABLE:
-        scatter = (
-            alt.Chart(scatter_df)
-            .mark_circle(size=85, opacity=0.85)
-            .encode(
-                x=alt.X("metric_mediane_voisins_mm:Q", title=f"Mediane voisins proches - {metric_label} (mm)"),
-                y=alt.Y("metric_station_mm:Q", title=f"Station - {metric_label} (mm)"),
-                color=alt.Color("reliability_class:N", title="Fiabilite"),
-                shape=alt.Shape("incoherent:N", title="Incoherence"),
-                tooltip=[
-                    "station_id",
-                    "station_commune_name",
-                    "source",
-                    "distance_to_lgv_km",
-                    "metric_station_mm",
-                    "metric_mediane_voisins_mm",
-                    "ecart_voisins_mm",
-                    "ecart_voisins_pct",
-                    "nb_voisins",
-                    "fiabilite_100",
-                    "reliability_class",
-                    "reliability_reason",
-                ],
-            )
-        )
-        st.altair_chart(scatter.interactive(), use_container_width=True)
-    else:
-        st.caption("Mode fallback: tableau comparatif (Altair indisponible).")
-        st.dataframe(
-            scatter_df[
-                [
-                    "station_id",
-                    "station_commune_name",
-                    "metric_station_mm",
-                    "metric_mediane_voisins_mm",
-                    "ecart_voisins_mm",
-                    "ecart_voisins_pct",
-                    "fiabilite_100",
-                    "reliability_class",
-                    "reliability_reason",
-                ]
-            ].sort_values("ecart_voisins_pct", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
+    scatter = px.scatter(
+        scatter_df,
+        x="metric_mediane_voisins_mm",
+        y="metric_station_mm",
+        color="reliability_class",
+        symbol="incoherent",
+        hover_data=[
+            "station_display",
+            "source",
+            "distance_to_lgv_km",
+            "ecart_voisins_mm",
+            "ecart_voisins_pct",
+            "nb_voisins",
+            "fiabilite_100",
+            "reliability_reason",
+        ],
+        labels={
+            "metric_mediane_voisins_mm": f"Mediane voisins proches - {metric_label} (mm)",
+            "metric_station_mm": f"Station - {metric_label} (mm)",
+        },
+        title="Coherence station vs voisins proches",
+    )
+    scatter.update_layout(height=430, margin=dict(l=10, r=10, t=45, b=10))
+    st.plotly_chart(scatter, use_container_width=True)
 
 worst_df = pro_view.sort_values(["incoherent", "ecart_voisins_pct", "fiabilite_100"], ascending=[False, False, True], na_position="last").head(30).copy()
 if not worst_df.empty:
-    worst_df["station_label"] = worst_df["station_id"].astype(str) + " | " + worst_df["station_commune_name"].astype(str)
-    if ALT_AVAILABLE:
-        worst_chart = (
-            alt.Chart(worst_df)
-            .mark_bar()
-            .encode(
-                x=alt.X("ecart_voisins_pct:Q", title=f"Ecart relatif vs mediane voisins ({metric_label}, %)"),
-                y=alt.Y("station_label:N", sort="-x", title="Station"),
-                color=alt.Color("reliability_class:N", title="Fiabilite"),
-                tooltip=[
-                    "station_id",
-                    "station_commune_name",
-                    "source",
-                    "nb_voisins",
-                    "ecart_voisins_mm",
-                    "ecart_voisins_pct",
-                    "fiabilite_100",
-                    "reliability_class",
-                    "reliability_reason",
-                ],
-            )
+    worst_df["station_label"] = worst_df.get("station_display", worst_df["station_id"].astype(str))
+    worst_chart = px.bar(
+        worst_df.sort_values("ecart_voisins_pct", ascending=True),
+        x="ecart_voisins_pct",
+        y="station_label",
+        color="reliability_class",
+        orientation="h",
+        hover_data=["source", "ecart_voisins_mm", "nb_voisins", "fiabilite_100", "reliability_reason"],
+        labels={"ecart_voisins_pct": f"Ecart relatif vs mediane voisins ({metric_label}, %)", "station_label": "Station"},
+        title="Stations les plus en ecart avec leurs voisines",
+    )
+    worst_chart.update_layout(height=480, margin=dict(l=10, r=10, t=45, b=10))
+    st.plotly_chart(worst_chart, use_container_width=True)
+
+st.subheader("Comparaison Open-Meteo vs InfoClimat (stations proches)")
+pairs_df = _build_openmeteo_vs_infoclimat_pairs(
+    stations_df=filtered_stations,
+    metric_col=metric_col,
+    max_pair_distance_km=float(pair_radius_km),
+)
+if pairs_df.empty:
+    st.info("Aucune paire Open-Meteo/InfoClimat disponible sur ce filtre. Elargis les sources ou le rayon d'appariement.")
+else:
+    pairs_df = pairs_df.copy()
+    pairs_df["delta_abs_mm"] = pd.to_numeric(pairs_df.get("delta_open_minus_info_mm"), errors="coerce").abs()
+    pairs_df["pair_label"] = pairs_df["infoclimat_station"].astype(str)
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("Paires comparees", int(len(pairs_df)))
+    p2.metric("Distance moyenne paires", f"{float(pd.to_numeric(pairs_df['pair_distance_km'], errors='coerce').mean()):.1f} km")
+    p3.metric("Ecart moyen absolu", f"{float(pd.to_numeric(pairs_df['delta_abs_mm'], errors='coerce').mean()):.1f} mm")
+    p4.metric("Ecart median absolu", f"{float(pd.to_numeric(pairs_df['delta_abs_mm'], errors='coerce').median()):.1f} mm")
+
+    pair_scatter = px.scatter(
+        pairs_df,
+        x="infoclimat_mm",
+        y="open_meteo_mm",
+        color="delta_abs_pct",
+        color_continuous_scale="RdYlGn_r",
+        hover_data=[
+            "infoclimat_station",
+            "open_meteo_station",
+            "pair_distance_km",
+            "delta_open_minus_info_mm",
+            "delta_abs_pct",
+        ],
+        labels={
+            "infoclimat_mm": f"InfoClimat - {metric_label} (mm)",
+            "open_meteo_mm": f"Open-Meteo - {metric_label} (mm)",
+            "delta_abs_pct": "Ecart absolu (%)",
+        },
+        title="Comparaison point a point Open-Meteo vs InfoClimat",
+    )
+    max_axis = float(
+        max(
+            1.0,
+            pd.to_numeric(pairs_df["infoclimat_mm"], errors="coerce").max(),
+            pd.to_numeric(pairs_df["open_meteo_mm"], errors="coerce").max(),
         )
-        st.altair_chart(worst_chart, use_container_width=True)
-    else:
-        st.caption("Mode fallback sans Altair: ecarts majeurs en tableau.")
-        fallback_worst = worst_df[
-            ["station_label", "ecart_voisins_pct", "ecart_voisins_mm", "reliability_score", "reliability_class"]
-        ].copy()
-        st.dataframe(
-            fallback_worst.sort_values("ecart_voisins_pct", ascending=False),
-            use_container_width=True,
-            hide_index=True,
+    )
+    pair_scatter.add_trace(
+        go.Scatter(
+            x=[0.0, max_axis],
+            y=[0.0, max_axis],
+            mode="lines",
+            name="Reference y=x",
+            line=dict(color="#111827", width=2, dash="dash"),
+            hoverinfo="skip",
         )
+    )
+    pair_scatter.update_layout(height=430, margin=dict(l=10, r=10, t=45, b=10))
+    st.plotly_chart(pair_scatter, use_container_width=True)
+
+    pair_bar = px.bar(
+        pairs_df.sort_values("delta_abs_mm", ascending=True).tail(30),
+        x="delta_abs_mm",
+        y="pair_label",
+        orientation="h",
+        color="delta_abs_pct",
+        color_continuous_scale="RdYlGn_r",
+        hover_data=[
+            "open_meteo_station",
+            "pair_distance_km",
+            "infoclimat_mm",
+            "open_meteo_mm",
+            "delta_open_minus_info_mm",
+        ],
+        labels={"delta_abs_mm": f"Ecart absolu {metric_label} (mm)", "pair_label": "Station InfoClimat"},
+        title="Top ecarts entre stations appariees",
+    )
+    pair_bar.update_layout(height=520, margin=dict(l=10, r=10, t=45, b=10))
+    st.plotly_chart(pair_bar, use_container_width=True)
+
+    pairs_cols = [
+        "infoclimat_station",
+        "open_meteo_station",
+        "pair_distance_km",
+        "infoclimat_mm",
+        "open_meteo_mm",
+        "delta_open_minus_info_mm",
+        "delta_abs_pct",
+    ]
+    pairs_cols = [c for c in pairs_cols if c in pairs_df.columns]
+    st.dataframe(
+        pairs_df[pairs_cols].sort_values("delta_abs_pct", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
@@ -865,11 +1044,12 @@ neighbor_df = _nearest_neighbors_for_station(
     metric_col=metric_col,
     compare_radius_km=float(compare_radius_km),
 )
-st.markdown(f"**Voisins de comparaison pour la station {history_station_id}**")
+st.markdown(f"**Voisins de comparaison pour la station {selected_station.get('station_display')}**")
 if neighbor_df.empty:
     st.info("Aucune station voisine dans le rayon de comparaison.")
 else:
     ncols = [
+        "station_display",
         "station_id",
         "station_commune_name",
         "source",
@@ -886,6 +1066,8 @@ else:
 
 st.subheader("Table stations filtrees")
 station_cols = [
+    "station_display",
+    "station_name",
     "station_id",
     "source",
     "station_commune_name",
@@ -908,7 +1090,7 @@ station_cols = [
 station_cols = [c for c in station_cols if c in filtered_stations.columns]
 st.dataframe(filtered_stations[station_cols], use_container_width=True, hide_index=True)
 
-st.subheader(f"Historique station: {selected_station.get('station_id')} ({selected_station.get('station_commune_name')})")
+st.subheader(f"Historique station: {selected_station.get('station_display')}")
 if not history_sources:
     st.info("Selectionne au moins une source historique.")
 else:
@@ -947,74 +1129,42 @@ else:
                 .rename(columns={"precip_mm": "monthly_mm"})
             )
 
-            if ALT_AVAILABLE:
-                daily_chart = (
-                    alt.Chart(hist_df)
-                    .mark_line(point=False)
-                    .encode(
-                        x=alt.X("date:T", title="Date"),
-                        y=alt.Y("precip_mm:Q", title="Pluie journaliere (mm)"),
-                        color=alt.Color(
-                            "source:N",
-                            scale=alt.Scale(
-                                domain=list(HISTORY_SOURCE_COLORS.keys()),
-                                range=list(HISTORY_SOURCE_COLORS.values()),
-                            ),
-                        ),
-                        tooltip=["source", "date", "precip_mm"],
-                    )
-                )
-                st.altair_chart(daily_chart.interactive(), use_container_width=True)
+            daily_chart = px.line(
+                hist_df,
+                x="date",
+                y="precip_mm",
+                color="source",
+                color_discrete_map=HISTORY_SOURCE_COLORS,
+                labels={"date": "Date", "precip_mm": "Pluie journaliere (mm)", "source": "Source historique"},
+                title="Historique journalier multi-sources",
+            )
+            daily_chart.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+            st.plotly_chart(daily_chart, use_container_width=True)
 
-                roll_chart = (
-                    alt.Chart(roll_df)
-                    .mark_line(point=False, strokeDash=[8, 3])
-                    .encode(
-                        x=alt.X("date:T", title="Date"),
-                        y=alt.Y("rolling_7d_mm:Q", title="Cumul glissant 7 jours (mm)"),
-                        color=alt.Color("source:N", title="Source historique"),
-                        tooltip=["source", "date", "rolling_7d_mm"],
-                    )
-                )
-                st.altair_chart(roll_chart.interactive(), use_container_width=True)
+            roll_chart = px.line(
+                roll_df,
+                x="date",
+                y="rolling_7d_mm",
+                color="source",
+                color_discrete_map=HISTORY_SOURCE_COLORS,
+                labels={"date": "Date", "rolling_7d_mm": "Cumul glissant 7 jours (mm)", "source": "Source historique"},
+                title="Cumul glissant 7 jours",
+            )
+            roll_chart.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+            st.plotly_chart(roll_chart, use_container_width=True)
 
-                monthly_chart = (
-                    alt.Chart(monthly)
-                    .mark_bar()
-                    .encode(
-                        x=alt.X("ym:N", title="Mois"),
-                        y=alt.Y("monthly_mm:Q", title="Cumul mensuel (mm)"),
-                        color=alt.Color("source:N", title="Source historique"),
-                        xOffset=alt.XOffset("source:N"),
-                        tooltip=["source", "ym", "monthly_mm"],
-                    )
-                )
-                st.altair_chart(monthly_chart, use_container_width=True)
-            else:
-                st.caption("Mode fallback: graphiques historiques en rendu Streamlit natif.")
-                daily_fallback = (
-                    hist_df.pivot_table(index="date", columns="source", values="precip_mm", aggfunc="mean")
-                    .sort_index()
-                    .fillna(0.0)
-                )
-                st.markdown("**Historique journalier (tableau pivot)**")
-                st.dataframe(daily_fallback.reset_index(), use_container_width=True, hide_index=True)
-
-                roll_fallback = (
-                    roll_df.pivot_table(index="date", columns="source", values="rolling_7d_mm", aggfunc="mean")
-                    .sort_index()
-                    .fillna(0.0)
-                )
-                st.markdown("**Cumul glissant 7 jours (tableau pivot)**")
-                st.dataframe(roll_fallback.reset_index(), use_container_width=True, hide_index=True)
-
-                monthly_fallback = (
-                    monthly.pivot_table(index="ym", columns="source", values="monthly_mm", aggfunc="mean")
-                    .sort_index()
-                    .fillna(0.0)
-                )
-                st.markdown("**Cumuls mensuels (tableau pivot)**")
-                st.dataframe(monthly_fallback.reset_index(), use_container_width=True, hide_index=True)
+            monthly_chart = px.bar(
+                monthly,
+                x="ym",
+                y="monthly_mm",
+                color="source",
+                barmode="group",
+                color_discrete_map=HISTORY_SOURCE_COLORS,
+                labels={"ym": "Mois", "monthly_mm": "Cumul mensuel (mm)", "source": "Source historique"},
+                title="Cumuls mensuels par source",
+            )
+            monthly_chart.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+            st.plotly_chart(monthly_chart, use_container_width=True)
 
             summary = (
                 hist_df.groupby("source", as_index=False)
