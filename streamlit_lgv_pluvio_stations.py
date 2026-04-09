@@ -20,8 +20,8 @@ REMOTE_SNAPSHOT_URLS = [
 ]
 
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_MODEL_METEOFRANCE = "meteofrance_seamless"
-NASA_POWER_DAILY_URL = "https://power.larc.nasa.gov/api/temporal/daily/point"
 
 HISTORY_MIN_DATE = date(2026, 1, 1)
 RAIN_METRICS = {
@@ -33,20 +33,18 @@ RAIN_METRICS = {
 HISTORY_SOURCES = [
     "Open-Meteo MeteoFrance",
     "Open-Meteo Standard",
-    "NASA POWER",
 ]
 HISTORY_SOURCE_COLORS = {
     "Open-Meteo MeteoFrance": "#1d4ed8",
     "Open-Meteo Standard": "#0f766e",
-    "NASA POWER": "#b45309",
 }
 SOURCE_RELIABILITY_HINTS = {
-    "SYNOP": 96.0,
-    "INFOCLIMAT": 94.0,
+    "SYNOP": 95.0,
+    "INFOCLIMAT": 95.0,
     "METEOFRANCE": 93.0,
-    "OPEN_METEO": 82.0,
-    "NASA": 78.0,
+    "OPEN_METEO": 84.0,
 }
+LOCAL_INFOCLIMAT_RADIUS_KM = 120.0
 MAP_TILE_STYLES = {
     "Google Hybrid": {
         "tiles": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
@@ -172,7 +170,7 @@ def _multiselect_all(label: str, options: List[str], key: str) -> List[str]:
 
 def _is_infoclimat_source(source: object) -> bool:
     txt = str(source or "").strip().lower()
-    return ("infoclimat" in txt) or ("synop" in txt)
+    return ("infoclimat" in txt) or ("info_climat" in txt) or ("synop" in txt)
 
 
 def _is_open_meteo_source(source: object) -> bool:
@@ -194,6 +192,362 @@ def _create_base_map(location: List[float], zoom_start: int, map_style: str) -> 
         ).add_to(fmap)
         return fmap
     return folium.Map(location=location, zoom_start=zoom_start, tiles=tile_value)
+
+
+def _find_latest_file(patterns: List[str]) -> Path | None:
+    candidates: List[Path] = []
+    for pat in patterns:
+        candidates.extend([p for p in Path(".").glob(pat) if p.is_file()])
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _clean_station_label(txt: object) -> str:
+    out = str(txt or "").strip()
+    if not out:
+        return ""
+    out = out.replace("_", " ").replace(";", " ")
+    out = " ".join(out.split())
+    return out
+
+
+def _infer_commune_from_station_name(station_name: object) -> str:
+    name = _clean_station_label(station_name)
+    if not name:
+        return "Inconnue"
+    for sep in [" [", " / ", " - "]:
+        if sep in name:
+            name = name.split(sep)[0].strip()
+    if "-" in name:
+        name = name.split("-")[0].strip()
+    return name.title() if name else "Inconnue"
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _load_synop_station_name_lookup(station_ids: Tuple[str, ...]) -> Dict[str, str]:
+    targets = {str(s).strip() for s in station_ids if str(s).strip()}
+    if not targets:
+        return {}
+    cache_path = _find_latest_file(["data/synop_cache/synop_*.csv.gz", "data/synop_cache/synop.*.csv"])
+    if cache_path is None:
+        return {}
+
+    out: Dict[str, str] = {}
+    try:
+        usecols_candidates = {"geo_id_wmo", "numer_sta", "station_id", "name", "nom_station", "libelle_station"}
+        stream = pd.read_csv(
+            cache_path,
+            sep=";",
+            dtype=str,
+            usecols=lambda c: c in usecols_candidates,
+            chunksize=250000,
+            low_memory=False,
+            compression="infer",
+        )
+        for chunk in stream:
+            if chunk.empty:
+                continue
+            id_col = next((c for c in ["geo_id_wmo", "numer_sta", "station_id"] if c in chunk.columns), None)
+            name_col = next((c for c in ["name", "libelle_station", "nom_station"] if c in chunk.columns), None)
+            if id_col is None or name_col is None:
+                continue
+            sub = chunk[[id_col, name_col]].dropna(subset=[id_col])
+            if sub.empty:
+                continue
+            sub[id_col] = sub[id_col].astype(str).str.strip()
+            sub = sub[sub[id_col].isin(targets)]
+            if sub.empty:
+                continue
+            for _, row in sub.iterrows():
+                sid = str(row[id_col]).strip()
+                name = _clean_station_label(row[name_col])
+                if sid and name and sid not in out:
+                    out[sid] = name
+            if len(out) >= len(targets):
+                break
+    except Exception:
+        return out
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _load_infoclimat_synop_local(max_distance_km: float = LOCAL_INFOCLIMAT_RADIUS_KM) -> Tuple[pd.DataFrame, str]:
+    synop_path = _find_latest_file(["data/synop_all_stations_*.csv"])
+    if synop_path is None:
+        return pd.DataFrame(), "InfoClimat/SYNOP local: aucun fichier synop_all_stations_*.csv disponible."
+    try:
+        df = pd.read_csv(synop_path, dtype=str)
+    except Exception as exc:
+        return pd.DataFrame(), f"InfoClimat/SYNOP local: lecture impossible ({exc})."
+    if df.empty:
+        return pd.DataFrame(), f"InfoClimat/SYNOP local: fichier vide ({synop_path.name})."
+    if "station_id" not in df.columns:
+        return pd.DataFrame(), f"InfoClimat/SYNOP local: colonne station_id absente ({synop_path.name})."
+
+    for col in [
+        "distance_to_lgv_km",
+        "latitude",
+        "longitude",
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "rain_12h_mm",
+        "rain_instant_mm",
+        "rain_forecast_mm",
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    if "distance_to_lgv_km" in df.columns:
+        df = df[pd.to_numeric(df["distance_to_lgv_km"], errors="coerce").fillna(9999.0) <= float(max_distance_km)].copy()
+    if df.empty:
+        return pd.DataFrame(), f"InfoClimat/SYNOP local: 0 station <= {float(max_distance_km):.0f} km LGV."
+
+    station_ids = tuple(sorted(df["station_id"].astype(str).str.strip().dropna().unique().tolist()))
+    name_lookup = _load_synop_station_name_lookup(station_ids)
+    df["station_name"] = df["station_id"].astype(str).map(name_lookup).fillna("")
+    df["station_name"] = df["station_name"].astype(str).map(_clean_station_label)
+
+    if "station_commune_name" not in df.columns:
+        df["station_commune_name"] = ""
+    df["station_commune_name"] = df["station_commune_name"].fillna("").astype(str).str.strip()
+    df["station_commune_name"] = np.where(
+        df["station_commune_name"].astype(str).str.len() > 0,
+        df["station_commune_name"],
+        df["station_name"].map(_infer_commune_from_station_name),
+    )
+    df["station_commune_name"] = df["station_commune_name"].fillna("Inconnue").astype(str)
+
+    if "source" not in df.columns:
+        df["source"] = "infoclimat_synop"
+    else:
+        df["source"] = "infoclimat_synop"
+    if "selection_mode" not in df.columns:
+        df["selection_mode"] = "infoclimat_synop_local_cache"
+    if "date_obs_raw" not in df.columns:
+        if "date" in df.columns:
+            df["date_obs_raw"] = df["date"].fillna("").astype(str)
+        else:
+            df["date_obs_raw"] = ""
+    if "rain_class" not in df.columns:
+        df["rain_class"] = "NORMAL"
+
+    keep_cols = [
+        "station_id",
+        "station_name",
+        "station_commune_name",
+        "date_obs_raw",
+        "latitude",
+        "longitude",
+        "distance_to_lgv_km",
+        "precipitation_mm",
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "rain_12h_mm",
+        "rain_instant_mm",
+        "rain_forecast_mm",
+        "rain_class",
+        "source",
+        "selection_mode",
+    ]
+    keep_cols = [c for c in keep_cols if c in df.columns]
+    out = df[keep_cols].copy()
+    notice = (
+        f"InfoClimat/SYNOP local: {len(out)} stations proches chargees "
+        f"(<= {float(max_distance_km):.0f} km LGV) depuis {synop_path.name}."
+    )
+    return out, notice
+
+
+def _build_open_meteo_reference_key(stations_df: pd.DataFrame) -> Tuple[Tuple[str, str, str, float, float, float], ...]:
+    if stations_df.empty:
+        return tuple()
+    work = stations_df.copy()
+    work["latitude"] = pd.to_numeric(work.get("latitude"), errors="coerce")
+    work["longitude"] = pd.to_numeric(work.get("longitude"), errors="coerce")
+    if "distance_to_lgv_km" not in work.columns:
+        work["distance_to_lgv_km"] = np.nan
+    work["distance_to_lgv_km"] = pd.to_numeric(work.get("distance_to_lgv_km"), errors="coerce")
+    work = work.dropna(subset=["latitude", "longitude"]).copy()
+    work = work.drop_duplicates(subset=["station_id"], keep="first")
+    if work.empty:
+        return tuple()
+    rows: List[Tuple[str, str, str, float, float, float]] = []
+    for _, row in work.iterrows():
+        sid = str(row.get("station_id") or "").strip()
+        if not sid:
+            continue
+        sname = _clean_station_label(row.get("station_name") or "")
+        commune = str(row.get("station_commune_name") or "").strip()
+        lat = float(pd.to_numeric(row.get("latitude"), errors="coerce"))
+        lon = float(pd.to_numeric(row.get("longitude"), errors="coerce"))
+        dist = pd.to_numeric(row.get("distance_to_lgv_km"), errors="coerce")
+        dist_val = float(dist) if pd.notna(dist) else -1.0
+        rows.append((sid, sname, commune, lat, lon, dist_val))
+    rows.sort(key=lambda x: x[0])
+    return tuple(rows)
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _fetch_open_meteo_reference_points(
+    points_key: Tuple[Tuple[str, str, str, float, float, float], ...],
+    model: str = OPEN_METEO_MODEL_METEOFRANCE,
+) -> Tuple[pd.DataFrame, str]:
+    if not points_key:
+        return pd.DataFrame(), "Open-Meteo reference: aucun point station."
+
+    rows: List[Dict[str, object]] = []
+    notices: List[str] = []
+    batch_size = 20
+    now_utc = datetime.now(timezone.utc)
+    for i in range(0, len(points_key), batch_size):
+        batch = list(points_key[i : i + batch_size])
+        lats = ",".join(f"{float(x[3]):.6f}" for x in batch)
+        lons = ",".join(f"{float(x[4]):.6f}" for x in batch)
+        params: Dict[str, object] = {
+            "latitude": lats,
+            "longitude": lons,
+            "hourly": "precipitation",
+            "past_days": 35,
+            "forecast_days": 1,
+            "timezone": "UTC",
+            "models": model,
+        }
+        used_model = str(model)
+        try:
+            resp = _http_get_with_retry(OPEN_METEO_FORECAST_URL, params=params, timeout=35, max_attempts=2)
+            if resp.status_code != 200:
+                fallback_params = dict(params)
+                fallback_params.pop("models", None)
+                resp = _http_get_with_retry(OPEN_METEO_FORECAST_URL, params=fallback_params, timeout=35, max_attempts=2)
+                used_model = "open_meteo_default"
+            if resp.status_code != 200:
+                notices.append(f"Open-Meteo reference batch HTTP {resp.status_code}")
+                continue
+            payload = resp.json()
+            entries = payload if isinstance(payload, list) else [payload]
+            if not entries:
+                continue
+            for idx, entry in enumerate(entries):
+                if idx >= len(batch):
+                    break
+                sid, sname, commune, lat, lon, dist = batch[idx]
+                hourly = entry.get("hourly") if isinstance(entry, dict) else {}
+                times = hourly.get("time") if isinstance(hourly, dict) else []
+                precs = hourly.get("precipitation") if isinstance(hourly, dict) else []
+                points: List[Tuple[datetime, float, str]] = []
+                for t, p in zip(times if isinstance(times, list) else [], precs if isinstance(precs, list) else []):
+                    dt = pd.to_datetime(t, utc=True, errors="coerce")
+                    mm = pd.to_numeric(p, errors="coerce")
+                    if pd.isna(dt) or pd.isna(mm):
+                        continue
+                    points.append((dt.to_pydatetime(), max(0.0, float(mm)), str(t)))
+
+                past = [x for x in points if x[0] <= now_utc]
+                future = [x for x in points if x[0] > now_utc]
+                past.sort(key=lambda x: x[0])
+                future.sort(key=lambda x: x[0])
+                if past:
+                    dt_obs, rain_instant, dt_str = past[-1]
+                else:
+                    dt_obs = now_utc
+                    rain_instant = 0.0
+                    dt_str = now_utc.strftime("%Y-%m-%dT%H:%M")
+                lower_12h = now_utc - pd.Timedelta(hours=12)
+                lower_24h = now_utc - pd.Timedelta(hours=24)
+                lower_7d = now_utc - pd.Timedelta(days=7)
+                lower_30d = now_utc - pd.Timedelta(days=30)
+                month_start = datetime(now_utc.year, now_utc.month, 1, tzinfo=timezone.utc)
+                rain_12h = float(sum(v for dt, v, _ in past if dt > lower_12h))
+                rain_24h = float(sum(v for dt, v, _ in past if dt > lower_24h))
+                rain_7d = float(sum(v for dt, v, _ in past if dt > lower_7d))
+                rain_30d = float(sum(v for dt, v, _ in past if dt > lower_30d))
+                rain_month = float(sum(v for dt, v, _ in past if dt >= month_start))
+                rain_forecast = float(sum(v for dt, v, _ in future[:12])) if future else 0.0
+                station_name = _clean_station_label(sname) or f"Open-Meteo ref {sid}"
+                rows.append(
+                    {
+                        "station_id": f"openmeteo_ref_{sid}",
+                        "station_name": station_name,
+                        "station_commune_name": commune or _infer_commune_from_station_name(station_name),
+                        "date_obs_raw": dt_str,
+                        "latitude": float(lat),
+                        "longitude": float(lon),
+                        "distance_to_lgv_km": None if float(dist) < 0 else float(dist),
+                        "precipitation_mm": round(rain_24h, 3),
+                        "rain_24h_mm": round(rain_24h, 3),
+                        "rain_7d_mm": round(max(rain_24h, rain_7d), 3),
+                        "rain_30d_mm": round(max(rain_7d, rain_30d), 3),
+                        "rain_month_mm": round(max(rain_24h, rain_month), 3),
+                        "rain_12h_mm": round(max(rain_instant, rain_12h), 3),
+                        "rain_instant_mm": round(rain_instant, 3),
+                        "rain_forecast_mm": round(max(0.0, rain_forecast), 3),
+                        "rain_class": "NORMAL",
+                        "source": "open_meteo_reference",
+                        "selection_mode": "open_meteo_at_infoclimat_station",
+                        "meteo_model": used_model,
+                        "station_ref_id": sid,
+                        "date": dt_obs.isoformat(),
+                    }
+                )
+        except Exception as exc:
+            notices.append(f"Open-Meteo reference batch erreur: {exc}")
+            continue
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        detail = " | ".join(notices[:2]) if notices else "aucune donnee retournee"
+        return out, f"Open-Meteo reference: {detail}."
+    out = out.sort_values("distance_to_lgv_km", na_position="last").reset_index(drop=True)
+    model_values = out.get("meteo_model", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+    model_name = str(model_values[0]) if model_values else "open_meteo_unknown"
+    notice = f"Open-Meteo reference: {len(out)} points calcules sur stations InfoClimat ({model_name})."
+    if notices:
+        notice = notice + " | " + " | ".join(notices[:2])
+    return out, notice
+
+
+def _build_source_metadata_table(stations_df: pd.DataFrame) -> pd.DataFrame:
+    if stations_df.empty or "source" not in stations_df.columns:
+        return pd.DataFrame()
+    rows: List[Dict[str, object]] = []
+    for source in sorted(stations_df["source"].dropna().astype(str).unique().tolist()):
+        sub = stations_df[stations_df["source"].astype(str) == str(source)].copy()
+        age_h = pd.to_numeric(sub.get("obs_age_h"), errors="coerce")
+        rel = pd.to_numeric(sub.get("reliability_score"), errors="coerce")
+        dist = pd.to_numeric(sub.get("distance_to_lgv_km"), errors="coerce")
+        if _is_infoclimat_source(source):
+            data_type = "Stations observations (SYNOP/InfoClimat)"
+            refresh = "Horaire (observation)"
+            method = "Mesures station + calcul cumuls 24h/7j/30j puis controle de coherence locale."
+            limits = "Densite de stations variable selon secteurs LGV."
+        elif _is_open_meteo_source(source):
+            data_type = "Modele numerique (Open-Meteo)"
+            refresh = "Horaire (reanalyse + prevision courte)"
+            method = "Interpolation modele sur coordonnees station puis cumuls glissants."
+            limits = "Ce n'est pas une mesure directe de pluviometre."
+        else:
+            data_type = "Source diverse"
+            refresh = "Selon source"
+            method = "Harmonisation interne puis controle de coherence."
+            limits = "Metadonnees limitees."
+        rows.append(
+            {
+                "source": source,
+                "type_data": data_type,
+                "maj_typique": refresh,
+                "nb_stations": int(len(sub)),
+                "distance_mediane_lgv_km": round(float(dist.median()), 2) if dist.notna().any() else np.nan,
+                "age_median_h": round(float(age_h.median()), 1) if age_h.notna().any() else np.nan,
+                "fiabilite_mediane_100": round(float(rel.median()), 1) if rel.notna().any() else np.nan,
+                "methodologie": method,
+                "limites": limits,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["fiabilite_mediane_100", "nb_stations"], ascending=[False, False], na_position="last")
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -218,8 +572,6 @@ def _source_reliability_note(source: object) -> float:
         return SOURCE_RELIABILITY_HINTS["METEOFRANCE"]
     if ("OPEN" in txt) and ("METEO" in txt):
         return SOURCE_RELIABILITY_HINTS["OPEN_METEO"]
-    if "NASA" in txt:
-        return SOURCE_RELIABILITY_HINTS["NASA"]
     return 70.0
 
 
@@ -357,10 +709,13 @@ def _build_proximity_quality(
     work["near_delta_metric_pct"] = pd.Series(near_delta_metric_pct_list, index=work.index, dtype=float)
     work["coherence_note"] = pd.Series(coherence_note_list, index=work.index, dtype=float).clip(lower=0.0, upper=100.0)
 
+    work["reliability_source_component"] = 0.42 * pd.to_numeric(work["source_note"], errors="coerce").fillna(70.0)
+    work["reliability_freshness_component"] = 0.23 * pd.to_numeric(work["freshness_note"], errors="coerce").fillna(40.0)
+    work["reliability_coherence_component"] = 0.35 * pd.to_numeric(work["coherence_note"], errors="coerce").fillna(55.0)
     work["reliability_score"] = (
-        0.42 * pd.to_numeric(work["source_note"], errors="coerce").fillna(70.0)
-        + 0.23 * pd.to_numeric(work["freshness_note"], errors="coerce").fillna(40.0)
-        + 0.35 * pd.to_numeric(work["coherence_note"], errors="coerce").fillna(55.0)
+        pd.to_numeric(work["reliability_source_component"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(work["reliability_freshness_component"], errors="coerce").fillna(0.0)
+        + pd.to_numeric(work["reliability_coherence_component"], errors="coerce").fillna(0.0)
     ).clip(lower=0.0, upper=100.0)
     work["reliability_class"] = work["reliability_score"].map(_reliability_class)
     work["reliability_reason"] = np.where(
@@ -549,49 +904,6 @@ def _fetch_open_meteo_history(
         return pd.DataFrame(), f"{source_label}: {exc}"
 
 
-@st.cache_data(show_spinner=False, ttl=21600)
-def _fetch_nasa_power_history(lat: float, lon: float, start_day: str, end_day: str) -> Tuple[pd.DataFrame, str]:
-    start_fmt = str(start_day).replace("-", "")
-    end_fmt = str(end_day).replace("-", "")
-    params = {
-        "parameters": "PRECTOTCORR",
-        "community": "AG",
-        "longitude": f"{float(lon):.6f}",
-        "latitude": f"{float(lat):.6f}",
-        "start": start_fmt,
-        "end": end_fmt,
-        "format": "JSON",
-    }
-    try:
-        resp = _http_get_with_retry(NASA_POWER_DAILY_URL, params=params, timeout=35, max_attempts=2)
-        if resp.status_code != 200:
-            return pd.DataFrame(), f"NASA POWER: HTTP {resp.status_code}"
-        payload = resp.json()
-        data_obj = (
-            (((payload or {}).get("properties") or {}).get("parameter") or {}).get("PRECTOTCORR", {})
-            if isinstance(payload, dict)
-            else {}
-        )
-        if not isinstance(data_obj, dict) or not data_obj:
-            return pd.DataFrame(), "NASA POWER: vide"
-        rows: List[Dict[str, object]] = []
-        for ymd, val in data_obj.items():
-            dt = pd.to_datetime(str(ymd), format="%Y%m%d", utc=True, errors="coerce")
-            mm = pd.to_numeric(val, errors="coerce")
-            if pd.isna(dt) or pd.isna(mm):
-                continue
-            if float(mm) < 0.0:
-                continue
-            rows.append({"date": dt, "precip_mm": float(mm), "source": "NASA POWER"})
-        out = pd.DataFrame(rows)
-        if out.empty:
-            return out, "NASA POWER: aucune valeur exploitable"
-        out["precip_mm"] = pd.to_numeric(out["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
-        return out[["date", "precip_mm", "source"]], ""
-    except Exception as exc:
-        return pd.DataFrame(), f"NASA POWER: {exc}"
-
-
 def _load_history_multi_source(
     lat: float,
     lon: float,
@@ -627,13 +939,6 @@ def _load_history_multi_source(
             source_label="Open-Meteo Standard",
             model=None,
         )
-        if not df.empty:
-            blocks.append(df)
-        if note:
-            notices.append(note)
-
-    if "NASA POWER" in selected_sources:
-        df, note = _fetch_nasa_power_history(lat=lat, lon=lon, start_day=start_iso, end_day=end_iso)
         if not df.empty:
             blocks.append(df)
         if note:
@@ -723,9 +1028,45 @@ except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-weather_df = _safe_weather_df(snapshot)
 lgv_lines = _extract_lgv_lines(snapshot)
 snapshot_ts = pd.to_datetime(snapshot.get("timestamp_utc"), utc=True, errors="coerce")
+raw_snapshot_weather = snapshot.get("weather", []) if isinstance(snapshot, dict) else []
+raw_snapshot_weather = [row for row in raw_snapshot_weather if isinstance(row, dict)]
+
+data_build_notices: List[str] = []
+infoclimat_local_df, infoclimat_local_notice = _load_infoclimat_synop_local(max_distance_km=LOCAL_INFOCLIMAT_RADIUS_KM)
+if infoclimat_local_notice:
+    data_build_notices.append(infoclimat_local_notice)
+
+raw_weather_rows = list(raw_snapshot_weather)
+if not infoclimat_local_df.empty:
+    known_communes = {
+        str(row.get("station_id") or "").strip(): str(row.get("station_commune_name") or "").strip()
+        for row in raw_snapshot_weather
+        if str(row.get("station_id") or "").strip()
+    }
+    infoclimat_local_df = infoclimat_local_df.copy()
+    infoclimat_local_df["station_commune_name"] = np.where(
+        infoclimat_local_df["station_id"].astype(str).map(known_communes).fillna("").astype(str).str.len() > 0,
+        infoclimat_local_df["station_id"].astype(str).map(known_communes).fillna("").astype(str),
+        infoclimat_local_df.get("station_commune_name", pd.Series("Inconnue", index=infoclimat_local_df.index))
+        .fillna("Inconnue")
+        .astype(str),
+    )
+    raw_weather_rows = [row for row in raw_weather_rows if not _is_infoclimat_source(row.get("source"))]
+    raw_weather_rows.extend(infoclimat_local_df.to_dict(orient="records"))
+
+open_meteo_ref_df = pd.DataFrame()
+if not infoclimat_local_df.empty:
+    ref_points_key = _build_open_meteo_reference_key(infoclimat_local_df)
+    open_meteo_ref_df, open_meteo_ref_notice = _fetch_open_meteo_reference_points(ref_points_key)
+    if open_meteo_ref_notice:
+        data_build_notices.append(open_meteo_ref_notice)
+    if not open_meteo_ref_df.empty:
+        raw_weather_rows = [row for row in raw_weather_rows if not _is_open_meteo_source(row.get("source"))]
+        raw_weather_rows.extend(open_meteo_ref_df.to_dict(orient="records"))
+
+weather_df = _safe_weather_df({"weather": raw_weather_rows})
 
 with st.sidebar:
     st.subheader("Filtres stations")
@@ -769,7 +1110,7 @@ with st.sidebar:
     )
 
     src_options = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-    selected_sources = _multiselect_all("Sources snapshot", src_options, key="plv_sources")
+    selected_sources = _multiselect_all("Sources stations", src_options, key="plv_sources")
 
     commune_options = sorted(weather_df.get("station_commune_name", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_communes = _multiselect_all("Communes stations", commune_options, key="plv_communes")
@@ -866,6 +1207,39 @@ if snapshot_ts is not None and not pd.isna(snapshot_ts):
     st.caption(f"Snapshot: {snapshot_source} | timestamp_utc={snapshot_ts.isoformat()}")
 else:
     st.caption(f"Snapshot: {snapshot_source} | timestamp inconnu")
+if data_build_notices:
+    st.caption(" | ".join([n for n in data_build_notices if n][:3]))
+
+st.subheader("Fiabilite & Metadonnees sources")
+st.caption("Score fiabilite station = 0.42*note_source + 0.23*fraicheur_obs + 0.35*coherence_locale.")
+source_meta_df = _build_source_metadata_table(filtered_stations)
+if source_meta_df.empty:
+    st.info("Metadonnees sources indisponibles sur ce filtre.")
+else:
+    st.dataframe(source_meta_df, use_container_width=True, hide_index=True)
+with st.expander("Detail du calcul de fiabilite par station", expanded=False):
+    rel_cols = [
+        "station_display",
+        "source",
+        "source_note",
+        "freshness_note",
+        "coherence_note",
+        "reliability_source_component",
+        "reliability_freshness_component",
+        "reliability_coherence_component",
+        "reliability_score",
+        "reliability_class",
+        "reliability_reason",
+        "obs_age_h",
+        "near_station_count",
+        "near_delta_metric_pct",
+    ]
+    rel_cols = [c for c in rel_cols if c in filtered_stations.columns]
+    st.dataframe(
+        filtered_stations[rel_cols].sort_values("reliability_score", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 st.subheader("Carte stations pluvio autour de la LGV SEA")
 map_obj = _build_map(lgv_lines, filtered_stations, metric_col, map_style=map_style)
@@ -1082,6 +1456,12 @@ station_cols = [
     "near_median_metric_mm",
     "near_delta_metric_mm",
     "near_delta_metric_pct",
+    "source_note",
+    "freshness_note",
+    "coherence_note",
+    "reliability_source_component",
+    "reliability_freshness_component",
+    "reliability_coherence_component",
     "reliability_score",
     "reliability_class",
     "reliability_reason",
