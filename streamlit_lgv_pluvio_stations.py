@@ -4,13 +4,22 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import altair as alt
 import folium
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from streamlit_folium import st_folium
+
+try:
+    import altair as alt
+
+    ALT_AVAILABLE = True
+    ALT_IMPORT_ERROR = ""
+except Exception as exc:  # pragma: no cover - defensive import fallback for cloud env mismatches
+    alt = None
+    ALT_AVAILABLE = False
+    ALT_IMPORT_ERROR = str(exc)
 
 
 SNAPSHOT_LATEST = Path("reports/streamlit_snapshot_latest.json")
@@ -580,6 +589,11 @@ st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
     "Version pro: fiabilisation des mesures, comparaison entre stations proches, historique multi-sources (depuis 2026) et carte operative."
 )
+if not ALT_AVAILABLE:
+    st.warning(
+        "Altair indisponible sur cet environnement Cloud: bascule automatique en mode graphique Streamlit natif. "
+        + f"Detail import: {ALT_IMPORT_ERROR}"
+    )
 
 try:
     snapshot, snapshot_source = _load_snapshot_payload()
@@ -728,17 +742,21 @@ st_folium(map_obj, height=640, use_container_width=True)
 st.subheader(f"Top {int(top_n)} stations - {metric_label}")
 top_df = filtered_stations.head(int(top_n)).copy()
 top_df["station_label"] = top_df["station_id"].astype(str) + " | " + top_df["station_commune_name"].astype(str)
-bar_chart = (
-    alt.Chart(top_df)
-    .mark_bar()
-    .encode(
-        x=alt.X(f"{metric_col}:Q", title=f"Pluie {metric_label} (mm)"),
-        y=alt.Y("station_label:N", sort="-x", title="Station"),
-        color=alt.Color("source:N", title="Source snapshot"),
-        tooltip=["station_id", "station_commune_name", "source", "distance_to_lgv_km", metric_col, "date_obs_raw"],
+if ALT_AVAILABLE:
+    bar_chart = (
+        alt.Chart(top_df)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{metric_col}:Q", title=f"Pluie {metric_label} (mm)"),
+            y=alt.Y("station_label:N", sort="-x", title="Station"),
+            color=alt.Color("source:N", title="Source snapshot"),
+            tooltip=["station_id", "station_commune_name", "source", "distance_to_lgv_km", metric_col, "date_obs_raw"],
+        )
     )
-)
-st.altair_chart(bar_chart, use_container_width=True)
+    st.altair_chart(bar_chart, use_container_width=True)
+else:
+    fallback_top = top_df[["station_label", metric_col]].copy().set_index("station_label")
+    st.bar_chart(fallback_top)
 
 st.subheader("Comparaison inter-stations de proximite (mode pro)")
 pro_view = filtered_stations.copy()
@@ -754,56 +772,80 @@ scatter_df = pro_view.dropna(subset=["metric_station_mm", "metric_mediane_voisin
 if scatter_df.empty:
     st.info("Comparaison proximite indisponible sur ce filtre.")
 else:
-    scatter = (
-        alt.Chart(scatter_df)
-        .mark_circle(size=85, opacity=0.85)
-        .encode(
-            x=alt.X("metric_mediane_voisins_mm:Q", title=f"Mediane voisins proches - {metric_label} (mm)"),
-            y=alt.Y("metric_station_mm:Q", title=f"Station - {metric_label} (mm)"),
-            color=alt.Color("reliability_class:N", title="Fiabilite"),
-            shape=alt.Shape("incoherent:N", title="Incoherence"),
-            tooltip=[
-                "station_id",
-                "station_commune_name",
-                "source",
-                "distance_to_lgv_km",
-                "metric_station_mm",
-                "metric_mediane_voisins_mm",
-                "ecart_voisins_mm",
-                "ecart_voisins_pct",
-                "nb_voisins",
-                "fiabilite_100",
-                "reliability_class",
-                "reliability_reason",
-            ],
+    if ALT_AVAILABLE:
+        scatter = (
+            alt.Chart(scatter_df)
+            .mark_circle(size=85, opacity=0.85)
+            .encode(
+                x=alt.X("metric_mediane_voisins_mm:Q", title=f"Mediane voisins proches - {metric_label} (mm)"),
+                y=alt.Y("metric_station_mm:Q", title=f"Station - {metric_label} (mm)"),
+                color=alt.Color("reliability_class:N", title="Fiabilite"),
+                shape=alt.Shape("incoherent:N", title="Incoherence"),
+                tooltip=[
+                    "station_id",
+                    "station_commune_name",
+                    "source",
+                    "distance_to_lgv_km",
+                    "metric_station_mm",
+                    "metric_mediane_voisins_mm",
+                    "ecart_voisins_mm",
+                    "ecart_voisins_pct",
+                    "nb_voisins",
+                    "fiabilite_100",
+                    "reliability_class",
+                    "reliability_reason",
+                ],
+            )
         )
-    )
-    st.altair_chart(scatter.interactive(), use_container_width=True)
+        st.altair_chart(scatter.interactive(), use_container_width=True)
+    else:
+        st.caption("Mode fallback: tableau comparatif (Altair indisponible).")
+        st.dataframe(
+            scatter_df[
+                [
+                    "station_id",
+                    "station_commune_name",
+                    "metric_station_mm",
+                    "metric_mediane_voisins_mm",
+                    "ecart_voisins_mm",
+                    "ecart_voisins_pct",
+                    "fiabilite_100",
+                    "reliability_class",
+                    "reliability_reason",
+                ]
+            ].sort_values("ecart_voisins_pct", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 worst_df = pro_view.sort_values(["incoherent", "ecart_voisins_pct", "fiabilite_100"], ascending=[False, False, True], na_position="last").head(30).copy()
 if not worst_df.empty:
     worst_df["station_label"] = worst_df["station_id"].astype(str) + " | " + worst_df["station_commune_name"].astype(str)
-    worst_chart = (
-        alt.Chart(worst_df)
-        .mark_bar()
-        .encode(
-            x=alt.X("ecart_voisins_pct:Q", title=f"Ecart relatif vs mediane voisins ({metric_label}, %)"),
-            y=alt.Y("station_label:N", sort="-x", title="Station"),
-            color=alt.Color("reliability_class:N", title="Fiabilite"),
-            tooltip=[
-                "station_id",
-                "station_commune_name",
-                "source",
-                "nb_voisins",
-                "ecart_voisins_mm",
-                "ecart_voisins_pct",
-                "fiabilite_100",
-                "reliability_class",
-                "reliability_reason",
-            ],
+    if ALT_AVAILABLE:
+        worst_chart = (
+            alt.Chart(worst_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("ecart_voisins_pct:Q", title=f"Ecart relatif vs mediane voisins ({metric_label}, %)"),
+                y=alt.Y("station_label:N", sort="-x", title="Station"),
+                color=alt.Color("reliability_class:N", title="Fiabilite"),
+                tooltip=[
+                    "station_id",
+                    "station_commune_name",
+                    "source",
+                    "nb_voisins",
+                    "ecart_voisins_mm",
+                    "ecart_voisins_pct",
+                    "fiabilite_100",
+                    "reliability_class",
+                    "reliability_reason",
+                ],
+            )
         )
-    )
-    st.altair_chart(worst_chart, use_container_width=True)
+        st.altair_chart(worst_chart, use_container_width=True)
+    else:
+        fallback_worst = worst_df[["station_label", "ecart_voisins_pct"]].copy().set_index("station_label")
+        st.bar_chart(fallback_worst)
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
@@ -880,43 +922,10 @@ else:
             hist_df["precip_mm"] = pd.to_numeric(hist_df["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
             hist_df = hist_df.dropna(subset=["date"]).sort_values(["source", "date"])
 
-            daily_chart = (
-                alt.Chart(hist_df)
-                .mark_line(point=False)
-                .encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y("precip_mm:Q", title="Pluie journaliere (mm)"),
-                    color=alt.Color(
-                        "source:N",
-                        scale=alt.Scale(
-                            domain=list(HISTORY_SOURCE_COLORS.keys()),
-                            range=list(HISTORY_SOURCE_COLORS.values()),
-                        ),
-                    ),
-                    tooltip=["source", "date", "precip_mm"],
-                )
-            )
-            st.altair_chart(daily_chart.interactive(), use_container_width=True)
-
             roll_df = hist_df.copy()
-            roll_df["rolling_7d_mm"] = (
-                roll_df.sort_values("date")
-                .groupby("source", as_index=False)["precip_mm"]
-                .rolling(window=7, min_periods=1)
-                .sum()
-                .reset_index(level=0, drop=True)
+            roll_df["rolling_7d_mm"] = roll_df.groupby("source")["precip_mm"].transform(
+                lambda s: s.rolling(window=7, min_periods=1).sum()
             )
-            roll_chart = (
-                alt.Chart(roll_df)
-                .mark_line(point=False, strokeDash=[8, 3])
-                .encode(
-                    x=alt.X("date:T", title="Date"),
-                    y=alt.Y("rolling_7d_mm:Q", title="Cumul glissant 7 jours (mm)"),
-                    color=alt.Color("source:N", title="Source historique"),
-                    tooltip=["source", "date", "rolling_7d_mm"],
-                )
-            )
-            st.altair_chart(roll_chart.interactive(), use_container_width=True)
 
             monthly = hist_df.copy()
             monthly["ym"] = monthly["date"].dt.strftime("%Y-%m")
@@ -925,18 +934,72 @@ else:
                 .sum()
                 .rename(columns={"precip_mm": "monthly_mm"})
             )
-            monthly_chart = (
-                alt.Chart(monthly)
-                .mark_bar()
-                .encode(
-                    x=alt.X("ym:N", title="Mois"),
-                    y=alt.Y("monthly_mm:Q", title="Cumul mensuel (mm)"),
-                    color=alt.Color("source:N", title="Source historique"),
-                    xOffset=alt.XOffset("source:N"),
-                    tooltip=["source", "ym", "monthly_mm"],
+
+            if ALT_AVAILABLE:
+                daily_chart = (
+                    alt.Chart(hist_df)
+                    .mark_line(point=False)
+                    .encode(
+                        x=alt.X("date:T", title="Date"),
+                        y=alt.Y("precip_mm:Q", title="Pluie journaliere (mm)"),
+                        color=alt.Color(
+                            "source:N",
+                            scale=alt.Scale(
+                                domain=list(HISTORY_SOURCE_COLORS.keys()),
+                                range=list(HISTORY_SOURCE_COLORS.values()),
+                            ),
+                        ),
+                        tooltip=["source", "date", "precip_mm"],
+                    )
                 )
-            )
-            st.altair_chart(monthly_chart, use_container_width=True)
+                st.altair_chart(daily_chart.interactive(), use_container_width=True)
+
+                roll_chart = (
+                    alt.Chart(roll_df)
+                    .mark_line(point=False, strokeDash=[8, 3])
+                    .encode(
+                        x=alt.X("date:T", title="Date"),
+                        y=alt.Y("rolling_7d_mm:Q", title="Cumul glissant 7 jours (mm)"),
+                        color=alt.Color("source:N", title="Source historique"),
+                        tooltip=["source", "date", "rolling_7d_mm"],
+                    )
+                )
+                st.altair_chart(roll_chart.interactive(), use_container_width=True)
+
+                monthly_chart = (
+                    alt.Chart(monthly)
+                    .mark_bar()
+                    .encode(
+                        x=alt.X("ym:N", title="Mois"),
+                        y=alt.Y("monthly_mm:Q", title="Cumul mensuel (mm)"),
+                        color=alt.Color("source:N", title="Source historique"),
+                        xOffset=alt.XOffset("source:N"),
+                        tooltip=["source", "ym", "monthly_mm"],
+                    )
+                )
+                st.altair_chart(monthly_chart, use_container_width=True)
+            else:
+                st.caption("Mode fallback: graphiques historiques en rendu Streamlit natif.")
+                daily_fallback = (
+                    hist_df.pivot_table(index="date", columns="source", values="precip_mm", aggfunc="mean")
+                    .sort_index()
+                    .fillna(0.0)
+                )
+                st.line_chart(daily_fallback, use_container_width=True)
+
+                roll_fallback = (
+                    roll_df.pivot_table(index="date", columns="source", values="rolling_7d_mm", aggfunc="mean")
+                    .sort_index()
+                    .fillna(0.0)
+                )
+                st.line_chart(roll_fallback, use_container_width=True)
+
+                monthly_fallback = (
+                    monthly.pivot_table(index="ym", columns="source", values="monthly_mm", aggfunc="mean")
+                    .sort_index()
+                    .fillna(0.0)
+                )
+                st.bar_chart(monthly_fallback, use_container_width=True)
 
             summary = (
                 hist_df.groupby("source", as_index=False)
