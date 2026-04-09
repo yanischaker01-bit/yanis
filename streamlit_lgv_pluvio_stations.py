@@ -755,8 +755,13 @@ if ALT_AVAILABLE:
     )
     st.altair_chart(bar_chart, use_container_width=True)
 else:
-    fallback_top = top_df[["station_label", metric_col]].copy().set_index("station_label")
-    st.bar_chart(fallback_top)
+    st.caption("Mode fallback sans Altair: classement tabulaire.")
+    fallback_top = top_df[["station_label", metric_col, "source", "distance_to_lgv_km"]].copy()
+    st.dataframe(
+        fallback_top.sort_values(metric_col, ascending=False),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 st.subheader("Comparaison inter-stations de proximite (mode pro)")
 pro_view = filtered_stations.copy()
@@ -844,8 +849,15 @@ if not worst_df.empty:
         )
         st.altair_chart(worst_chart, use_container_width=True)
     else:
-        fallback_worst = worst_df[["station_label", "ecart_voisins_pct"]].copy().set_index("station_label")
-        st.bar_chart(fallback_worst)
+        st.caption("Mode fallback sans Altair: ecarts majeurs en tableau.")
+        fallback_worst = worst_df[
+            ["station_label", "ecart_voisins_pct", "ecart_voisins_mm", "reliability_score", "reliability_class"]
+        ].copy()
+        st.dataframe(
+            fallback_worst.sort_values("ecart_voisins_pct", ascending=False),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
@@ -985,21 +997,24 @@ else:
                     .sort_index()
                     .fillna(0.0)
                 )
-                st.line_chart(daily_fallback, use_container_width=True)
+                st.markdown("**Historique journalier (tableau pivot)**")
+                st.dataframe(daily_fallback.reset_index(), use_container_width=True, hide_index=True)
 
                 roll_fallback = (
                     roll_df.pivot_table(index="date", columns="source", values="rolling_7d_mm", aggfunc="mean")
                     .sort_index()
                     .fillna(0.0)
                 )
-                st.line_chart(roll_fallback, use_container_width=True)
+                st.markdown("**Cumul glissant 7 jours (tableau pivot)**")
+                st.dataframe(roll_fallback.reset_index(), use_container_width=True, hide_index=True)
 
                 monthly_fallback = (
                     monthly.pivot_table(index="ym", columns="source", values="monthly_mm", aggfunc="mean")
                     .sort_index()
                     .fillna(0.0)
                 )
-                st.bar_chart(monthly_fallback, use_container_width=True)
+                st.markdown("**Cumuls mensuels (tableau pivot)**")
+                st.dataframe(monthly_fallback.reset_index(), use_container_width=True, hide_index=True)
 
             summary = (
                 hist_df.groupby("source", as_index=False)
