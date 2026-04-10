@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from io import StringIO
 import json
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 import unicodedata
@@ -23,9 +25,13 @@ REMOTE_SNAPSHOT_URLS = [
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_MODEL_METEOFRANCE = "meteofrance_seamless"
+METEO_FRANCE_TOKEN_URL_DEFAULT = "https://portail-api.meteofrance.fr/token"
+METEO_FRANCE_DP_OBS_BASE_URL = "https://public-api.meteofrance.fr/public/DPObs"
+METEO_FRANCE_SOURCE_LABEL = "Meteo-France Portail API"
 OPEN_METEO_SOURCE_LABEL = "Open-Meteo MeteoFrance"
+SOURCE_MODE_METEOFRANCE = "Meteo-France Portail API"
 SOURCE_MODE_OPEN = "Open-Meteo MeteoFrance"
-SOURCE_MODE_MIX = "Open-Meteo + InfoClimat proches LGV"
+SOURCE_MODE_MIX = "Meteo-France + Open-Meteo + InfoClimat"
 INFOCLIMAT_PRIORITY_MATCH_KM = 25.0
 INFOCLIMAT_STRICT_RADIUS_KM = 10.0
 INFOCLIMAT_MIN_STATIONS_COVERAGE = 4
@@ -61,6 +67,7 @@ HISTORY_SOURCES = [
 ]
 HISTORY_SOURCE_COLORS = {
     INFOCLIMAT_HISTORY_SOURCE: "#0f766e",
+    METEO_FRANCE_SOURCE_LABEL: "#0b3d91",
     OPEN_METEO_SOURCE_LABEL: "#1d4ed8",
 }
 SOURCE_RELIABILITY_HINTS = {
@@ -86,13 +93,19 @@ MAP_TILE_STYLES = {
 }
 
 
-def _http_get_with_retry(url: str, params: Dict[str, object], timeout: int = 30, max_attempts: int = 2) -> requests.Response:
+def _http_get_with_retry(
+    url: str,
+    params: Dict[str, object],
+    timeout: int = 30,
+    max_attempts: int = 2,
+    headers: Dict[str, str] | None = None,
+) -> requests.Response:
     last_exc: Exception | None = None
     session = requests.Session()
     session.trust_env = False
     for _ in range(max(1, int(max_attempts))):
         try:
-            return session.get(url, params=params, timeout=int(timeout))
+            return session.get(url, params=params, timeout=int(timeout), headers=headers)
         except Exception as exc:
             last_exc = exc
     if last_exc is not None:
@@ -306,7 +319,14 @@ def _normalize_commune_name(txt: object) -> str:
 
 @st.cache_data(show_spinner=False, ttl=86400)
 def _load_lgv_communes_catalog() -> pd.DataFrame:
-    src = _find_latest_file(["data/lgv_communes_cache.json", "data/lgv_communes_*.json"])
+    src = _find_latest_file(
+        [
+            "data/lgv_communes_cache.json",
+            "data/lgv_communes_*.json",
+            "seed_data/lgv_communes_seed.json",
+            "seed_data/lgv_communes_*.json",
+        ]
+    )
     if src is None:
         return pd.DataFrame()
     try:
@@ -633,6 +653,623 @@ def _build_open_meteo_key_from_lgv_communes() -> Tuple[Tuple[str, str, str, floa
 
 
 @st.cache_data(show_spinner=False, ttl=1800)
+def _load_open_meteo_grid_local() -> Tuple[pd.DataFrame, str]:
+    src = _find_latest_file(
+        [
+            "data/open_meteo_lgv_grid_*.csv",
+            "seed_data/open_meteo_lgv_grid_seed.csv",
+            "seed_data/open_meteo_lgv_grid_*.csv",
+        ]
+    )
+    if src is None:
+        return pd.DataFrame(), (
+            "Open-Meteo grille locale: aucun fichier open_meteo_lgv_grid_*.csv disponible "
+            "(ni seed_data/open_meteo_lgv_grid_seed.csv)."
+        )
+    try:
+        df = pd.read_csv(src, dtype=str)
+    except Exception as exc:
+        return pd.DataFrame(), f"Open-Meteo grille locale: lecture impossible ({exc})."
+    if df.empty:
+        return pd.DataFrame(), f"Open-Meteo grille locale: fichier vide ({src.name})."
+
+    work = df.copy()
+    for col in [
+        "distance_to_lgv_km",
+        "latitude",
+        "longitude",
+        "precipitation_mm",
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "rain_12h_mm",
+        "rain_instant_mm",
+        "rain_forecast_mm",
+    ]:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+    work = work.dropna(subset=["latitude", "longitude"]).copy()
+    if work.empty:
+        return pd.DataFrame(), f"Open-Meteo grille locale: coordonnees invalides ({src.name})."
+
+    # Map each grid point to nearest traversed LGV commune for professional naming.
+    catalog = _load_lgv_communes_catalog()
+    if not catalog.empty:
+        cat = catalog.copy()
+        cat["centroid_latitude"] = pd.to_numeric(cat.get("centroid_latitude"), errors="coerce")
+        cat["centroid_longitude"] = pd.to_numeric(cat.get("centroid_longitude"), errors="coerce")
+        cat = cat.dropna(subset=["centroid_latitude", "centroid_longitude"]).reset_index(drop=True)
+    else:
+        cat = pd.DataFrame()
+
+    nearest_codes: List[str] = []
+    nearest_names: List[str] = []
+    nearest_distances: List[float] = []
+    for _, row in work.iterrows():
+        lat = pd.to_numeric(row.get("latitude"), errors="coerce")
+        lon = pd.to_numeric(row.get("longitude"), errors="coerce")
+        if pd.isna(lat) or pd.isna(lon) or cat.empty:
+            nearest_codes.append("")
+            nearest_names.append("")
+            nearest_distances.append(np.nan)
+            continue
+        dvals = [
+            _haversine_km(
+                float(lat),
+                float(lon),
+                float(crow.get("centroid_latitude")),
+                float(crow.get("centroid_longitude")),
+            )
+            for _, crow in cat.iterrows()
+        ]
+        best_idx = int(np.argmin(dvals))
+        best_row = cat.iloc[best_idx]
+        nearest_codes.append(str(best_row.get("commune_code") or "").strip())
+        nearest_names.append(str(best_row.get("commune_name") or "").strip())
+        nearest_distances.append(float(dvals[best_idx]))
+
+    work["nearest_lgv_commune_code"] = nearest_codes
+    work["nearest_lgv_commune_name"] = nearest_names
+    work["nearest_lgv_commune_km"] = nearest_distances
+
+    if "station_commune_name" not in work.columns:
+        work["station_commune_name"] = ""
+    work["station_commune_name"] = work["station_commune_name"].fillna("").astype(str).str.strip()
+
+    unknown_mask = work["station_commune_name"].map(_is_unknown_commune) | (work["station_commune_name"].astype(str).str.len() == 0)
+    near_mask = pd.to_numeric(work.get("nearest_lgv_commune_km"), errors="coerce").fillna(9999.0) <= 8.0
+    work["station_commune_name"] = np.where(
+        unknown_mask & near_mask,
+        work["nearest_lgv_commune_name"].fillna("").astype(str),
+        work["station_commune_name"],
+    )
+    work["station_commune_name"] = np.where(
+        work["station_commune_name"].astype(str).str.len() > 0,
+        work["station_commune_name"],
+        work["nearest_lgv_commune_name"].fillna("").astype(str),
+    )
+    work["station_commune_name"] = work["station_commune_name"].fillna("Inconnue").astype(str)
+
+    if "station_ref_id" not in work.columns:
+        work["station_ref_id"] = ""
+    work["station_ref_id"] = work["station_ref_id"].fillna("").astype(str).str.strip()
+    work["station_ref_id"] = np.where(
+        work["station_ref_id"].astype(str).str.len() > 0,
+        work["station_ref_id"],
+        work["nearest_lgv_commune_code"].fillna("").astype(str),
+    )
+
+    if "station_id" not in work.columns:
+        work["station_id"] = ""
+    work["station_id"] = work["station_id"].fillna("").astype(str).str.strip()
+    has_ref = work["station_ref_id"].astype(str).str.len() > 0
+    work["station_id"] = np.where(has_ref, "openmeteo_ref_" + work["station_ref_id"], work["station_id"])
+    missing_id = work["station_id"].astype(str).str.len() == 0
+    if missing_id.any():
+        replacement = [f"openmeteo_grid_{idx+1:04d}" for idx in range(int(missing_id.sum()))]
+        work.loc[missing_id, "station_id"] = replacement
+
+    if "station_name" not in work.columns:
+        work["station_name"] = ""
+    work["station_name"] = work["station_name"].fillna("").astype(str).map(_clean_station_label)
+    work["station_name"] = np.where(
+        work["station_name"].astype(str).str.len() > 0,
+        work["station_name"],
+        work["station_commune_name"].fillna("Inconnue").astype(str),
+    )
+
+    if "source" not in work.columns:
+        work["source"] = OPEN_METEO_SOURCE_LABEL
+    else:
+        work["source"] = OPEN_METEO_SOURCE_LABEL
+    if "selection_mode" not in work.columns:
+        work["selection_mode"] = "open_meteo_grid_lgv_seed"
+    else:
+        mode_text = work["selection_mode"].fillna("").astype(str)
+        work["selection_mode"] = np.where(mode_text.str.len() > 0, mode_text + ";seed_fallback", "open_meteo_grid_lgv_seed")
+    if "meteo_model" not in work.columns:
+        work["meteo_model"] = OPEN_METEO_MODEL_METEOFRANCE
+    else:
+        work["meteo_model"] = work["meteo_model"].fillna("").astype(str).replace("", OPEN_METEO_MODEL_METEOFRANCE)
+    if "date_obs_raw" not in work.columns:
+        if "date" in work.columns:
+            work["date_obs_raw"] = work["date"].fillna("").astype(str)
+        else:
+            work["date_obs_raw"] = ""
+    if "rain_class" not in work.columns:
+        work["rain_class"] = "NORMAL"
+
+    work["_obs_ts"] = pd.to_datetime(work.get("date_obs_raw", pd.Series("", index=work.index)), utc=True, errors="coerce")
+    work = work.sort_values(["_obs_ts", "distance_to_lgv_km"], ascending=[False, True], na_position="last")
+    work = work.drop_duplicates(subset=["station_id"], keep="first")
+
+    keep_cols = [
+        "station_id",
+        "station_name",
+        "station_commune_name",
+        "date_obs_raw",
+        "latitude",
+        "longitude",
+        "distance_to_lgv_km",
+        "precipitation_mm",
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "rain_12h_mm",
+        "rain_instant_mm",
+        "rain_forecast_mm",
+        "rain_class",
+        "source",
+        "selection_mode",
+        "meteo_model",
+        "station_ref_id",
+        "date",
+    ]
+    keep_cols = [c for c in keep_cols if c in work.columns]
+    out = work[keep_cols].copy()
+    return out, f"Open-Meteo grille locale: {len(out)} points charges depuis {src.name}."
+
+
+def _runtime_secret_or_env(*keys: str) -> str:
+    for key in keys:
+        k = str(key or "").strip()
+        if not k:
+            continue
+        try:
+            secret_val = st.secrets.get(k, "")
+            if isinstance(secret_val, str) and secret_val.strip():
+                return secret_val.strip()
+        except Exception:
+            pass
+        env_val = os.getenv(k, "").strip()
+        if env_val:
+            return env_val
+    return ""
+
+
+def _normalize_col_key(txt: object) -> str:
+    return "".join(ch for ch in _ascii_norm(txt) if ch.isalnum())
+
+
+def _parse_csv_flexible(text: str) -> pd.DataFrame:
+    raw = str(text or "").strip()
+    if not raw:
+        return pd.DataFrame()
+    for sep in [None, ";", ","]:
+        try:
+            if sep is None:
+                df = pd.read_csv(StringIO(raw), sep=None, engine="python", dtype=str)
+            else:
+                df = pd.read_csv(StringIO(raw), sep=sep, engine="python", dtype=str)
+            if not df.empty and len(df.columns) >= 2:
+                return df
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def _find_column_by_keys(df: pd.DataFrame, exact_keys: List[str], contains_tokens: List[str] | None = None) -> str:
+    if df.empty:
+        return ""
+    norm_map: Dict[str, str] = {}
+    for col in df.columns:
+        key = _normalize_col_key(col)
+        if key and key not in norm_map:
+            norm_map[key] = str(col)
+    for key in exact_keys:
+        k = _normalize_col_key(key)
+        if k in norm_map:
+            return norm_map[k]
+    if contains_tokens:
+        for col in df.columns:
+            nk = _normalize_col_key(col)
+            if nk and all(_normalize_col_key(tok) in nk for tok in contains_tokens):
+                return str(col)
+    return ""
+
+
+def _to_num(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series.fillna("").astype(str).str.replace(",", ".", regex=False), errors="coerce")
+
+
+@st.cache_data(show_spinner=False, ttl=3000)
+def _request_meteo_france_portal_token() -> Tuple[str, str]:
+    direct_token = _runtime_secret_or_env("METEOFRANCE_ACCESS_TOKEN", "METEO_FRANCE_ACCESS_TOKEN")
+    if direct_token:
+        return direct_token, "Meteo-France token: fourni via variable d'environnement/secrets."
+
+    client_id = _runtime_secret_or_env("METEOFRANCE_CLIENT_ID", "METEO_FRANCE_CLIENT_ID")
+    client_secret = _runtime_secret_or_env("METEOFRANCE_CLIENT_SECRET", "METEO_FRANCE_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return "", (
+            "Meteo-France Portail API: configure METEOFRANCE_CLIENT_ID et METEOFRANCE_CLIENT_SECRET "
+            "(ou METEOFRANCE_ACCESS_TOKEN) dans Streamlit secrets."
+        )
+
+    token_url = _runtime_secret_or_env("METEOFRANCE_TOKEN_URL", "METEO_FRANCE_TOKEN_URL")
+    if not token_url:
+        token_url = METEO_FRANCE_TOKEN_URL_DEFAULT
+
+    session = requests.Session()
+    session.trust_env = False
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    attempts = [
+        {"grant_type": "client_credentials"},
+        {"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+    ]
+    last_err = ""
+    for payload in attempts:
+        try:
+            if "client_id" in payload:
+                resp = session.post(token_url, data=payload, headers=headers, timeout=25)
+            else:
+                resp = session.post(token_url, data=payload, headers=headers, auth=(client_id, client_secret), timeout=25)
+            if resp.status_code != 200:
+                last_err = f"HTTP {resp.status_code}"
+                continue
+            parsed = resp.json() if "application/json" in str(resp.headers.get("Content-Type", "")).lower() else {}
+            access_token = str((parsed or {}).get("access_token") or "").strip()
+            if access_token:
+                return access_token, "Meteo-France token OAuth2 recupere."
+            last_err = "access_token absent"
+        except Exception as exc:
+            last_err = str(exc)
+
+    return "", f"Meteo-France token indisponible ({last_err})."
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _fetch_meteo_france_synop_station_catalog(token: str) -> Tuple[pd.DataFrame, str]:
+    tk = str(token or "").strip()
+    if not tk:
+        return pd.DataFrame(), "Meteo-France catalog stations: token manquant."
+    headers = {"Authorization": f"Bearer {tk}", "accept": "text/csv"}
+    url = f"{METEO_FRANCE_DP_OBS_BASE_URL}/liste-stations-synop"
+    try:
+        resp = _http_get_with_retry(url, params={"format": "csv"}, timeout=35, max_attempts=2, headers=headers)
+    except Exception as exc:
+        return pd.DataFrame(), f"Meteo-France catalog stations: erreur HTTP ({exc})."
+    if resp.status_code != 200:
+        return pd.DataFrame(), f"Meteo-France catalog stations: HTTP {resp.status_code}."
+
+    df = _parse_csv_flexible(resp.text)
+    if df.empty:
+        return pd.DataFrame(), "Meteo-France catalog stations: CSV vide."
+
+    id_col = _find_column_by_keys(
+        df,
+        exact_keys=["geo_id_wmo", "id_station", "id", "station_id", "numer_sta"],
+        contains_tokens=["id", "station"],
+    )
+    if not id_col:
+        id_col = _find_column_by_keys(df, exact_keys=["indicatif", "omm", "wmo"], contains_tokens=["wmo"])
+    name_col = _find_column_by_keys(
+        df,
+        exact_keys=["nom_station", "station_name", "nom", "libelle_station", "station"],
+        contains_tokens=["nom"],
+    )
+    lat_col = _find_column_by_keys(df, exact_keys=["latitude", "lat"], contains_tokens=["lat"])
+    lon_col = _find_column_by_keys(df, exact_keys=["longitude", "lon", "long"], contains_tokens=["lon"])
+    if not lon_col:
+        lon_col = _find_column_by_keys(df, exact_keys=["longitude", "lon", "long"], contains_tokens=["long"])
+    if not id_col:
+        return pd.DataFrame(), "Meteo-France catalog stations: colonne id station introuvable."
+
+    out = pd.DataFrame()
+    out["station_api_id"] = df[id_col].fillna("").astype(str).str.strip()
+    out["station_api_id"] = out["station_api_id"].apply(lambda v: "".join(ch for ch in str(v) if ch.isdigit())).astype(str)
+    out["station_api_id"] = np.where(
+        out["station_api_id"].astype(str).str.len() > 0,
+        out["station_api_id"].astype(str).str.zfill(5),
+        "",
+    )
+    out["station_name"] = (
+        df[name_col].fillna("").astype(str).map(_clean_station_label) if name_col else pd.Series("", index=df.index, dtype=str)
+    )
+    out["latitude"] = _to_num(df[lat_col]) if lat_col else pd.Series(np.nan, index=df.index)
+    out["longitude"] = _to_num(df[lon_col]) if lon_col else pd.Series(np.nan, index=df.index)
+    out = out[(out["station_api_id"].astype(str).str.len() > 0)].copy()
+    out = out.dropna(subset=["latitude", "longitude"], how="any")
+    out = out.drop_duplicates(subset=["station_api_id"], keep="first")
+    return out.reset_index(drop=True), f"Meteo-France catalog stations: {len(out)} stations geolocalisees."
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _fetch_meteo_france_portal_commune_weather() -> Tuple[pd.DataFrame, str]:
+    token, token_note = _request_meteo_france_portal_token()
+    if not token:
+        return pd.DataFrame(), token_note
+
+    stations_df, stations_note = _fetch_meteo_france_synop_station_catalog(token)
+    headers = {"Authorization": f"Bearer {token}", "accept": "text/csv"}
+    synop_url = f"{METEO_FRANCE_DP_OBS_BASE_URL}/v1/synop"
+    try:
+        synop_resp = _http_get_with_retry(synop_url, params={"format": "csv"}, timeout=40, max_attempts=2, headers=headers)
+    except Exception as exc:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail erreur HTTP ({exc})."
+    if synop_resp.status_code != 200:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail HTTP {synop_resp.status_code}."
+
+    synop_raw = _parse_csv_flexible(synop_resp.text)
+    if synop_raw.empty:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail vide."
+
+    id_col = _find_column_by_keys(
+        synop_raw,
+        exact_keys=["geo_id_wmo", "id_station", "station_id", "numer_sta", "id"],
+        contains_tokens=["station"],
+    )
+    if not id_col:
+        id_col = _find_column_by_keys(synop_raw, exact_keys=["wmo", "omm"], contains_tokens=["wmo"])
+    dt_col = _find_column_by_keys(
+        synop_raw,
+        exact_keys=["validity_time", "reference_time", "date_obs_raw", "date"],
+        contains_tokens=["date"],
+    )
+    lat_col = _find_column_by_keys(synop_raw, exact_keys=["latitude", "lat"], contains_tokens=["lat"])
+    lon_col = _find_column_by_keys(synop_raw, exact_keys=["longitude", "lon", "long"], contains_tokens=["lon"])
+    if not lon_col:
+        lon_col = _find_column_by_keys(synop_raw, exact_keys=["longitude", "lon", "long"], contains_tokens=["long"])
+
+    if not id_col:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail: colonne id station introuvable."
+
+    synop = synop_raw.copy()
+    synop["station_api_id"] = synop[id_col].fillna("").astype(str).str.strip()
+    synop["station_api_id"] = synop["station_api_id"].apply(lambda v: "".join(ch for ch in str(v) if ch.isdigit())).astype(str)
+    synop["station_api_id"] = np.where(
+        synop["station_api_id"].astype(str).str.len() > 0,
+        synop["station_api_id"].astype(str).str.zfill(5),
+        "",
+    )
+    synop = synop[synop["station_api_id"].astype(str).str.len() > 0].copy()
+    if synop.empty:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail: aucune station exploitable."
+
+    synop["date_obs_raw"] = synop[dt_col].fillna("").astype(str) if dt_col else ""
+    synop["_obs_ts"] = pd.to_datetime(synop["date_obs_raw"], utc=True, errors="coerce")
+    if synop["_obs_ts"].isna().all():
+        synop["_obs_ts"] = pd.Timestamp(datetime.now(timezone.utc))
+        synop["date_obs_raw"] = synop["_obs_ts"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    if lat_col:
+        synop["latitude"] = _to_num(synop[lat_col])
+    else:
+        synop["latitude"] = np.nan
+    if lon_col:
+        synop["longitude"] = _to_num(synop[lon_col])
+    else:
+        synop["longitude"] = np.nan
+
+    rr1_col = _find_column_by_keys(synop, exact_keys=["rr1"], contains_tokens=["rr1"])
+    rr3_col = _find_column_by_keys(synop, exact_keys=["rr3"], contains_tokens=["rr3"])
+    rr6_col = _find_column_by_keys(synop, exact_keys=["rr6"], contains_tokens=["rr6"])
+    rr12_col = _find_column_by_keys(synop, exact_keys=["rr12"], contains_tokens=["rr12"])
+    rr24_col = _find_column_by_keys(synop, exact_keys=["rr24"], contains_tokens=["rr24"])
+    rr_col = _find_column_by_keys(synop, exact_keys=["rr"], contains_tokens=None)
+    pr_col = _find_column_by_keys(
+        synop,
+        exact_keys=["precipitation", "precip", "pluie"],
+        contains_tokens=["precip"],
+    )
+
+    synop["rr1_mm"] = _to_num(synop[rr1_col]) if rr1_col else np.nan
+    synop["rr3_mm"] = _to_num(synop[rr3_col]) if rr3_col else np.nan
+    synop["rr6_mm"] = _to_num(synop[rr6_col]) if rr6_col else np.nan
+    synop["rr12_mm"] = _to_num(synop[rr12_col]) if rr12_col else np.nan
+    synop["rr24_mm"] = _to_num(synop[rr24_col]) if rr24_col else np.nan
+    synop["rr_mm"] = _to_num(synop[rr_col]) if rr_col else np.nan
+    synop["precip_mm"] = _to_num(synop[pr_col]) if pr_col else np.nan
+    synop["step_mm"] = synop["rr1_mm"]
+    for col in ["rr3_mm", "rr6_mm", "rr12_mm", "rr24_mm", "rr_mm", "precip_mm"]:
+        synop["step_mm"] = synop["step_mm"].where(synop["step_mm"].notna(), synop[col])
+    synop["step_mm"] = pd.to_numeric(synop["step_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+
+    if not stations_df.empty:
+        st_lookup = stations_df.copy()
+        st_lookup["station_api_id"] = st_lookup["station_api_id"].astype(str).str.zfill(5)
+        synop = synop.merge(
+            st_lookup[["station_api_id", "station_name", "latitude", "longitude"]].rename(
+                columns={"latitude": "lat_station", "longitude": "lon_station"}
+            ),
+            how="left",
+            on="station_api_id",
+        )
+        synop["latitude"] = synop["latitude"].fillna(pd.to_numeric(synop.get("lat_station"), errors="coerce"))
+        synop["longitude"] = synop["longitude"].fillna(pd.to_numeric(synop.get("lon_station"), errors="coerce"))
+        synop["station_name"] = synop.get("station_name", pd.Series("", index=synop.index)).fillna("").astype(str).map(_clean_station_label)
+    else:
+        synop["station_name"] = ""
+
+    synop = synop.dropna(subset=["latitude", "longitude"]).copy()
+    if synop.empty:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail sans coordonnees station exploitables."
+
+    now_utc = pd.to_datetime(synop["_obs_ts"], utc=True, errors="coerce").dropna().max()
+    if pd.isna(now_utc):
+        now_utc = pd.Timestamp(datetime.now(timezone.utc))
+    lower_12h = now_utc - pd.Timedelta(hours=12)
+    lower_24h = now_utc - pd.Timedelta(hours=24)
+    lower_7d = now_utc - pd.Timedelta(days=7)
+    lower_30d = now_utc - pd.Timedelta(days=30)
+    month_start = pd.Timestamp(year=int(now_utc.year), month=int(now_utc.month), day=1, tz="UTC")
+
+    station_rows: List[Dict[str, object]] = []
+    for station_id, grp in synop.groupby("station_api_id"):
+        g = grp.copy()
+        g["_obs_ts"] = pd.to_datetime(g["_obs_ts"], utc=True, errors="coerce")
+        g = g.dropna(subset=["_obs_ts"]).sort_values("_obs_ts")
+        if g.empty:
+            continue
+        latest = g.iloc[-1]
+        rain_24h_direct = pd.to_numeric(latest.get("rr24_mm"), errors="coerce")
+        rain_12h_direct = pd.to_numeric(latest.get("rr12_mm"), errors="coerce")
+        rain_instant = pd.to_numeric(latest.get("rr1_mm"), errors="coerce")
+        if pd.isna(rain_instant):
+            rain_instant = pd.to_numeric(latest.get("step_mm"), errors="coerce")
+
+        step = pd.to_numeric(g.get("step_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
+        ts = pd.to_datetime(g["_obs_ts"], utc=True, errors="coerce")
+        rain_12h = float(step[ts > lower_12h].sum())
+        rain_24h = float(step[ts > lower_24h].sum())
+        rain_7d = float(step[ts > lower_7d].sum())
+        rain_30d = float(step[ts > lower_30d].sum())
+        rain_month = float(step[ts >= month_start].sum())
+
+        rain_12h = max(rain_12h, float(rain_12h_direct) if pd.notna(rain_12h_direct) else 0.0)
+        rain_24h = max(rain_24h, float(rain_24h_direct) if pd.notna(rain_24h_direct) else 0.0)
+        rain_7d = max(rain_7d, rain_24h)
+        rain_30d = max(rain_30d, rain_7d)
+        rain_month = max(rain_month, rain_24h)
+        rain_inst = max(0.0, float(rain_instant) if pd.notna(rain_instant) else 0.0)
+
+        station_rows.append(
+            {
+                "station_api_id": str(station_id).zfill(5),
+                "provider_station_name": _clean_station_label(latest.get("station_name") or f"Station {station_id}"),
+                "date_obs_raw": str(latest.get("date_obs_raw") or latest.get("_obs_ts") or ""),
+                "_obs_ts": pd.to_datetime(latest.get("_obs_ts"), utc=True, errors="coerce"),
+                "latitude": float(pd.to_numeric(latest.get("latitude"), errors="coerce")),
+                "longitude": float(pd.to_numeric(latest.get("longitude"), errors="coerce")),
+                "precipitation_mm": round(float(rain_24h), 3),
+                "rain_24h_mm": round(float(rain_24h), 3),
+                "rain_7d_mm": round(float(rain_7d), 3),
+                "rain_30d_mm": round(float(rain_30d), 3),
+                "rain_month_mm": round(float(rain_month), 3),
+                "rain_12h_mm": round(float(rain_12h), 3),
+                "rain_instant_mm": round(float(rain_inst), 3),
+                "rain_forecast_mm": 0.0,
+                "rain_class": "NORMAL",
+                "source": METEO_FRANCE_SOURCE_LABEL,
+                "selection_mode": "meteo_france_portail_synop_station",
+                "meteo_model": "mf_dpobs_synop",
+            }
+        )
+
+    station_agg = pd.DataFrame(station_rows)
+    if station_agg.empty:
+        return pd.DataFrame(), f"{token_note} | SYNOP portail: station aggregates vides."
+
+    communes = _load_lgv_communes_catalog()
+    if communes.empty:
+        out = station_agg.copy()
+        out["station_id"] = "meteofrance_station_" + out["station_api_id"].astype(str)
+        out["station_name"] = out["provider_station_name"]
+        out["station_commune_name"] = out["provider_station_name"]
+        out["distance_to_lgv_km"] = np.nan
+        out["station_ref_id"] = out["station_api_id"]
+        keep_cols = [
+            "station_id",
+            "station_name",
+            "station_commune_name",
+            "date_obs_raw",
+            "latitude",
+            "longitude",
+            "distance_to_lgv_km",
+            "precipitation_mm",
+            "rain_24h_mm",
+            "rain_7d_mm",
+            "rain_30d_mm",
+            "rain_month_mm",
+            "rain_12h_mm",
+            "rain_instant_mm",
+            "rain_forecast_mm",
+            "rain_class",
+            "source",
+            "selection_mode",
+            "meteo_model",
+            "station_ref_id",
+        ]
+        return out[keep_cols].copy(), (
+            f"{token_note} | {stations_note} | SYNOP portail: {len(out)} stations (mode station, "
+            "catalogue communes LGV indisponible)."
+        )
+
+    comm = communes.copy()
+    comm["centroid_latitude"] = pd.to_numeric(comm.get("centroid_latitude"), errors="coerce")
+    comm["centroid_longitude"] = pd.to_numeric(comm.get("centroid_longitude"), errors="coerce")
+    comm = comm.dropna(subset=["centroid_latitude", "centroid_longitude"]).copy()
+    if comm.empty:
+        return pd.DataFrame(), f"{token_note} | {stations_note} | communes LGV sans centroide."
+
+    proxy_rows: List[Dict[str, object]] = []
+    for _, crow in comm.iterrows():
+        clat = float(pd.to_numeric(crow.get("centroid_latitude"), errors="coerce"))
+        clon = float(pd.to_numeric(crow.get("centroid_longitude"), errors="coerce"))
+        dists = [
+            _haversine_km(clat, clon, float(srow["latitude"]), float(srow["longitude"]))
+            for _, srow in station_agg.iterrows()
+        ]
+        if not dists:
+            continue
+        best_i = int(np.argmin(dists))
+        src_row = station_agg.iloc[best_i]
+        ccode = str(crow.get("commune_code") or "").strip()
+        cname = str(crow.get("commune_name") or "").strip()
+        sid = f"meteofrance_ref_{ccode}" if ccode else f"meteofrance_ref_{best_i+1:03d}"
+        proxy_rows.append(
+            {
+                "station_id": sid,
+                "station_ref_id": ccode or str(src_row.get("station_api_id") or ""),
+                "station_name": cname or str(src_row.get("provider_station_name") or sid),
+                "station_commune_name": cname or str(src_row.get("provider_station_name") or "Inconnue"),
+                "date_obs_raw": str(src_row.get("date_obs_raw") or ""),
+                "latitude": clat,
+                "longitude": clon,
+                "distance_to_lgv_km": 0.0,
+                "precipitation_mm": float(pd.to_numeric(src_row.get("precipitation_mm"), errors="coerce") or 0.0),
+                "rain_24h_mm": float(pd.to_numeric(src_row.get("rain_24h_mm"), errors="coerce") or 0.0),
+                "rain_7d_mm": float(pd.to_numeric(src_row.get("rain_7d_mm"), errors="coerce") or 0.0),
+                "rain_30d_mm": float(pd.to_numeric(src_row.get("rain_30d_mm"), errors="coerce") or 0.0),
+                "rain_month_mm": float(pd.to_numeric(src_row.get("rain_month_mm"), errors="coerce") or 0.0),
+                "rain_12h_mm": float(pd.to_numeric(src_row.get("rain_12h_mm"), errors="coerce") or 0.0),
+                "rain_instant_mm": float(pd.to_numeric(src_row.get("rain_instant_mm"), errors="coerce") or 0.0),
+                "rain_forecast_mm": 0.0,
+                "rain_class": str(src_row.get("rain_class") or "NORMAL"),
+                "source": METEO_FRANCE_SOURCE_LABEL,
+                "selection_mode": "meteo_france_portail_synop_commune_proxy",
+                "meteo_model": "mf_dpobs_synop",
+                "provider_station_id": str(src_row.get("station_api_id") or ""),
+                "provider_station_name": str(src_row.get("provider_station_name") or ""),
+                "provider_station_dist_km": round(float(dists[best_i]), 3),
+                "rain_calc_method": "mf_portal_synop_nearest_station",
+            }
+        )
+    out = pd.DataFrame(proxy_rows)
+    if out.empty:
+        return pd.DataFrame(), f"{token_note} | {stations_note} | SYNOP portail: aucune commune LGV projetee."
+
+    out = out.sort_values("station_id").reset_index(drop=True)
+    notice = (
+        f"{token_note} | {stations_note} | Meteo-France Portail: {len(out)} communes LGV projetees "
+        f"depuis {len(station_agg)} stations SYNOP."
+    )
+    return out, notice
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
 def _fetch_open_meteo_reference_points(
     points_key: Tuple[Tuple[str, str, str, float, float, float], ...],
     model: str = OPEN_METEO_MODEL_METEOFRANCE,
@@ -723,7 +1360,7 @@ def _fetch_open_meteo_reference_points(
                         "rain_forecast_mm": round(max(0.0, rain_forecast), 3),
                         "rain_class": "NORMAL",
                         "source": "open_meteo_reference",
-                        "selection_mode": "open_meteo_at_infoclimat_station",
+                        "selection_mode": "open_meteo_grid_lgv_commune",
                         "meteo_model": used_model,
                         "station_ref_id": sid,
                         "date": dt_obs.isoformat(),
@@ -740,7 +1377,7 @@ def _fetch_open_meteo_reference_points(
     out = out.sort_values("distance_to_lgv_km", na_position="last").reset_index(drop=True)
     model_values = out.get("meteo_model", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
     model_name = str(model_values[0]) if model_values else "open_meteo_unknown"
-    notice = f"Open-Meteo reference: {len(out)} points calcules sur stations InfoClimat ({model_name})."
+    notice = f"Open-Meteo reference: {len(out)} communes LGV calculees ({model_name})."
     if notices:
         notice = notice + " | " + " | ".join(notices[:2])
     return out, notice
@@ -760,6 +1397,11 @@ def _build_source_metadata_table(stations_df: pd.DataFrame) -> pd.DataFrame:
             refresh = "Horaire (observation)"
             method = "Mesures station + calcul cumuls 24h/7j/30j puis controle de coherence locale."
             limits = "Densite de stations variable selon secteurs LGV."
+        elif str(source or "").strip() == METEO_FRANCE_SOURCE_LABEL:
+            data_type = "Stations officielles (Meteo-France Portail API)"
+            refresh = "Tri-horaire (SYNOP)"
+            method = "Observations SYNOP officielles projetees sur chaque commune LGV (station la plus proche)."
+            limits = "La mesure est indirecte pour certaines communes (proxy station)."
         elif _is_open_meteo_source(source):
             data_type = "Modele numerique (Open-Meteo)"
             refresh = "Horaire (reanalyse + prevision courte)"
@@ -852,6 +1494,158 @@ def _nearest_lgv_commune_name(lat: float, lon: float, max_km: float = 40.0) -> s
     if best_dist > float(max_km):
         return ""
     return str(catalog.iloc[best_idx].get("commune_name") or "").strip()
+
+
+def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
+    communes = _load_lgv_communes_catalog()
+    if communes.empty:
+        return pd.DataFrame()
+
+    work = stations_df.copy() if isinstance(stations_df, pd.DataFrame) else pd.DataFrame()
+    if not work.empty:
+        for col in [
+            "latitude",
+            "longitude",
+            "rain_24h_mm",
+            "rain_7d_mm",
+            "rain_30d_mm",
+            "rain_month_mm",
+            "rain_12h_mm",
+            "rain_instant_mm",
+            "rain_forecast_mm",
+        ]:
+            if col in work.columns:
+                work[col] = pd.to_numeric(work[col], errors="coerce")
+        for col in ["station_id", "station_ref_id", "station_display", "station_commune_name", "source", "date_obs_raw"]:
+            if col not in work.columns:
+                work[col] = ""
+            work[col] = work[col].fillna("").astype(str)
+        work["station_commune_norm"] = work["station_commune_name"].map(_normalize_commune_name)
+    else:
+        work = pd.DataFrame(
+            columns=[
+                "station_id",
+                "station_ref_id",
+                "station_display",
+                "station_commune_name",
+                "station_commune_norm",
+                "source",
+                "date_obs_raw",
+                "latitude",
+                "longitude",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "rain_12h_mm",
+                "rain_instant_mm",
+                "rain_forecast_mm",
+            ]
+        )
+
+    out_rows: List[Dict[str, object]] = []
+    for _, crow in communes.iterrows():
+        code = str(crow.get("commune_code") or "").strip()
+        name = str(crow.get("commune_name") or "").strip()
+        clat = pd.to_numeric(crow.get("centroid_latitude"), errors="coerce")
+        clon = pd.to_numeric(crow.get("centroid_longitude"), errors="coerce")
+        picked = pd.Series(dtype=object)
+        match_mode = "no_data"
+        provider_dist = np.nan
+
+        if not work.empty:
+            code_mask = pd.Series(False, index=work.index)
+            if code:
+                code_mask = (
+                    (work["station_ref_id"].astype(str).str.strip() == code)
+                    | work["station_id"].astype(str).str.endswith(code)
+                )
+            code_match = work[code_mask].copy()
+            if not code_match.empty:
+                picked = code_match.sort_values("date_obs_raw", ascending=False).iloc[0]
+                match_mode = "code_exact"
+            else:
+                comm_norm = _normalize_commune_name(name)
+                name_match = work[work["station_commune_norm"] == comm_norm].copy()
+                if not name_match.empty:
+                    picked = name_match.sort_values("date_obs_raw", ascending=False).iloc[0]
+                    match_mode = "commune_name"
+                elif pd.notna(clat) and pd.notna(clon):
+                    coords = work.dropna(subset=["latitude", "longitude"]).copy()
+                    if not coords.empty:
+                        dvals = coords.apply(
+                            lambda r: _haversine_km(
+                                float(clat),
+                                float(clon),
+                                float(pd.to_numeric(r.get("latitude"), errors="coerce")),
+                                float(pd.to_numeric(r.get("longitude"), errors="coerce")),
+                            ),
+                            axis=1,
+                        )
+                        best_idx = int(dvals.idxmin())
+                        picked = coords.loc[best_idx]
+                        provider_dist = float(dvals.loc[best_idx])
+                        match_mode = "nearest_station"
+
+        if picked.empty:
+            out_rows.append(
+                {
+                    "commune_code": code,
+                    "commune_name": name,
+                    "latitude": float(clat) if pd.notna(clat) else np.nan,
+                    "longitude": float(clon) if pd.notna(clon) else np.nan,
+                    "distance_to_lgv_km": 0.0,
+                    "provider_station_id": "",
+                    "provider_station": "",
+                    "provider_source": "",
+                    "provider_station_dist_km": np.nan,
+                    "match_mode": match_mode,
+                    "date_obs_raw": "",
+                    "rain_24h_mm": np.nan,
+                    "rain_7d_mm": np.nan,
+                    "rain_30d_mm": np.nan,
+                    "rain_month_mm": np.nan,
+                    "rain_12h_mm": np.nan,
+                    "rain_instant_mm": np.nan,
+                    "rain_forecast_mm": np.nan,
+                }
+            )
+            continue
+
+        if pd.isna(provider_dist):
+            plat = pd.to_numeric(picked.get("latitude"), errors="coerce")
+            plon = pd.to_numeric(picked.get("longitude"), errors="coerce")
+            if pd.notna(clat) and pd.notna(clon) and pd.notna(plat) and pd.notna(plon):
+                provider_dist = _haversine_km(float(clat), float(clon), float(plat), float(plon))
+
+        out_rows.append(
+            {
+                "commune_code": code,
+                "commune_name": name,
+                "latitude": float(clat) if pd.notna(clat) else float(pd.to_numeric(picked.get("latitude"), errors="coerce")),
+                "longitude": float(clon) if pd.notna(clon) else float(pd.to_numeric(picked.get("longitude"), errors="coerce")),
+                "distance_to_lgv_km": 0.0,
+                "provider_station_id": str(picked.get("station_id") or ""),
+                "provider_station": str(picked.get("station_display") or picked.get("station_id") or ""),
+                "provider_source": str(picked.get("source") or ""),
+                "provider_station_dist_km": round(float(provider_dist), 3) if pd.notna(provider_dist) else np.nan,
+                "match_mode": match_mode,
+                "date_obs_raw": str(picked.get("date_obs_raw") or ""),
+                "rain_24h_mm": pd.to_numeric(picked.get("rain_24h_mm"), errors="coerce"),
+                "rain_7d_mm": pd.to_numeric(picked.get("rain_7d_mm"), errors="coerce"),
+                "rain_30d_mm": pd.to_numeric(picked.get("rain_30d_mm"), errors="coerce"),
+                "rain_month_mm": pd.to_numeric(picked.get("rain_month_mm"), errors="coerce"),
+                "rain_12h_mm": pd.to_numeric(picked.get("rain_12h_mm"), errors="coerce"),
+                "rain_instant_mm": pd.to_numeric(picked.get("rain_instant_mm"), errors="coerce"),
+                "rain_forecast_mm": pd.to_numeric(picked.get("rain_forecast_mm"), errors="coerce"),
+            }
+        )
+
+    out = pd.DataFrame(out_rows)
+    if out.empty:
+        return out
+    out = out.sort_values(["commune_name", "commune_code"], ascending=[True, True]).reset_index(drop=True)
+    return out
 
 
 def _filter_infoclimat_nearest_lgv(
@@ -1579,16 +2373,20 @@ def _build_map(
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
-    "Version pro: Open-Meteo par defaut, avec option InfoClimat proche LGV SEA pour comparaison et fiabilisation."
+    "Version pro: Meteo-France Portail API par defaut (officiel), Open-Meteo en secours, "
+    "et option InfoClimat proche LGV pour comparaison."
 )
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
 with st.sidebar:
     st.subheader("Sources")
     source_mode = st.selectbox(
         "Jeu de donnees",
-        options=[SOURCE_MODE_OPEN, SOURCE_MODE_MIX],
+        options=[SOURCE_MODE_METEOFRANCE, SOURCE_MODE_OPEN, SOURCE_MODE_MIX],
         index=0,
-        help="Open-Meteo par defaut. Option mixte disponible avec stations InfoClimat les plus proches LGV.",
+        help=(
+            "Meteo-France Portail API par defaut. "
+            "Open-Meteo disponible en mode strict ou en mode mixte avec InfoClimat."
+        ),
     )
     infoclimat_near_max_km = float(INFOCLIMAT_STRICT_RADIUS_KM)
     infoclimat_near_top_n = 9999
@@ -1666,15 +2464,29 @@ if not infoclimat_weather_df.empty:
         data_build_notices.append(
             f"InfoClimat proche LGV: aucune station retenue (distance<={float(infoclimat_near_max_km):.0f} km)."
         )
-if source_mode == SOURCE_MODE_OPEN:
+if source_mode == SOURCE_MODE_METEOFRANCE:
     data_build_notices.append(
-        "Mode Open-Meteo strict: stations support limitees aux stations InfoClimat proches LGV "
-        + f"(distance<={float(infoclimat_near_max_km):.0f} km)."
+        "Mode Meteo-France strict: donnees officielles SYNOP (Portail API) projetees sur toutes les communes LGV."
+    )
+elif source_mode == SOURCE_MODE_OPEN:
+    data_build_notices.append(
+        "Mode Open-Meteo strict: grille MeteoFrance calculee sur les communes traversees par la LGV SEA."
     )
 
+meteo_france_df = pd.DataFrame()
+if source_mode in {SOURCE_MODE_METEOFRANCE, SOURCE_MODE_MIX}:
+    meteo_france_df, mf_notice = _fetch_meteo_france_portal_commune_weather()
+    if mf_notice:
+        data_build_notices.append(mf_notice)
+    if not meteo_france_df.empty:
+        meteo_france_df = meteo_france_df.copy()
+        meteo_france_df["source"] = METEO_FRANCE_SOURCE_LABEL
+
 open_meteo_ref_df = pd.DataFrame()
-if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
+if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
+    ref_points_total = 0
     ref_points_key = _build_open_meteo_key_from_lgv_communes()
+    ref_points_total = int(len(ref_points_key))
     if not ref_points_key:
         open_ref_base = infoclimat_near_df.copy()
         if open_ref_base.empty and not infoclimat_local_df.empty:
@@ -1689,6 +2501,7 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
                     + f"jusqu'a {float(used_local_radius_km):.0f} km."
                 )
         ref_points_key = _build_open_meteo_reference_key(open_ref_base) if not open_ref_base.empty else tuple()
+        ref_points_total = int(len(ref_points_key))
     if ref_points_key:
         open_meteo_ref_df, open_meteo_notice = _fetch_open_meteo_reference_points(
             ref_points_key,
@@ -1696,20 +2509,44 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
         )
         if open_meteo_notice:
             data_build_notices.append(open_meteo_notice)
-        data_build_notices.append(
-            "Open-Meteo MeteoFrance: stations generees pour chaque commune traversee par la LGV SEA."
-        )
         if not open_meteo_ref_df.empty:
             open_meteo_ref_df = open_meteo_ref_df.copy()
             open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
+            data_build_notices.append(
+                "Open-Meteo MeteoFrance: grille active sur les communes traversees par la LGV SEA."
+            )
+    if open_meteo_ref_df.empty:
+        open_meteo_ref_df, open_grid_notice = _load_open_meteo_grid_local()
+        if open_grid_notice:
+            data_build_notices.append(open_grid_notice)
+        if not open_meteo_ref_df.empty:
+            open_meteo_ref_df = open_meteo_ref_df.copy()
+            open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
+            data_build_notices.append(
+                "Fallback Open-Meteo: grille locale chargee (seed/cache) pour garantir la couverture LGV."
+            )
+
+    if not open_meteo_ref_df.empty and ref_points_total > 0:
+        coverage_col = "station_ref_id" if "station_ref_id" in open_meteo_ref_df.columns else "station_commune_name"
+        covered = int(open_meteo_ref_df.get(coverage_col, pd.Series(dtype=str)).dropna().astype(str).str.strip().replace("", np.nan).dropna().nunique())
+        coverage_pct = round(100.0 * covered / max(1, ref_points_total), 1)
+        data_build_notices.append(
+            "Couverture communes LGV (Open-Meteo): "
+            + f"{covered}/{ref_points_total} ({coverage_pct}%)."
+        )
     else:
-        data_build_notices.append("Open-Meteo reference: aucune station InfoClimat geolocalisee disponible.")
+        data_build_notices.append("Open-Meteo reference: aucun point geolocalise disponible.")
 
 weather_blocks: List[pd.DataFrame] = []
+if source_mode in {SOURCE_MODE_METEOFRANCE, SOURCE_MODE_MIX} and not meteo_france_df.empty:
+    weather_blocks.append(meteo_france_df)
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} and not open_meteo_ref_df.empty:
     weather_blocks.append(open_meteo_ref_df)
 if source_mode == SOURCE_MODE_MIX and not infoclimat_near_df.empty:
     weather_blocks.append(infoclimat_near_df)
+if (source_mode == SOURCE_MODE_METEOFRANCE) and meteo_france_df.empty and not open_meteo_ref_df.empty:
+    weather_blocks.append(open_meteo_ref_df)
+    data_build_notices.append("Fallback: Meteo-France indisponible, bascule Open-Meteo.")
 if (source_mode == SOURCE_MODE_OPEN) and open_meteo_ref_df.empty and not infoclimat_near_df.empty:
     weather_blocks.append(infoclimat_near_df)
     data_build_notices.append("Fallback: Open-Meteo indisponible, affichage temporaire InfoClimat proche LGV.")
@@ -1843,7 +2680,7 @@ with st.sidebar:
         index=history_station_options.index(history_station_default),
     )
     history_source_options = [INFOCLIMAT_HISTORY_SOURCE, OPEN_METEO_SOURCE_LABEL]
-    if source_mode == SOURCE_MODE_OPEN:
+    if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_METEOFRANCE}:
         history_default_sources = [OPEN_METEO_SOURCE_LABEL]
     else:
         history_default_sources = [INFOCLIMAT_HISTORY_SOURCE, OPEN_METEO_SOURCE_LABEL]
@@ -1852,7 +2689,7 @@ with st.sidebar:
         options=history_source_options,
         default=history_default_sources,
     )
-    st.caption("Historique compare: InfoClimat local et/ou Open-Meteo MeteoFrance")
+    st.caption("Historique compare: Open-Meteo archive et/ou InfoClimat local.")
     today_utc = datetime.now(timezone.utc).date()
     history_start = st.date_input(
         "Date debut",
@@ -1979,6 +2816,44 @@ else:
         use_container_width=True,
         hide_index=True,
     )
+
+commune_source_df = weather_df.copy()
+if not commune_source_df.empty and selected_sources:
+    commune_source_df = commune_source_df[commune_source_df["source"].astype(str).isin(selected_sources)]
+commune_pluvio_df = _build_lgv_communes_pluvio_table(commune_source_df)
+st.subheader("Pluviometrie - Toutes les communes traversees par la LGV SEA")
+if commune_pluvio_df.empty:
+    st.info("Impossible de construire la vue commune LGV (catalogue ou donnees indisponibles).")
+else:
+    n_total_communes = int(len(commune_pluvio_df))
+    n_with_data = int(pd.to_numeric(commune_pluvio_df.get(metric_col), errors="coerce").notna().sum())
+    st.caption(
+        f"Couverture communes LGV: {n_with_data}/{n_total_communes} (source(s) active(s): {selected_sources})."
+    )
+    commune_map_df = commune_pluvio_df.copy()
+    commune_map_df["station_display"] = commune_map_df["commune_name"].astype(str) + " (commune LGV)"
+    commune_map_df["station_id"] = commune_map_df["commune_code"].astype(str)
+    commune_map_df["station_commune_name"] = commune_map_df["commune_name"].astype(str)
+    commune_map_df["source"] = commune_map_df.get("provider_source", pd.Series("", index=commune_map_df.index)).fillna("").astype(str)
+    commune_map_df["date_obs_raw"] = commune_map_df.get("date_obs_raw", pd.Series("", index=commune_map_df.index)).fillna("").astype(str)
+    commune_map_df["distance_to_lgv_km"] = 0.0
+    commune_map = _build_map(lgv_lines, commune_map_df, metric_col, map_style=map_style)
+    st_folium(commune_map, height=560, use_container_width=True, key="lgv_communes_full_map")
+    commune_view_cols = [
+        "commune_code",
+        "commune_name",
+        "provider_source",
+        "provider_station",
+        "provider_station_dist_km",
+        "match_mode",
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "date_obs_raw",
+    ]
+    commune_view_cols = [c for c in commune_view_cols if c in commune_pluvio_df.columns]
+    st.dataframe(commune_pluvio_df[commune_view_cols], use_container_width=True, hide_index=True)
 
 st.subheader(f"Top {int(top_n)} stations - {metric_label}")
 top_df = filtered_stations.head(int(top_n)).copy()
