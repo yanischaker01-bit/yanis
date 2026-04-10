@@ -31,10 +31,12 @@ RAIN_METRICS = {
     "30 jours": "rain_30d_mm",
     "Mois courant": "rain_month_mm",
 }
+INFOCLIMAT_HISTORY_SOURCE = "InfoClimat SYNOP (local)"
 HISTORY_SOURCES = [
-    "Open-Meteo MeteoFrance",
+    INFOCLIMAT_HISTORY_SOURCE,
 ]
 HISTORY_SOURCE_COLORS = {
+    INFOCLIMAT_HISTORY_SOURCE: "#0f766e",
     "Open-Meteo MeteoFrance": "#1d4ed8",
 }
 SOURCE_RELIABILITY_HINTS = {
@@ -1014,9 +1016,123 @@ def _fetch_open_meteo_history(
         return pd.DataFrame(), f"{source_label}: {exc}"
 
 
+def _station_id_candidates(station_id: object) -> List[str]:
+    raw = str(station_id or "").strip()
+    if not raw:
+        return []
+    only_digits = "".join(ch for ch in raw if ch.isdigit())
+    out: List[str] = []
+    for val in [raw, only_digits, only_digits.zfill(5), only_digits.lstrip("0"), raw.lstrip("0")]:
+        txt = str(val or "").strip()
+        if txt and txt not in out:
+            out.append(txt)
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=21600)
+def _fetch_infoclimat_history_local(
+    station_id: str,
+    start_day: str,
+    end_day: str,
+    source_label: str = INFOCLIMAT_HISTORY_SOURCE,
+) -> Tuple[pd.DataFrame, str]:
+    sid = str(station_id or "").strip()
+    if not sid:
+        return pd.DataFrame(), f"{source_label}: station_id manquant."
+
+    start_ts = pd.Timestamp(start_day, tz="UTC").normalize()
+    end_ts = pd.Timestamp(end_day, tz="UTC").normalize()
+    if end_ts < start_ts:
+        start_ts, end_ts = end_ts, start_ts
+
+    preferred_year_file = Path(f"data/synop_cache/synop_{int(start_ts.year)}.csv.gz")
+    if preferred_year_file.exists():
+        synop_path = preferred_year_file
+    else:
+        synop_path = _find_latest_file(["data/synop_cache/synop_*.csv.gz", "data/synop_cache/synop.*.csv"])
+    if synop_path is None:
+        return pd.DataFrame(), f"{source_label}: aucun fichier synop_cache disponible."
+
+    id_candidates = _station_id_candidates(sid)
+    id_candidates_z5 = {c.zfill(5) for c in id_candidates if c}
+    rows: List[pd.DataFrame] = []
+    try:
+        usecols_candidates = {"geo_id_wmo", "validity_time", "reference_time", "rr24", "rr12", "rr6", "rr3", "rr1"}
+        stream = pd.read_csv(
+            synop_path,
+            sep=";",
+            dtype=str,
+            usecols=lambda c: c in usecols_candidates,
+            chunksize=250000,
+            low_memory=False,
+            compression="infer",
+        )
+        for chunk in stream:
+            if chunk.empty or "geo_id_wmo" not in chunk.columns:
+                continue
+            chunk_station = chunk["geo_id_wmo"].fillna("").astype(str).str.strip()
+            chunk_station_z5 = chunk_station.str.zfill(5)
+            sub = chunk[chunk_station_z5.isin(id_candidates_z5)].copy()
+            if sub.empty:
+                continue
+
+            if "validity_time" in sub.columns:
+                obs_dt = pd.to_datetime(sub["validity_time"], utc=True, errors="coerce")
+            elif "reference_time" in sub.columns:
+                obs_dt = pd.to_datetime(sub["reference_time"], utc=True, errors="coerce")
+            else:
+                continue
+
+            sub["date"] = obs_dt.dt.normalize()
+            sub = sub.dropna(subset=["date"])
+            sub = sub[(sub["date"] >= start_ts) & (sub["date"] <= end_ts)]
+            if sub.empty:
+                continue
+
+            rr24 = pd.to_numeric(sub["rr24"], errors="coerce") if "rr24" in sub.columns else pd.Series(np.nan, index=sub.index)
+            fallback_cols = [c for c in ["rr12", "rr6", "rr3", "rr1"] if c in sub.columns]
+            if fallback_cols:
+                fallback_rr = sub[fallback_cols].apply(pd.to_numeric, errors="coerce").max(axis=1, skipna=True)
+            else:
+                fallback_rr = pd.Series(np.nan, index=sub.index)
+
+            rain_obs = rr24.where(rr24.notna(), fallback_rr)
+            rain_obs = pd.to_numeric(rain_obs, errors="coerce")
+            rain_obs = rain_obs.where((rain_obs >= 0.0) & (rain_obs < 900.0))
+
+            tmp = pd.DataFrame({"date": sub["date"], "precip_mm": rain_obs})
+            tmp = tmp.dropna(subset=["date", "precip_mm"])
+            if tmp.empty:
+                continue
+            rows.append(tmp)
+    except Exception as exc:
+        return pd.DataFrame(), f"{source_label}: lecture synop impossible ({exc})."
+
+    if not rows:
+        return pd.DataFrame(), f"{source_label}: aucune mesure disponible pour station {sid}."
+
+    out = pd.concat(rows, ignore_index=True)
+    out["date"] = pd.to_datetime(out["date"], utc=True, errors="coerce").dt.normalize()
+    out["precip_mm"] = pd.to_numeric(out["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    out = (
+        out.dropna(subset=["date"])
+        .groupby("date", as_index=False)["precip_mm"]
+        .max()
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+    out["source"] = str(source_label)
+    station_norm = "".join(ch for ch in sid if ch.isdigit()).zfill(5)
+    return (
+        out[["date", "precip_mm", "source"]],
+        f"{source_label}: {len(out)} jours charges pour station {station_norm} ({synop_path.name}).",
+    )
+
+
 def _load_history_multi_source(
     lat: float,
     lon: float,
+    station_id: str,
     start_day: date,
     end_day: date,
     selected_sources: List[str],
@@ -1025,6 +1141,18 @@ def _load_history_multi_source(
     end_iso = str(end_day.isoformat())
     blocks: List[pd.DataFrame] = []
     notices: List[str] = []
+
+    if INFOCLIMAT_HISTORY_SOURCE in selected_sources:
+        df, note = _fetch_infoclimat_history_local(
+            station_id=str(station_id or ""),
+            start_day=start_iso,
+            end_day=end_iso,
+            source_label=INFOCLIMAT_HISTORY_SOURCE,
+        )
+        if not df.empty:
+            blocks.append(df)
+        if note:
+            notices.append(note)
 
     if "Open-Meteo MeteoFrance" in selected_sources:
         df, note = _fetch_open_meteo_history(
@@ -1128,7 +1256,7 @@ def _build_map(
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
-    "Version pro: Open-Meteo MeteoFrance uniquement, fiabilisation des mesures, suivi stations et carte operative."
+    "Version pro: InfoClimat/SYNOP uniquement, fiabilisation des mesures, suivi stations et carte operative."
 )
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
 
@@ -1148,7 +1276,7 @@ infoclimat_local_df, infoclimat_local_notice = _load_infoclimat_synop_local(max_
 if infoclimat_local_notice:
     data_build_notices.append(infoclimat_local_notice)
 
-raw_weather_rows = list(raw_snapshot_weather)
+raw_weather_rows = [row for row in raw_snapshot_weather if _is_infoclimat_source(row.get("source"))]
 if not infoclimat_local_df.empty:
     known_communes = {
         str(row.get("station_id") or "").strip(): str(row.get("station_commune_name") or "").strip()
@@ -1166,27 +1294,11 @@ if not infoclimat_local_df.empty:
     raw_weather_rows = [row for row in raw_weather_rows if not _is_infoclimat_source(row.get("source"))]
     raw_weather_rows.extend(infoclimat_local_df.to_dict(orient="records"))
 
-open_meteo_ref_df = pd.DataFrame()
-if not infoclimat_local_df.empty:
-    ref_points_key = _build_open_meteo_reference_key(infoclimat_local_df)
-    open_meteo_ref_df, open_meteo_ref_notice = _fetch_open_meteo_reference_points(ref_points_key)
-    if open_meteo_ref_notice:
-        data_build_notices.append(open_meteo_ref_notice)
-    if not open_meteo_ref_df.empty:
-        raw_weather_rows = [row for row in raw_weather_rows if not _is_open_meteo_source(row.get("source"))]
-        raw_weather_rows.extend(open_meteo_ref_df.to_dict(orient="records"))
-
-# Mode force: Open-Meteo MeteoFrance uniquement.
-open_meteo_only_rows = [
-    row
-    for row in raw_weather_rows
-    if _is_open_meteo_source(row.get("source"))
-    and ("meteofrance" in str(row.get("meteo_model") or "").strip().lower())
-]
-weather_df = _safe_weather_df({"weather": open_meteo_only_rows})
+weather_df = _safe_weather_df({"weather": raw_weather_rows})
+weather_df = weather_df[weather_df["source"].map(_is_infoclimat_source)].copy()
 if weather_df.empty:
     st.warning(
-        "Aucune donnee Open-Meteo MeteoFrance disponible pour le moment."
+        "Aucune donnee InfoClimat/SYNOP disponible pour le moment."
     )
     st.stop()
 
@@ -1224,7 +1336,7 @@ with st.sidebar:
         help="Ecart relatif (vs mediane des stations proches) au-dela duquel la station est marquee incoherente.",
     )
     selected_sources = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-    st.caption("Source active: Open-Meteo MeteoFrance uniquement")
+    st.caption("Source active: InfoClimat/SYNOP uniquement")
 
     commune_options = sorted(weather_df.get("station_commune_name", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_communes = _multiselect_all("Communes stations", commune_options, key="plv_communes")
@@ -1247,7 +1359,11 @@ if not filtered_stations.empty and selected_stations:
     filtered_stations = filtered_stations[filtered_stations["station_display"].astype(str).isin(selected_stations)]
 
 if filtered_stations.empty:
-    st.warning("Aucune station sur ce filtre.")
+    st.warning(
+        "Aucune station sur ce filtre. "
+        + f"Stations InfoClimat chargees={int(len(weather_df))}. "
+        + "Elargis la distance LGV ou remets les filtres communes/stations sur 'Tout'."
+    )
     st.stop()
 
 if metric_col not in filtered_stations.columns:
@@ -1270,12 +1386,8 @@ with st.sidebar:
     top_n = st.slider("Top stations (graphe)", min_value=1, max_value=top_n_max, value=min(25, top_n_max), step=1)
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
-    history_reference_mode = st.radio(
-        "Reference historique",
-        options=["Commune LGV (aligne app PRO)", "Point station (coordonnees station)"],
-        index=0,
-        help="Le mode commune utilise le centroide LGV de la commune pour aligner les valeurs avec l'app PRO.",
-    )
+    history_reference_mode = "Point station (coordonnees station)"
+    st.caption("Reference historique: station SYNOP selectionnee (station_id).")
     history_station_default = str(filtered_stations.iloc[0]["station_display"])
     history_station_options = sorted(filtered_stations["station_display"].astype(str).unique().tolist())
     history_station_display = st.selectbox(
@@ -1284,7 +1396,7 @@ with st.sidebar:
         index=history_station_options.index(history_station_default),
     )
     history_sources = list(HISTORY_SOURCES)
-    st.caption("Historique: Open-Meteo MeteoFrance")
+    st.caption("Historique: InfoClimat/SYNOP local")
     today_utc = datetime.now(timezone.utc).date()
     history_start = st.date_input(
         "Date debut",
@@ -1434,7 +1546,7 @@ if not worst_df.empty:
     worst_chart.update_layout(height=480, margin=dict(l=10, r=10, t=45, b=10))
     st.plotly_chart(worst_chart, use_container_width=True)
 
-st.caption("Comparatif Open-Meteo vs InfoClimat desactive: application verrouillee sur Open-Meteo MeteoFrance.")
+st.caption("Comparatif multi-sources desactive: application verrouillee sur InfoClimat/SYNOP.")
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
@@ -1506,13 +1618,15 @@ else:
         st.warning("Coordonnees invalides pour charger l'historique.")
     else:
         st.caption(
-            f"Reference historique: {ref_label} | lat={float(ref_lat):.5f}, lon={float(ref_lon):.5f} | timezone=UTC"
+            f"Reference historique: {ref_label} | station_id={str(history_station_id)} | "
+            + f"lat={float(ref_lat):.5f}, lon={float(ref_lon):.5f} | timezone=UTC"
         )
         if ref_notice:
             st.caption(ref_notice)
         hist_df, hist_notices = _load_history_multi_source(
             lat=float(ref_lat),
             lon=float(ref_lon),
+            station_id=str(history_station_id),
             start_day=history_start,
             end_day=history_end,
             selected_sources=history_sources,
