@@ -1506,17 +1506,21 @@ if not infoclimat_weather_df.empty:
         data_build_notices.append(
             f"InfoClimat proche LGV: aucune station retenue (distance<={float(infoclimat_near_max_km):.0f} km)."
         )
+if source_mode == SOURCE_MODE_OPEN:
+    data_build_notices.append(
+        "Mode Open-Meteo strict: stations support limitees aux stations InfoClimat proches LGV "
+        + f"(distance<={float(infoclimat_near_max_km):.0f} km)."
+    )
 
 open_meteo_ref_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
-    if source_mode == SOURCE_MODE_MIX:
-        open_ref_base = infoclimat_near_df.copy()
-    else:
-        open_ref_base = infoclimat_weather_df.copy()
-    if open_ref_base.empty:
-        open_ref_base = infoclimat_near_df.copy()
+    open_ref_base = infoclimat_near_df.copy()
     if open_ref_base.empty and not infoclimat_local_df.empty:
-        open_ref_base = infoclimat_local_df.copy()
+        open_ref_base = _filter_infoclimat_nearest_lgv(
+            stations_df=infoclimat_local_df,
+            max_distance_km=float(infoclimat_near_max_km),
+            max_stations=int(infoclimat_near_top_n),
+        )
     if not open_ref_base.empty:
         ref_points_key = _build_open_meteo_reference_key(open_ref_base)
         open_meteo_ref_df, open_meteo_notice = _fetch_open_meteo_reference_points(
@@ -1563,7 +1567,7 @@ with st.sidebar:
         "Distance max a la LGV (km)",
         min_value=1.0,
         max_value=float(LOCAL_INFOCLIMAT_RADIUS_KM),
-        value=min(120.0, float(LOCAL_INFOCLIMAT_RADIUS_KM)),
+        value=min(40.0, float(LOCAL_INFOCLIMAT_RADIUS_KM)),
         step=0.5,
     )
     compare_radius_km = st.slider(
