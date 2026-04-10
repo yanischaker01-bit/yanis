@@ -422,9 +422,17 @@ def _load_synop_station_name_lookup(station_ids: Tuple[str, ...]) -> Dict[str, s
 
 @st.cache_data(show_spinner=False, ttl=1800)
 def _load_infoclimat_synop_local(max_distance_km: float = LOCAL_INFOCLIMAT_RADIUS_KM) -> Tuple[pd.DataFrame, str]:
-    synop_path = _find_latest_file(["data/synop_all_stations_*.csv"])
+    synop_path = _find_latest_file(
+        [
+            "data/synop_all_stations_*.csv",
+            "seed_data/synop_all_stations_seed.csv",
+        ]
+    )
     if synop_path is None:
-        return pd.DataFrame(), "InfoClimat/SYNOP local: aucun fichier synop_all_stations_*.csv disponible."
+        return pd.DataFrame(), (
+            "InfoClimat/SYNOP local: aucun fichier synop_all_stations_*.csv disponible "
+            "(ni seed_data/synop_all_stations_seed.csv)."
+        )
     try:
         df = pd.read_csv(synop_path, dtype=str)
     except Exception as exc:
