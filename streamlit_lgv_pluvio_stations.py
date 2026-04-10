@@ -883,8 +883,9 @@ def _filter_infoclimat_nearest_lgv(
                 if _is_unknown_commune(work.loc[h, "station_commune_name"]):
                     work.loc[h, "station_commune_name"] = commune
 
-    top_n = max(1, int(max_stations))
-    nearest_idx = set(work.head(top_n).index.tolist())
+    # Keep all stations within distance threshold (no top-N truncation).
+    _ = max_stations  # kept for backward compatibility in call sites
+    nearest_idx = set(work.index.tolist())
     keep_idx = sorted(nearest_idx.union(priority_idx))
     out = work.loc[keep_idx].copy()
     out["selection_mode"] = out.get("selection_mode", pd.Series("", index=out.index)).fillna("").astype(str)
@@ -1503,22 +1504,9 @@ with st.sidebar:
         index=0,
         help="Open-Meteo par defaut. Option mixte disponible avec stations InfoClimat les plus proches LGV.",
     )
-    infoclimat_near_max_km = st.slider(
-        "InfoClimat: distance max LGV (km)",
-        min_value=5.0,
-        max_value=float(LOCAL_INFOCLIMAT_RADIUS_KM),
-        value=40.0,
-        step=1.0,
-        disabled=(source_mode != SOURCE_MODE_MIX),
-    )
-    infoclimat_near_top_n = st.slider(
-        "InfoClimat: nb stations proches",
-        min_value=3,
-        max_value=30,
-        value=12,
-        step=1,
-        disabled=(source_mode != SOURCE_MODE_MIX),
-    )
+    infoclimat_near_max_km = 10.0
+    infoclimat_near_top_n = 9999
+    st.caption("Regle pro: toutes stations InfoClimat a <=10 km de la LGV SEA.")
 
 try:
     snapshot, snapshot_source = _load_snapshot_payload()
@@ -1579,7 +1567,7 @@ if not infoclimat_weather_df.empty:
         data_build_notices.append(
             "InfoClimat proche LGV: "
             + f"{len(infoclimat_near_df)} stations retenues "
-            + f"(distance<={float(infoclimat_near_max_km):.0f} km, top={int(infoclimat_near_top_n)}, prioritaires={priority_count})."
+            + f"(distance<={float(infoclimat_near_max_km):.0f} km, toutes stations, prioritaires={priority_count})."
         )
     else:
         data_build_notices.append(
