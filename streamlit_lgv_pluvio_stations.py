@@ -1509,9 +1509,12 @@ if not infoclimat_weather_df.empty:
 
 open_meteo_ref_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
-    open_ref_base = infoclimat_near_df.copy()
-    if open_ref_base.empty:
+    if source_mode == SOURCE_MODE_MIX:
+        open_ref_base = infoclimat_near_df.copy()
+    else:
         open_ref_base = infoclimat_weather_df.copy()
+    if open_ref_base.empty:
+        open_ref_base = infoclimat_near_df.copy()
     if open_ref_base.empty and not infoclimat_local_df.empty:
         open_ref_base = infoclimat_local_df.copy()
     if not open_ref_base.empty:
