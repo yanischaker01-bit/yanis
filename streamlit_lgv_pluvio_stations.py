@@ -27,6 +27,9 @@ OPEN_METEO_SOURCE_LABEL = "Open-Meteo MeteoFrance"
 SOURCE_MODE_OPEN = "Open-Meteo MeteoFrance"
 SOURCE_MODE_MIX = "Open-Meteo + InfoClimat proches LGV"
 INFOCLIMAT_PRIORITY_MATCH_KM = 25.0
+INFOCLIMAT_STRICT_RADIUS_KM = 10.0
+INFOCLIMAT_MIN_STATIONS_COVERAGE = 4
+INFOCLIMAT_ADAPTIVE_RADII_KM = [10.0, 20.0, 30.0, 40.0, 50.0]
 INFOCLIMAT_PRIORITY_STATIONS = [
     {"name": "ST GERVAIS", "commune": "Saint-Gervais", "lat": 45.03, "lon": -0.47, "aliases": ["MF33415001", "ST GERVAIS"]},
     {"name": "MONTLIEU_SAPC", "commune": "Montlieu-la-Garde", "lat": 45.22, "lon": -0.29, "aliases": ["MF17243002", "MONTLIEU"]},
@@ -907,6 +910,52 @@ def _filter_infoclimat_nearest_lgv(
     return out.drop(columns=["_orig_idx"], errors="ignore").reset_index(drop=True)
 
 
+def _select_infoclimat_monitoring_set(
+    stations_df: pd.DataFrame,
+    preferred_radius_km: float = INFOCLIMAT_STRICT_RADIUS_KM,
+    min_stations: int = INFOCLIMAT_MIN_STATIONS_COVERAGE,
+) -> Tuple[pd.DataFrame, float, bool]:
+    if stations_df.empty:
+        return pd.DataFrame(), float(preferred_radius_km), False
+
+    radii: List[float] = []
+    for r in INFOCLIMAT_ADAPTIVE_RADII_KM:
+        rv = float(r)
+        if rv not in radii:
+            radii.append(rv)
+    if float(preferred_radius_km) not in radii:
+        radii.insert(0, float(preferred_radius_km))
+    radii = sorted(radii)
+
+    selected = pd.DataFrame()
+    used_radius = float(preferred_radius_km)
+    adaptive_used = False
+    best_non_empty = pd.DataFrame()
+    best_radius = float(preferred_radius_km)
+
+    for radius in radii:
+        candidate = _filter_infoclimat_nearest_lgv(
+            stations_df=stations_df,
+            max_distance_km=float(radius),
+            max_stations=9999,
+        )
+        if not candidate.empty:
+            best_non_empty = candidate.copy()
+            best_radius = float(radius)
+        if len(candidate) >= int(min_stations):
+            selected = candidate.copy()
+            used_radius = float(radius)
+            adaptive_used = float(radius) > float(preferred_radius_km)
+            break
+
+    if selected.empty and not best_non_empty.empty:
+        selected = best_non_empty.copy()
+        used_radius = float(best_radius)
+        adaptive_used = float(best_radius) > float(preferred_radius_km)
+
+    return selected, used_radius, adaptive_used
+
+
 def _source_reliability_note(source: object) -> float:
     txt = str(source or "").strip().upper()
     if not txt:
@@ -1504,9 +1553,12 @@ with st.sidebar:
         index=0,
         help="Open-Meteo par defaut. Option mixte disponible avec stations InfoClimat les plus proches LGV.",
     )
-    infoclimat_near_max_km = 10.0
+    infoclimat_near_max_km = float(INFOCLIMAT_STRICT_RADIUS_KM)
     infoclimat_near_top_n = 9999
-    st.caption("Regle pro: toutes stations InfoClimat a <=10 km de la LGV SEA.")
+    st.caption(
+        "Regle pro: toutes stations InfoClimat a <=10 km de la LGV SEA, "
+        "avec elargissement automatique si couverture insuffisante."
+    )
 
 try:
     snapshot, snapshot_source = _load_snapshot_payload()
@@ -1557,18 +1609,22 @@ if not infoclimat_weather_df.empty:
 
 infoclimat_near_df = pd.DataFrame()
 if not infoclimat_weather_df.empty:
-    infoclimat_near_df = _filter_infoclimat_nearest_lgv(
+    infoclimat_near_df, used_monitor_radius_km, adaptive_radius_used = _select_infoclimat_monitoring_set(
         stations_df=infoclimat_weather_df,
-        max_distance_km=float(infoclimat_near_max_km),
-        max_stations=int(infoclimat_near_top_n),
+        preferred_radius_km=float(infoclimat_near_max_km),
+        min_stations=int(INFOCLIMAT_MIN_STATIONS_COVERAGE),
     )
     if not infoclimat_near_df.empty:
         priority_count = int((infoclimat_near_df.get("priority_name", pd.Series("", index=infoclimat_near_df.index)).astype(str).str.len() > 0).sum())
         data_build_notices.append(
             "InfoClimat proche LGV: "
             + f"{len(infoclimat_near_df)} stations retenues "
-            + f"(distance<={float(infoclimat_near_max_km):.0f} km, toutes stations, prioritaires={priority_count})."
+            + f"(distance<={float(used_monitor_radius_km):.0f} km, toutes stations, prioritaires={priority_count})."
         )
+        if adaptive_radius_used:
+            data_build_notices.append(
+                "Couverture adaptee: rayon elargi automatiquement pour eviter une surveillance mono-station."
+            )
     else:
         data_build_notices.append(
             f"InfoClimat proche LGV: aucune station retenue (distance<={float(infoclimat_near_max_km):.0f} km)."
@@ -1583,11 +1639,16 @@ open_meteo_ref_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
     open_ref_base = infoclimat_near_df.copy()
     if open_ref_base.empty and not infoclimat_local_df.empty:
-        open_ref_base = _filter_infoclimat_nearest_lgv(
+        open_ref_base, used_local_radius_km, adaptive_local_radius = _select_infoclimat_monitoring_set(
             stations_df=infoclimat_local_df,
-            max_distance_km=float(infoclimat_near_max_km),
-            max_stations=int(infoclimat_near_top_n),
+            preferred_radius_km=float(infoclimat_near_max_km),
+            min_stations=int(INFOCLIMAT_MIN_STATIONS_COVERAGE),
         )
+        if adaptive_local_radius:
+            data_build_notices.append(
+                "Couverture adaptee (fallback local): rayon elargi automatiquement "
+                + f"jusqu'a {float(used_local_radius_km):.0f} km."
+            )
     if not open_ref_base.empty:
         ref_points_key = _build_open_meteo_reference_key(open_ref_base)
         open_meteo_ref_df, open_meteo_notice = _fetch_open_meteo_reference_points(
