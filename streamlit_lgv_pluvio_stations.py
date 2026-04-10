@@ -606,6 +606,32 @@ def _build_open_meteo_reference_key(stations_df: pd.DataFrame) -> Tuple[Tuple[st
     return tuple(rows)
 
 
+def _build_open_meteo_key_from_lgv_communes() -> Tuple[Tuple[str, str, str, float, float, float], ...]:
+    communes_df = _load_lgv_communes_catalog()
+    if communes_df.empty:
+        return tuple()
+    work = communes_df.copy()
+    work["centroid_latitude"] = pd.to_numeric(work.get("centroid_latitude"), errors="coerce")
+    work["centroid_longitude"] = pd.to_numeric(work.get("centroid_longitude"), errors="coerce")
+    work = work.dropna(subset=["centroid_latitude", "centroid_longitude"]).copy()
+    if work.empty:
+        return tuple()
+
+    rows: List[Tuple[str, str, str, float, float, float]] = []
+    for _, row in work.iterrows():
+        code = str(row.get("commune_code") or "").strip()
+        commune = str(row.get("commune_name") or "").strip()
+        if not commune:
+            continue
+        sid = code if code else f"LGVCOMM_{len(rows)+1:03d}"
+        lat = float(pd.to_numeric(row.get("centroid_latitude"), errors="coerce"))
+        lon = float(pd.to_numeric(row.get("centroid_longitude"), errors="coerce"))
+        # Commune traversed by LGV SEA -> considered as on-corridor reference.
+        rows.append((sid, commune, commune, lat, lon, 0.0))
+    rows.sort(key=lambda x: x[0])
+    return tuple(rows)
+
+
 @st.cache_data(show_spinner=False, ttl=1800)
 def _fetch_open_meteo_reference_points(
     points_key: Tuple[Tuple[str, str, str, float, float, float], ...],
@@ -1648,26 +1674,31 @@ if source_mode == SOURCE_MODE_OPEN:
 
 open_meteo_ref_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
-    open_ref_base = infoclimat_near_df.copy()
-    if open_ref_base.empty and not infoclimat_local_df.empty:
-        open_ref_base, used_local_radius_km, adaptive_local_radius = _select_infoclimat_monitoring_set(
-            stations_df=infoclimat_local_df,
-            preferred_radius_km=float(infoclimat_near_max_km),
-            min_stations=int(INFOCLIMAT_MIN_STATIONS_COVERAGE),
-        )
-        if adaptive_local_radius:
-            data_build_notices.append(
-                "Couverture adaptee (fallback local): rayon elargi automatiquement "
-                + f"jusqu'a {float(used_local_radius_km):.0f} km."
+    ref_points_key = _build_open_meteo_key_from_lgv_communes()
+    if not ref_points_key:
+        open_ref_base = infoclimat_near_df.copy()
+        if open_ref_base.empty and not infoclimat_local_df.empty:
+            open_ref_base, used_local_radius_km, adaptive_local_radius = _select_infoclimat_monitoring_set(
+                stations_df=infoclimat_local_df,
+                preferred_radius_km=float(infoclimat_near_max_km),
+                min_stations=int(INFOCLIMAT_MIN_STATIONS_COVERAGE),
             )
-    if not open_ref_base.empty:
-        ref_points_key = _build_open_meteo_reference_key(open_ref_base)
+            if adaptive_local_radius:
+                data_build_notices.append(
+                    "Couverture adaptee (fallback local): rayon elargi automatiquement "
+                    + f"jusqu'a {float(used_local_radius_km):.0f} km."
+                )
+        ref_points_key = _build_open_meteo_reference_key(open_ref_base) if not open_ref_base.empty else tuple()
+    if ref_points_key:
         open_meteo_ref_df, open_meteo_notice = _fetch_open_meteo_reference_points(
             ref_points_key,
             model=OPEN_METEO_MODEL_METEOFRANCE,
         )
         if open_meteo_notice:
             data_build_notices.append(open_meteo_notice)
+        data_build_notices.append(
+            "Open-Meteo MeteoFrance: stations generees pour chaque commune traversee par la LGV SEA."
+        )
         if not open_meteo_ref_df.empty:
             open_meteo_ref_df = open_meteo_ref_df.copy()
             open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
