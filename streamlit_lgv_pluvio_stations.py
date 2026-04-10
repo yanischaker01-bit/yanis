@@ -28,17 +28,17 @@ SOURCE_MODE_OPEN = "Open-Meteo MeteoFrance"
 SOURCE_MODE_MIX = "Open-Meteo + InfoClimat proches LGV"
 INFOCLIMAT_PRIORITY_MATCH_KM = 25.0
 INFOCLIMAT_PRIORITY_STATIONS = [
-    {"name": "ST GERVAIS", "lat": 45.03, "lon": -0.47, "aliases": ["MF33415001", "ST GERVAIS"]},
-    {"name": "MONTLIEU_SAPC", "lat": 45.22, "lon": -0.29, "aliases": ["MF17243002", "MONTLIEU"]},
-    {"name": "PASSIRAC", "lat": 45.33, "lon": -0.08, "aliases": ["MF16256001", "PASSIRAC"]},
-    {"name": "LA COURONNE", "lat": 45.63, "lon": 0.10, "aliases": ["MF16113001", "LA COURONNE"]},
-    {"name": "Angouleme - Brie-Champnier", "lat": 45.73, "lon": 0.22, "aliases": ["07420", "MF16078001", "ANGOULEME"]},
-    {"name": "BRUX_SAPC", "lat": 46.28, "lon": 0.19, "aliases": ["MF86039001", "BRUX"]},
-    {"name": "JOUE-LES-TOURS OB", "lat": 47.33, "lon": 0.66, "aliases": ["MF37122001", "JOUE LES TOURS"]},
-    {"name": "SAINT-EPAIN", "lat": 47.16, "lon": 0.60, "aliases": ["MF37216003", "SAINT-EPAIN", "ST EPAIN"]},
-    {"name": "Les Ormes", "lat": 46.97, "lon": 0.60, "aliases": ["LES ORMES"]},
-    {"name": "Naintre", "lat": 46.76, "lon": 0.48, "aliases": ["NAINTRE"]},
-    {"name": "Poitiers-Biard", "lat": 46.59, "lon": 0.31, "aliases": ["07335", "MF86027001", "POITIERS-BIARD"]},
+    {"name": "ST GERVAIS", "commune": "Saint-Gervais", "lat": 45.03, "lon": -0.47, "aliases": ["MF33415001", "ST GERVAIS"]},
+    {"name": "MONTLIEU_SAPC", "commune": "Montlieu-la-Garde", "lat": 45.22, "lon": -0.29, "aliases": ["MF17243002", "MONTLIEU"]},
+    {"name": "PASSIRAC", "commune": "Passirac", "lat": 45.33, "lon": -0.08, "aliases": ["MF16256001", "PASSIRAC"]},
+    {"name": "LA COURONNE", "commune": "La Couronne", "lat": 45.63, "lon": 0.10, "aliases": ["MF16113001", "LA COURONNE"]},
+    {"name": "Angouleme - Brie-Champnier", "commune": "Brie", "lat": 45.73, "lon": 0.22, "aliases": ["07420", "MF16078001", "ANGOULEME"]},
+    {"name": "BRUX_SAPC", "commune": "Brux", "lat": 46.28, "lon": 0.19, "aliases": ["MF86039001", "BRUX"]},
+    {"name": "JOUE-LES-TOURS OB", "commune": "Joue-les-Tours", "lat": 47.33, "lon": 0.66, "aliases": ["MF37122001", "JOUE LES TOURS"]},
+    {"name": "SAINT-EPAIN", "commune": "Saint-Epain", "lat": 47.16, "lon": 0.60, "aliases": ["MF37216003", "SAINT-EPAIN", "ST EPAIN"]},
+    {"name": "Les Ormes", "commune": "Les Ormes", "lat": 46.97, "lon": 0.60, "aliases": ["LES ORMES"]},
+    {"name": "Naintre", "commune": "Naintre", "lat": 46.76, "lon": 0.48, "aliases": ["NAINTRE"]},
+    {"name": "Poitiers-Biard", "commune": "Poitiers", "lat": 46.59, "lon": 0.31, "aliases": ["07335", "MF86027001", "POITIERS-BIARD"]},
 ]
 
 HISTORY_MIN_DATE = date(2026, 1, 1)
@@ -168,6 +168,33 @@ def _safe_weather_df(payload: Dict[str, object]) -> pd.DataFrame:
     commune_name = df["station_commune_name"].fillna("Inconnue").astype(str).str.strip()
     station_id = df["station_id"].fillna("station_inconnue").astype(str).str.strip()
     station_name = station_name.fillna("").astype(str).str.strip()
+
+    # Enrich commune names: priority station mapping first, then nearest LGV commune by coordinates.
+    for idx in df.index:
+        if not _is_unknown_commune(commune_name.loc[idx]):
+            continue
+        inferred = _priority_commune_from_row(
+            station_id=station_id.loc[idx],
+            station_name=station_name.loc[idx],
+            commune_name=commune_name.loc[idx],
+        )
+        if inferred:
+            commune_name.loc[idx] = inferred
+
+    for idx in df.index:
+        if not _is_unknown_commune(commune_name.loc[idx]):
+            continue
+        lat = pd.to_numeric(df.loc[idx, "latitude"], errors="coerce") if "latitude" in df.columns else np.nan
+        lon = pd.to_numeric(df.loc[idx, "longitude"], errors="coerce") if "longitude" in df.columns else np.nan
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        nearest = _nearest_lgv_commune_name(float(lat), float(lon), max_km=45.0)
+        if nearest:
+            commune_name.loc[idx] = nearest
+
+    commune_name = commune_name.fillna("Inconnue").astype(str).str.strip()
+    df["station_commune_name"] = commune_name
+
     invalid_name = (
         (station_name.str.len() <= 0)
         | (station_name.str.lower() == station_id.str.lower())
@@ -739,6 +766,54 @@ def _ascii_norm(txt: object) -> str:
     return " ".join(norm.split())
 
 
+def _is_unknown_commune(txt: object) -> bool:
+    val = _ascii_norm(txt)
+    return val in {"", "inconnue", "inconnu", "unknown", "na", "n a"}
+
+
+def _priority_commune_from_row(station_id: object, station_name: object, commune_name: object) -> str:
+    sid_digits = "".join(ch for ch in str(station_id or "") if ch.isdigit())
+    sid_norm = sid_digits.zfill(5) if sid_digits else ""
+    name_norm = _ascii_norm(station_name)
+    commune_norm = _ascii_norm(commune_name)
+    for item in INFOCLIMAT_PRIORITY_STATIONS:
+        target_commune = str(item.get("commune") or item.get("name") or "").strip()
+        aliases = [str(a) for a in item.get("aliases", [])] + [str(item.get("name") or "")]
+        for alias in aliases:
+            alias_digits = "".join(ch for ch in str(alias) if ch.isdigit())
+            alias_norm = _ascii_norm(alias)
+            if alias_digits and sid_norm and sid_norm == alias_digits.zfill(5):
+                return target_commune
+            if alias_norm and (alias_norm in name_norm or alias_norm in commune_norm):
+                return target_commune
+    return ""
+
+
+def _nearest_lgv_commune_name(lat: float, lon: float, max_km: float = 40.0) -> str:
+    catalog = _load_lgv_communes_catalog()
+    if catalog.empty:
+        return ""
+    c_lat = pd.to_numeric(catalog.get("centroid_latitude"), errors="coerce").to_numpy(dtype=float)
+    c_lon = pd.to_numeric(catalog.get("centroid_longitude"), errors="coerce").to_numpy(dtype=float)
+    if c_lat.size == 0 or c_lon.size == 0:
+        return ""
+
+    r = 6371.0
+    p1 = np.radians(float(lat))
+    p2 = np.radians(c_lat)
+    dlat = np.radians(c_lat - float(lat))
+    dlon = np.radians(c_lon - float(lon))
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlon / 2.0) ** 2
+    dist = 2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    if dist.size <= 0:
+        return ""
+    best_idx = int(np.nanargmin(dist))
+    best_dist = float(dist[best_idx])
+    if best_dist > float(max_km):
+        return ""
+    return str(catalog.iloc[best_idx].get("commune_name") or "").strip()
+
+
 def _filter_infoclimat_nearest_lgv(
     stations_df: pd.DataFrame,
     max_distance_km: float,
@@ -772,6 +847,7 @@ def _filter_infoclimat_nearest_lgv(
         lat = float(item["lat"])
         lon = float(item["lon"])
         name = str(item["name"])
+        commune = str(item.get("commune") or name)
         aliases = [str(a) for a in item.get("aliases", [])]
 
         # 1) Spatial nearest match.
@@ -787,6 +863,7 @@ def _filter_infoclimat_nearest_lgv(
                 work.loc[best_idx, "priority_name"] = name
                 work.loc[best_idx, "priority_match_km"] = best_dist
                 work.loc[best_idx, "station_name"] = name
+                work.loc[best_idx, "station_commune_name"] = commune
 
         # 2) Alias textual/id match.
         for alias in aliases:
@@ -803,6 +880,8 @@ def _filter_infoclimat_nearest_lgv(
                 if not str(work.loc[h, "priority_name"]).strip():
                     work.loc[h, "priority_name"] = name
                 work.loc[h, "station_name"] = name
+                if _is_unknown_commune(work.loc[h, "station_commune_name"]):
+                    work.loc[h, "station_commune_name"] = commune
 
     top_n = max(1, int(max_stations))
     nearest_idx = set(work.head(top_n).index.tolist())
@@ -1772,6 +1851,29 @@ with st.expander("Localisation des stations (lat/lon)", expanded=False):
     loc_cols = [c for c in loc_cols if c in filtered_stations.columns]
     st.dataframe(
         filtered_stations[loc_cols].sort_values(["distance_to_lgv_km", "station_display"], ascending=[True, True]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+open_loc_df = filtered_stations[
+    filtered_stations.get("source", pd.Series("", index=filtered_stations.index)).astype(str) == OPEN_METEO_SOURCE_LABEL
+].copy()
+st.subheader("Localisation Open-Meteo par commune")
+if open_loc_df.empty:
+    st.info("Aucune station Open-Meteo visible sur ce filtre.")
+else:
+    open_loc_cols = [
+        "station_display",
+        "station_commune_name",
+        "latitude",
+        "longitude",
+        "distance_to_lgv_km",
+        metric_col,
+        "date_obs_raw",
+    ]
+    open_loc_cols = [c for c in open_loc_cols if c in open_loc_df.columns]
+    st.dataframe(
+        open_loc_df[open_loc_cols].sort_values(["distance_to_lgv_km", "station_commune_name"], ascending=[True, True]),
         use_container_width=True,
         hide_index=True,
     )
