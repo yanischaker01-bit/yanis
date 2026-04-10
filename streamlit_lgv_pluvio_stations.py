@@ -24,9 +24,22 @@ OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_MODEL_METEOFRANCE = "meteofrance_seamless"
 OPEN_METEO_SOURCE_LABEL = "Open-Meteo MeteoFrance"
-SOURCE_MODE_INFO = "InfoClimat/SYNOP"
 SOURCE_MODE_OPEN = "Open-Meteo MeteoFrance"
-SOURCE_MODE_MIX = "Mixte InfoClimat + Open-Meteo"
+SOURCE_MODE_MIX = "Open-Meteo + InfoClimat proches LGV"
+INFOCLIMAT_PRIORITY_MATCH_KM = 25.0
+INFOCLIMAT_PRIORITY_STATIONS = [
+    {"name": "ST GERVAIS", "lat": 45.03, "lon": -0.47, "aliases": ["MF33415001", "ST GERVAIS"]},
+    {"name": "MONTLIEU_SAPC", "lat": 45.22, "lon": -0.29, "aliases": ["MF17243002", "MONTLIEU"]},
+    {"name": "PASSIRAC", "lat": 45.33, "lon": -0.08, "aliases": ["MF16256001", "PASSIRAC"]},
+    {"name": "LA COURONNE", "lat": 45.63, "lon": 0.10, "aliases": ["MF16113001", "LA COURONNE"]},
+    {"name": "Angouleme - Brie-Champnier", "lat": 45.73, "lon": 0.22, "aliases": ["07420", "MF16078001", "ANGOULEME"]},
+    {"name": "BRUX_SAPC", "lat": 46.28, "lon": 0.19, "aliases": ["MF86039001", "BRUX"]},
+    {"name": "JOUE-LES-TOURS OB", "lat": 47.33, "lon": 0.66, "aliases": ["MF37122001", "JOUE LES TOURS"]},
+    {"name": "SAINT-EPAIN", "lat": 47.16, "lon": 0.60, "aliases": ["MF37216003", "SAINT-EPAIN", "ST EPAIN"]},
+    {"name": "Les Ormes", "lat": 46.97, "lon": 0.60, "aliases": ["LES ORMES"]},
+    {"name": "Naintre", "lat": 46.76, "lon": 0.48, "aliases": ["NAINTRE"]},
+    {"name": "Poitiers-Biard", "lat": 46.59, "lon": 0.31, "aliases": ["07335", "MF86027001", "POITIERS-BIARD"]},
+]
 
 HISTORY_MIN_DATE = date(2026, 1, 1)
 RAIN_METRICS = {
@@ -716,6 +729,104 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return float(2.0 * r * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a)))
 
 
+def _ascii_norm(txt: object) -> str:
+    raw = str(txt or "").strip().lower()
+    if not raw:
+        return ""
+    norm = unicodedata.normalize("NFKD", raw)
+    norm = "".join(ch for ch in norm if not unicodedata.combining(ch))
+    norm = norm.replace("-", " ").replace("_", " ").replace("'", " ")
+    return " ".join(norm.split())
+
+
+def _filter_infoclimat_nearest_lgv(
+    stations_df: pd.DataFrame,
+    max_distance_km: float,
+    max_stations: int,
+) -> pd.DataFrame:
+    if stations_df.empty:
+        return stations_df.copy()
+
+    work = stations_df.copy()
+    work["distance_to_lgv_km"] = pd.to_numeric(work.get("distance_to_lgv_km"), errors="coerce")
+    work["latitude"] = pd.to_numeric(work.get("latitude"), errors="coerce")
+    work["longitude"] = pd.to_numeric(work.get("longitude"), errors="coerce")
+    work = work.dropna(subset=["latitude", "longitude"]).copy()
+    if work.empty:
+        return work
+
+    work = work[work["distance_to_lgv_km"].fillna(9999.0) <= float(max_distance_km)].copy()
+    if work.empty:
+        return work
+    work = work.sort_values("distance_to_lgv_km", ascending=True).reset_index(drop=False).rename(columns={"index": "_orig_idx"})
+    work["priority_name"] = ""
+    work["priority_match_km"] = np.nan
+
+    # Match user-priority stations by nearest coordinate and by alias in station labels.
+    station_id_norm = work.get("station_id", pd.Series("", index=work.index)).fillna("").astype(str).str.zfill(5)
+    station_name_norm = work.get("station_name", pd.Series("", index=work.index)).fillna("").map(_ascii_norm)
+    commune_name_norm = work.get("station_commune_name", pd.Series("", index=work.index)).fillna("").map(_ascii_norm)
+
+    priority_idx: set[int] = set()
+    for item in INFOCLIMAT_PRIORITY_STATIONS:
+        lat = float(item["lat"])
+        lon = float(item["lon"])
+        name = str(item["name"])
+        aliases = [str(a) for a in item.get("aliases", [])]
+
+        # 1) Spatial nearest match.
+        dists = work.apply(
+            lambda r: _haversine_km(lat, lon, float(r["latitude"]), float(r["longitude"])),
+            axis=1,
+        )
+        if not dists.empty and dists.notna().any():
+            best_idx = int(dists.idxmin())
+            best_dist = float(dists.loc[best_idx])
+            if best_dist <= float(INFOCLIMAT_PRIORITY_MATCH_KM):
+                priority_idx.add(best_idx)
+                work.loc[best_idx, "priority_name"] = name
+                work.loc[best_idx, "priority_match_km"] = best_dist
+                work.loc[best_idx, "station_name"] = name
+
+        # 2) Alias textual/id match.
+        for alias in aliases:
+            alias_norm = _ascii_norm(alias)
+            alias_digits = "".join(ch for ch in alias if ch.isdigit())
+            mask = pd.Series(False, index=work.index)
+            if alias_norm:
+                mask = mask | station_name_norm.str.contains(alias_norm, regex=False) | commune_name_norm.str.contains(alias_norm, regex=False)
+            if alias_digits:
+                mask = mask | (station_id_norm == alias_digits.zfill(5))
+            hits = work[mask].index.tolist()
+            for h in hits:
+                priority_idx.add(int(h))
+                if not str(work.loc[h, "priority_name"]).strip():
+                    work.loc[h, "priority_name"] = name
+                work.loc[h, "station_name"] = name
+
+    top_n = max(1, int(max_stations))
+    nearest_idx = set(work.head(top_n).index.tolist())
+    keep_idx = sorted(nearest_idx.union(priority_idx))
+    out = work.loc[keep_idx].copy()
+    out["selection_mode"] = out.get("selection_mode", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["selection_mode"] = np.where(
+        out["selection_mode"].str.len() > 0,
+        out["selection_mode"] + ";nearest_lgv_priority",
+        "nearest_lgv_priority",
+    )
+    out["station_name"] = out.get("station_name", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    out["station_commune_name"] = out.get("station_commune_name", pd.Series("", index=out.index)).fillna("Inconnue").astype(str).str.strip()
+    out["station_id"] = out.get("station_id", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    same_commune = out["station_name"].str.lower() == out["station_commune_name"].str.lower()
+    out["station_display"] = np.where(
+        same_commune,
+        out["station_commune_name"] + " (" + out["station_id"] + ")",
+        out["station_name"] + " (" + out["station_commune_name"] + " - " + out["station_id"] + ")",
+    )
+    out = out.sort_values(["distance_to_lgv_km", "priority_match_km"], ascending=[True, True], na_position="last")
+    return out.drop(columns=["_orig_idx"], errors="ignore").reset_index(drop=True)
+
+
 def _source_reliability_note(source: object) -> float:
     txt = str(source or "").strip().upper()
     if not txt:
@@ -1302,16 +1413,32 @@ def _build_map(
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
-    "Version pro: stations InfoClimat geolocalisees + Open-Meteo MeteoFrance, fiabilisation des mesures et suivi LGV."
+    "Version pro: Open-Meteo par defaut, avec option InfoClimat proche LGV SEA pour comparaison et fiabilisation."
 )
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
 with st.sidebar:
     st.subheader("Sources")
     source_mode = st.selectbox(
         "Jeu de donnees",
-        options=[SOURCE_MODE_MIX, SOURCE_MODE_INFO, SOURCE_MODE_OPEN],
+        options=[SOURCE_MODE_OPEN, SOURCE_MODE_MIX],
         index=0,
-        help="Mixte = mesures InfoClimat/SYNOP + reference Open-Meteo sur les memes points.",
+        help="Open-Meteo par defaut. Option mixte disponible avec stations InfoClimat les plus proches LGV.",
+    )
+    infoclimat_near_max_km = st.slider(
+        "InfoClimat: distance max LGV (km)",
+        min_value=5.0,
+        max_value=float(LOCAL_INFOCLIMAT_RADIUS_KM),
+        value=40.0,
+        step=1.0,
+        disabled=(source_mode != SOURCE_MODE_MIX),
+    )
+    infoclimat_near_top_n = st.slider(
+        "InfoClimat: nb stations proches",
+        min_value=3,
+        max_value=30,
+        value=12,
+        step=1,
+        disabled=(source_mode != SOURCE_MODE_MIX),
     )
 
 try:
@@ -1361,9 +1488,30 @@ if not infoclimat_weather_df.empty:
     )
     infoclimat_weather_df = infoclimat_weather_df[info_mask].copy()
 
+infoclimat_near_df = pd.DataFrame()
+if not infoclimat_weather_df.empty:
+    infoclimat_near_df = _filter_infoclimat_nearest_lgv(
+        stations_df=infoclimat_weather_df,
+        max_distance_km=float(infoclimat_near_max_km),
+        max_stations=int(infoclimat_near_top_n),
+    )
+    if not infoclimat_near_df.empty:
+        priority_count = int((infoclimat_near_df.get("priority_name", pd.Series("", index=infoclimat_near_df.index)).astype(str).str.len() > 0).sum())
+        data_build_notices.append(
+            "InfoClimat proche LGV: "
+            + f"{len(infoclimat_near_df)} stations retenues "
+            + f"(distance<={float(infoclimat_near_max_km):.0f} km, top={int(infoclimat_near_top_n)}, prioritaires={priority_count})."
+        )
+    else:
+        data_build_notices.append(
+            f"InfoClimat proche LGV: aucune station retenue (distance<={float(infoclimat_near_max_km):.0f} km)."
+        )
+
 open_meteo_ref_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
-    open_ref_base = infoclimat_weather_df.copy()
+    open_ref_base = infoclimat_near_df.copy()
+    if open_ref_base.empty:
+        open_ref_base = infoclimat_weather_df.copy()
     if open_ref_base.empty and not infoclimat_local_df.empty:
         open_ref_base = infoclimat_local_df.copy()
     if not open_ref_base.empty:
@@ -1381,10 +1529,13 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
         data_build_notices.append("Open-Meteo reference: aucune station InfoClimat geolocalisee disponible.")
 
 weather_blocks: List[pd.DataFrame] = []
-if source_mode in {SOURCE_MODE_INFO, SOURCE_MODE_MIX} and not infoclimat_weather_df.empty:
-    weather_blocks.append(infoclimat_weather_df)
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} and not open_meteo_ref_df.empty:
     weather_blocks.append(open_meteo_ref_df)
+if source_mode == SOURCE_MODE_MIX and not infoclimat_near_df.empty:
+    weather_blocks.append(infoclimat_near_df)
+if (source_mode == SOURCE_MODE_OPEN) and open_meteo_ref_df.empty and not infoclimat_near_df.empty:
+    weather_blocks.append(infoclimat_near_df)
+    data_build_notices.append("Fallback: Open-Meteo indisponible, affichage temporaire InfoClimat proche LGV.")
 if weather_blocks:
     merged_rows = pd.concat(weather_blocks, ignore_index=True, sort=False).to_dict(orient="records")
     weather_df = _safe_weather_df({"weather": merged_rows})
@@ -1504,9 +1655,7 @@ with st.sidebar:
         index=history_station_options.index(history_station_default),
     )
     history_source_options = [INFOCLIMAT_HISTORY_SOURCE, OPEN_METEO_SOURCE_LABEL]
-    if source_mode == SOURCE_MODE_INFO:
-        history_default_sources = [INFOCLIMAT_HISTORY_SOURCE]
-    elif source_mode == SOURCE_MODE_OPEN:
+    if source_mode == SOURCE_MODE_OPEN:
         history_default_sources = [OPEN_METEO_SOURCE_LABEL]
     else:
         history_default_sources = [INFOCLIMAT_HISTORY_SOURCE, OPEN_METEO_SOURCE_LABEL]
@@ -1605,6 +1754,8 @@ with st.expander("Localisation des stations (lat/lon)", expanded=False):
         "station_display",
         "station_id",
         "station_commune_name",
+        "priority_name",
+        "priority_match_km",
         "source",
         "latitude",
         "longitude",
@@ -1690,6 +1841,33 @@ if not worst_df.empty:
     st.plotly_chart(worst_chart, use_container_width=True)
 
 st.caption(f"Comparatif multi-sources actif. Mode courant: {source_mode}.")
+if source_mode == SOURCE_MODE_MIX:
+    pair_df = _build_openmeteo_vs_infoclimat_pairs(
+        stations_df=filtered_stations,
+        metric_col=metric_col,
+        max_pair_distance_km=15.0,
+    )
+    st.markdown("**Fiabilisation Open-Meteo vs InfoClimat (stations proches)**")
+    if pair_df.empty:
+        st.info("Comparatif Open-Meteo vs InfoClimat indisponible sur ce filtre.")
+    else:
+        pair_view_cols = [
+            "infoclimat_station",
+            "open_meteo_station",
+            "pair_distance_km",
+            "infoclimat_mm",
+            "open_meteo_mm",
+            "delta_open_minus_info_mm",
+            "delta_abs_pct",
+        ]
+        pair_view_cols = [c for c in pair_view_cols if c in pair_df.columns]
+        st.dataframe(pair_df[pair_view_cols].head(30), use_container_width=True, hide_index=True)
+        delta_pct = pd.to_numeric(pair_df.get("delta_abs_pct"), errors="coerce")
+        if delta_pct.notna().any():
+            st.caption(
+                "Ecart median Open-Meteo vs InfoClimat sur paires proches: "
+                + f"{float(delta_pct.median()):.1f}% (distance max paire 15 km)."
+            )
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
@@ -1724,6 +1902,8 @@ station_cols = [
     "station_id",
     "source",
     "station_commune_name",
+    "priority_name",
+    "priority_match_km",
     "distance_to_lgv_km",
     "latitude",
     "longitude",
