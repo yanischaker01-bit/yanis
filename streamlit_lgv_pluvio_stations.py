@@ -97,7 +97,24 @@ def _extract_lgv_lines(payload: Dict[str, object]) -> List[List[Tuple[float, flo
 def _safe_weather_df(payload: Dict[str, object]) -> pd.DataFrame:
     df = pd.DataFrame(payload.get("weather") or [])
     if df.empty:
-        return df
+        return pd.DataFrame(
+            columns=[
+                "station_id",
+                "station_name",
+                "station_display",
+                "station_commune_name",
+                "source",
+                "date_obs_raw",
+                "latitude",
+                "longitude",
+                "distance_to_lgv_km",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "_obs_ts",
+            ]
+        )
     for col in [
         "distance_to_lgv_km",
         "latitude",
@@ -1295,7 +1312,8 @@ if not infoclimat_local_df.empty:
     raw_weather_rows.extend(infoclimat_local_df.to_dict(orient="records"))
 
 weather_df = _safe_weather_df({"weather": raw_weather_rows})
-weather_df = weather_df[weather_df["source"].map(_is_infoclimat_source)].copy()
+weather_sources = weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str)
+weather_df = weather_df[weather_sources.map(_is_infoclimat_source)].copy()
 if weather_df.empty:
     st.warning(
         "Aucune donnee InfoClimat/SYNOP disponible pour le moment."
