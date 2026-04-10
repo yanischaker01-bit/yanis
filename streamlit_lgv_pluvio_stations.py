@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+import json
 from pathlib import Path
 from typing import Dict, List, Tuple
+import unicodedata
 
 import folium
 import numpy as np
@@ -198,6 +200,122 @@ def _find_latest_file(patterns: List[str]) -> Path | None:
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def _normalize_commune_name(txt: object) -> str:
+    raw = str(txt or "").strip().lower()
+    if not raw:
+        return ""
+    normalized = unicodedata.normalize("NFKD", raw)
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.replace("-", " ").replace("'", " ")
+    return " ".join(normalized.split())
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def _load_lgv_communes_catalog() -> pd.DataFrame:
+    src = _find_latest_file(["data/lgv_communes_cache.json", "data/lgv_communes_*.json"])
+    if src is None:
+        return pd.DataFrame()
+    try:
+        payload = json.loads(src.read_text(encoding="utf-8"))
+    except Exception:
+        return pd.DataFrame()
+
+    communes: List[Dict[str, object]] = []
+    if isinstance(payload, dict):
+        raw = payload.get("communes", [])
+        if isinstance(raw, list):
+            communes = [r for r in raw if isinstance(r, dict)]
+    elif isinstance(payload, list):
+        communes = [r for r in payload if isinstance(r, dict)]
+    if not communes:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(communes)
+    if df.empty:
+        return pd.DataFrame()
+    for col in ["commune_code", "commune_name"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+    for col in ["centroid_latitude", "centroid_longitude"]:
+        if col not in df.columns:
+            df[col] = np.nan
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["centroid_latitude", "centroid_longitude"])
+    if df.empty:
+        return pd.DataFrame()
+    df["commune_name_norm"] = df["commune_name"].map(_normalize_commune_name)
+    return (
+        df[["commune_code", "commune_name", "commune_name_norm", "centroid_latitude", "centroid_longitude"]]
+        .drop_duplicates(subset=["commune_code", "commune_name_norm"], keep="first")
+        .reset_index(drop=True)
+    )
+
+
+def _resolve_history_reference_point(
+    station_row: Dict[str, object],
+    reference_mode: str,
+) -> Tuple[float | None, float | None, str, str]:
+    station_lat = pd.to_numeric(station_row.get("latitude"), errors="coerce")
+    station_lon = pd.to_numeric(station_row.get("longitude"), errors="coerce")
+    station_display = str(station_row.get("station_display") or station_row.get("station_id") or "station")
+
+    if str(reference_mode) != "Commune LGV (aligne app PRO)":
+        if pd.isna(station_lat) or pd.isna(station_lon):
+            return None, None, "Point station indisponible", "Coordonnees station invalides."
+        return (
+            float(station_lat),
+            float(station_lon),
+            f"Point station: {station_display}",
+            "",
+        )
+
+    catalog = _load_lgv_communes_catalog()
+    if catalog.empty:
+        if pd.isna(station_lat) or pd.isna(station_lon):
+            return None, None, "Commune LGV indisponible", "Catalogue communes LGV introuvable."
+        return (
+            float(station_lat),
+            float(station_lon),
+            f"Fallback point station: {station_display}",
+            "Catalogue communes LGV indisponible, bascule sur le point station.",
+        )
+
+    code_candidates = []
+    for key in ["station_commune_code", "commune_code", "insee_code"]:
+        val = str(station_row.get(key) or "").strip()
+        if val:
+            code_candidates.append(val)
+    code_candidates = [c for i, c in enumerate(code_candidates) if c and c not in code_candidates[:i]]
+
+    match = pd.DataFrame()
+    if code_candidates:
+        match = catalog[catalog["commune_code"].isin(code_candidates)].copy()
+    if match.empty:
+        commune_name = str(station_row.get("station_commune_name") or "").strip()
+        commune_norm = _normalize_commune_name(commune_name)
+        if commune_norm:
+            match = catalog[catalog["commune_name_norm"] == commune_norm].copy()
+
+    if not match.empty:
+        best = match.iloc[0]
+        lat = pd.to_numeric(best.get("centroid_latitude"), errors="coerce")
+        lon = pd.to_numeric(best.get("centroid_longitude"), errors="coerce")
+        if pd.notna(lat) and pd.notna(lon):
+            name = str(best.get("commune_name") or "Inconnue")
+            code = str(best.get("commune_code") or "")
+            return float(lat), float(lon), f"Centroide commune LGV: {name} ({code})", ""
+
+    if pd.isna(station_lat) or pd.isna(station_lon):
+        return None, None, "Commune LGV non resolue", "Impossible de resoudre la commune LGV et coordonnees station invalides."
+    return (
+        float(station_lat),
+        float(station_lon),
+        f"Fallback point station: {station_display}",
+        "Commune LGV non resolue, bascule sur le point station.",
+    )
 
 
 def _clean_station_label(txt: object) -> str:
@@ -1152,6 +1270,12 @@ with st.sidebar:
     top_n = st.slider("Top stations (graphe)", min_value=1, max_value=top_n_max, value=min(25, top_n_max), step=1)
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
+    history_reference_mode = st.radio(
+        "Reference historique",
+        options=["Commune LGV (aligne app PRO)", "Point station (coordonnees station)"],
+        index=0,
+        help="Le mode commune utilise le centroide LGV de la commune pour aligner les valeurs avec l'app PRO.",
+    )
     history_station_default = str(filtered_stations.iloc[0]["station_display"])
     history_station_options = sorted(filtered_stations["station_display"].astype(str).unique().tolist())
     history_station_display = st.selectbox(
@@ -1374,14 +1498,21 @@ st.subheader(f"Historique station: {selected_station.get('station_display')}")
 if not history_sources:
     st.info("Selectionne au moins une source historique.")
 else:
-    station_lat = pd.to_numeric(selected_station.get("latitude"), errors="coerce")
-    station_lon = pd.to_numeric(selected_station.get("longitude"), errors="coerce")
-    if pd.isna(station_lat) or pd.isna(station_lon):
-        st.warning("Coordonnees station invalides pour charger l'historique.")
+    ref_lat, ref_lon, ref_label, ref_notice = _resolve_history_reference_point(
+        station_row=selected_station,
+        reference_mode=history_reference_mode,
+    )
+    if ref_lat is None or ref_lon is None:
+        st.warning("Coordonnees invalides pour charger l'historique.")
     else:
+        st.caption(
+            f"Reference historique: {ref_label} | lat={float(ref_lat):.5f}, lon={float(ref_lon):.5f} | timezone=UTC"
+        )
+        if ref_notice:
+            st.caption(ref_notice)
         hist_df, hist_notices = _load_history_multi_source(
-            lat=float(station_lat),
-            lon=float(station_lon),
+            lat=float(ref_lat),
+            lon=float(ref_lon),
             start_day=history_start,
             end_day=history_end,
             selected_sources=history_sources,
@@ -1392,22 +1523,54 @@ else:
             st.warning("Historique indisponible sur cette periode/source.")
         else:
             hist_df = hist_df.copy()
-            hist_df["date"] = pd.to_datetime(hist_df["date"], utc=True, errors="coerce")
+            hist_df["date"] = pd.to_datetime(hist_df["date"], utc=True, errors="coerce").dt.normalize()
             hist_df["precip_mm"] = pd.to_numeric(hist_df["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
-            hist_df = hist_df.dropna(subset=["date"]).sort_values(["source", "date"])
+            hist_df = hist_df.dropna(subset=["date"])
+            hist_df = (
+                hist_df.groupby(["source", "date"], as_index=False)["precip_mm"]
+                .max()
+                .sort_values(["source", "date"])
+                .reset_index(drop=True)
+            )
 
             roll_df = hist_df.copy()
             roll_df["rolling_7d_mm"] = roll_df.groupby("source")["precip_mm"].transform(
                 lambda s: s.rolling(window=7, min_periods=1).sum()
             )
 
+            expected_dates = pd.date_range(start=history_start, end=history_end, freq="D", tz="UTC")
+            expected_total_days = int(len(expected_dates))
+            expected_days_map: Dict[pd.Timestamp, int] = {}
+            if expected_total_days > 0:
+                expected_df = pd.DataFrame({"date": expected_dates})
+                expected_df["month_start"] = pd.to_datetime(
+                    expected_df["date"].dt.strftime("%Y-%m-01"),
+                    utc=True,
+                    errors="coerce",
+                )
+                expected_days_map = expected_df.groupby("month_start").size().to_dict()
+
             monthly = hist_df.copy()
-            monthly["ym"] = monthly["date"].dt.strftime("%Y-%m")
-            monthly = (
-                monthly.groupby(["source", "ym"], as_index=False)["precip_mm"]
-                .sum()
-                .rename(columns={"precip_mm": "monthly_mm"})
+            monthly["month_start"] = pd.to_datetime(
+                monthly["date"].dt.strftime("%Y-%m-01"),
+                utc=True,
+                errors="coerce",
             )
+            monthly = (
+                monthly.groupby(["source", "month_start"], as_index=False)
+                .agg(
+                    monthly_mm=("precip_mm", "sum"),
+                    observed_days=("date", "nunique"),
+                )
+            )
+            monthly["expected_days"] = monthly["month_start"].map(expected_days_map).fillna(0).astype(int)
+            monthly["coverage_pct"] = np.where(
+                monthly["expected_days"] > 0,
+                100.0 * pd.to_numeric(monthly["observed_days"], errors="coerce").fillna(0.0)
+                / pd.to_numeric(monthly["expected_days"], errors="coerce").replace(0, np.nan),
+                np.nan,
+            )
+            monthly["ym"] = monthly["month_start"].dt.strftime("%Y-%m")
 
             daily_chart = px.line(
                 hist_df,
@@ -1435,25 +1598,34 @@ else:
 
             monthly_chart = px.bar(
                 monthly,
-                x="ym",
+                x="month_start",
                 y="monthly_mm",
                 color="source",
                 barmode="group",
                 color_discrete_map=HISTORY_SOURCE_COLORS,
-                labels={"ym": "Mois", "monthly_mm": "Cumul mensuel (mm)", "source": "Source historique"},
+                labels={"month_start": "Mois", "monthly_mm": "Cumul mensuel (mm)", "source": "Source historique"},
                 title="Cumuls mensuels par source",
             )
             monthly_chart.update_layout(height=360, margin=dict(l=10, r=10, t=45, b=10))
+            monthly_chart.update_xaxes(dtick="M1", tickformat="%Y-%m", ticklabelmode="period")
             st.plotly_chart(monthly_chart, use_container_width=True)
 
             summary = (
                 hist_df.groupby("source", as_index=False)
                 .agg(
-                    jours=("date", "count"),
+                    jours=("date", "nunique"),
                     total_mm=("precip_mm", "sum"),
                     moyenne_mm_j=("precip_mm", "mean"),
                     max_journalier_mm=("precip_mm", "max"),
                 )
                 .sort_values("total_mm", ascending=False)
             )
+            summary["jours_attendus"] = expected_total_days
+            summary["couverture_pct"] = np.where(
+                pd.to_numeric(summary["jours_attendus"], errors="coerce") > 0,
+                100.0
+                * pd.to_numeric(summary["jours"], errors="coerce").fillna(0.0)
+                / pd.to_numeric(summary["jours_attendus"], errors="coerce").replace(0, np.nan),
+                np.nan,
+            ).round(1)
             st.dataframe(summary, use_container_width=True, hide_index=True)
