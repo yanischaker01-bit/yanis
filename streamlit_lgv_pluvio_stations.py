@@ -1718,13 +1718,15 @@ top_n_max = max(1, int(len(filtered_stations)))
 top_n_key = f"plv_top_n_{int(top_n_max)}"
 top_n_default = int(min(25, top_n_max))
 with st.sidebar:
-    top_n = st.slider(
-        "Top stations (graphe)",
-        min_value=1,
-        max_value=top_n_max,
-        value=top_n_default,
-        step=1,
-        key=top_n_key,
+    top_n = int(
+        st.number_input(
+            "Top stations (graphe)",
+            min_value=1,
+            max_value=top_n_max,
+            value=top_n_default,
+            step=1,
+            key=top_n_key,
+        )
     )
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
