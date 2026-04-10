@@ -1715,8 +1715,13 @@ filtered_stations["incoherence_flag"] = (
 filtered_stations = filtered_stations.sort_values([metric_col, "distance_to_lgv_km"], ascending=[False, True], na_position="last")
 
 top_n_max = max(1, int(len(filtered_stations)))
+top_n_key = "plv_top_n"
+if top_n_key not in st.session_state:
+    st.session_state[top_n_key] = int(min(25, top_n_max))
+else:
+    st.session_state[top_n_key] = int(max(1, min(top_n_max, int(st.session_state[top_n_key]))))
 with st.sidebar:
-    top_n = st.slider("Top stations (graphe)", min_value=1, max_value=top_n_max, value=min(25, top_n_max), step=1)
+    top_n = st.slider("Top stations (graphe)", min_value=1, max_value=top_n_max, step=1, key=top_n_key)
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
     history_reference_mode = "Point station (coordonnees station)"
