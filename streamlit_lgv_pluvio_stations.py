@@ -23,6 +23,10 @@ REMOTE_SNAPSHOT_URLS = [
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_MODEL_METEOFRANCE = "meteofrance_seamless"
+OPEN_METEO_SOURCE_LABEL = "Open-Meteo MeteoFrance"
+SOURCE_MODE_INFO = "InfoClimat/SYNOP"
+SOURCE_MODE_OPEN = "Open-Meteo MeteoFrance"
+SOURCE_MODE_MIX = "Mixte InfoClimat + Open-Meteo"
 
 HISTORY_MIN_DATE = date(2026, 1, 1)
 RAIN_METRICS = {
@@ -37,7 +41,7 @@ HISTORY_SOURCES = [
 ]
 HISTORY_SOURCE_COLORS = {
     INFOCLIMAT_HISTORY_SOURCE: "#0f766e",
-    "Open-Meteo MeteoFrance": "#1d4ed8",
+    OPEN_METEO_SOURCE_LABEL: "#1d4ed8",
 }
 SOURCE_RELIABILITY_HINTS = {
     "SYNOP": 95.0,
@@ -45,7 +49,7 @@ SOURCE_RELIABILITY_HINTS = {
     "METEOFRANCE": 93.0,
     "OPEN_METEO": 84.0,
 }
-LOCAL_INFOCLIMAT_RADIUS_KM = 120.0
+LOCAL_INFOCLIMAT_RADIUS_KM = 250.0
 MAP_TILE_STYLES = {
     "Google Hybrid": {
         "tiles": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
@@ -1079,6 +1083,8 @@ def _fetch_infoclimat_history_local(
     sid = str(station_id or "").strip()
     if not sid:
         return pd.DataFrame(), f"{source_label}: station_id manquant."
+    if sid.lower().startswith("openmeteo_ref_"):
+        return pd.DataFrame(), f"{source_label}: historique non applicable pour station virtuelle Open-Meteo ({sid})."
 
     start_ts = pd.Timestamp(start_day, tz="UTC").normalize()
     end_ts = pd.Timestamp(end_day, tz="UTC").normalize()
@@ -1194,13 +1200,13 @@ def _load_history_multi_source(
         if note:
             notices.append(note)
 
-    if "Open-Meteo MeteoFrance" in selected_sources:
+    if OPEN_METEO_SOURCE_LABEL in selected_sources:
         df, note = _fetch_open_meteo_history(
             lat=lat,
             lon=lon,
             start_day=start_iso,
             end_day=end_iso,
-            source_label="Open-Meteo MeteoFrance",
+            source_label=OPEN_METEO_SOURCE_LABEL,
             model=OPEN_METEO_MODEL_METEOFRANCE,
         )
         if not df.empty:
@@ -1296,9 +1302,17 @@ def _build_map(
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
-    "Version pro: InfoClimat/SYNOP uniquement, fiabilisation des mesures, suivi stations et carte operative."
+    "Version pro: stations InfoClimat geolocalisees + Open-Meteo MeteoFrance, fiabilisation des mesures et suivi LGV."
 )
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
+with st.sidebar:
+    st.subheader("Sources")
+    source_mode = st.selectbox(
+        "Jeu de donnees",
+        options=[SOURCE_MODE_MIX, SOURCE_MODE_INFO, SOURCE_MODE_OPEN],
+        index=0,
+        help="Mixte = mesures InfoClimat/SYNOP + reference Open-Meteo sur les memes points.",
+    )
 
 try:
     snapshot, snapshot_source = _load_snapshot_payload()
@@ -1316,6 +1330,7 @@ infoclimat_local_df, infoclimat_local_notice = _load_infoclimat_synop_local(max_
 if infoclimat_local_notice:
     data_build_notices.append(infoclimat_local_notice)
 
+# Base InfoClimat/SYNOP: snapshot + enrichissement local (seed/cache).
 raw_weather_rows = [row for row in raw_snapshot_weather if _is_infoclimat_row(row)]
 if not infoclimat_local_df.empty:
     known_communes = {
@@ -1334,21 +1349,50 @@ if not infoclimat_local_df.empty:
     raw_weather_rows = [row for row in raw_weather_rows if not _is_infoclimat_source(row.get("source"))]
     raw_weather_rows.extend(infoclimat_local_df.to_dict(orient="records"))
 
-weather_df = _safe_weather_df({"weather": raw_weather_rows})
-if not weather_df.empty:
-    weather_sources = weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str)
-    weather_selection_mode = weather_df.get("selection_mode", pd.Series("", index=weather_df.index)).fillna("").astype(str)
-    weather_calc_method = weather_df.get("rain_calc_method", pd.Series("", index=weather_df.index)).fillna("").astype(str)
+infoclimat_weather_df = _safe_weather_df({"weather": raw_weather_rows})
+if not infoclimat_weather_df.empty:
+    weather_sources = infoclimat_weather_df.get("source", pd.Series("", index=infoclimat_weather_df.index)).fillna("").astype(str)
+    weather_selection_mode = infoclimat_weather_df.get("selection_mode", pd.Series("", index=infoclimat_weather_df.index)).fillna("").astype(str)
+    weather_calc_method = infoclimat_weather_df.get("rain_calc_method", pd.Series("", index=infoclimat_weather_df.index)).fillna("").astype(str)
     info_mask = (
         weather_sources.map(_is_infoclimat_source)
         | weather_selection_mode.str.lower().str.contains("info_climat|infoclimat|synop", regex=True)
         | weather_calc_method.str.lower().str.contains("synop", regex=False)
     )
-    weather_df = weather_df[info_mask].copy()
+    infoclimat_weather_df = infoclimat_weather_df[info_mask].copy()
+
+open_meteo_ref_df = pd.DataFrame()
+if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX}:
+    open_ref_base = infoclimat_weather_df.copy()
+    if open_ref_base.empty and not infoclimat_local_df.empty:
+        open_ref_base = infoclimat_local_df.copy()
+    if not open_ref_base.empty:
+        ref_points_key = _build_open_meteo_reference_key(open_ref_base)
+        open_meteo_ref_df, open_meteo_notice = _fetch_open_meteo_reference_points(
+            ref_points_key,
+            model=OPEN_METEO_MODEL_METEOFRANCE,
+        )
+        if open_meteo_notice:
+            data_build_notices.append(open_meteo_notice)
+        if not open_meteo_ref_df.empty:
+            open_meteo_ref_df = open_meteo_ref_df.copy()
+            open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
+    else:
+        data_build_notices.append("Open-Meteo reference: aucune station InfoClimat geolocalisee disponible.")
+
+weather_blocks: List[pd.DataFrame] = []
+if source_mode in {SOURCE_MODE_INFO, SOURCE_MODE_MIX} and not infoclimat_weather_df.empty:
+    weather_blocks.append(infoclimat_weather_df)
+if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} and not open_meteo_ref_df.empty:
+    weather_blocks.append(open_meteo_ref_df)
+if weather_blocks:
+    merged_rows = pd.concat(weather_blocks, ignore_index=True, sort=False).to_dict(orient="records")
+    weather_df = _safe_weather_df({"weather": merged_rows})
+else:
+    weather_df = _safe_weather_df({"weather": []})
+
 if weather_df.empty:
-    st.warning(
-        "Aucune donnee InfoClimat/SYNOP disponible pour le moment."
-    )
+    st.warning(f"Aucune donnee disponible pour le mode source '{source_mode}'.")
     st.stop()
 
 with st.sidebar:
@@ -1361,11 +1405,17 @@ with st.sidebar:
     metric_col = RAIN_METRICS[metric_label]
     map_style = st.selectbox("Fond de carte", list(MAP_TILE_STYLES.keys()), index=0)
 
-    max_distance_km = st.slider("Distance max a la LGV (km)", min_value=1.0, max_value=80.0, value=25.0, step=0.5)
+    max_distance_km = st.slider(
+        "Distance max a la LGV (km)",
+        min_value=1.0,
+        max_value=float(LOCAL_INFOCLIMAT_RADIUS_KM),
+        value=min(120.0, float(LOCAL_INFOCLIMAT_RADIUS_KM)),
+        step=0.5,
+    )
     compare_radius_km = st.slider(
         "Rayon comparaison stations proches (km)",
         min_value=2.0,
-        max_value=40.0,
+        max_value=80.0,
         value=15.0,
         step=0.5,
     )
@@ -1384,8 +1434,9 @@ with st.sidebar:
         step=5,
         help="Ecart relatif (vs mediane des stations proches) au-dela duquel la station est marquee incoherente.",
     )
-    selected_sources = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
-    st.caption("Source active: InfoClimat/SYNOP uniquement")
+    source_options = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+    selected_sources = _multiselect_all("Sources stations", source_options, key="plv_sources")
+    st.caption(f"Mode source actif: {source_mode}")
 
     commune_options = sorted(weather_df.get("station_commune_name", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_communes = _multiselect_all("Communes stations", commune_options, key="plv_communes")
@@ -1408,10 +1459,18 @@ if not filtered_stations.empty and selected_stations:
     filtered_stations = filtered_stations[filtered_stations["station_display"].astype(str).isin(selected_stations)]
 
 if filtered_stations.empty:
+    by_source = (
+        weather_df.get("source", pd.Series(dtype=str))
+        .dropna()
+        .astype(str)
+        .value_counts()
+        .to_dict()
+    )
     st.warning(
         "Aucune station sur ce filtre. "
-        + f"Stations InfoClimat chargees={int(len(weather_df))}. "
-        + "Elargis la distance LGV ou remets les filtres communes/stations sur 'Tout'."
+        + f"Stations chargees={int(len(weather_df))}. "
+        + f"Repartition sources={by_source}. "
+        + "Elargis la distance LGV ou remets les filtres communes/stations/sources sur 'Tout'."
     )
     st.stop()
 
@@ -1436,7 +1495,7 @@ with st.sidebar:
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
     history_reference_mode = "Point station (coordonnees station)"
-    st.caption("Reference historique: station SYNOP selectionnee (station_id).")
+    st.caption("Reference historique: point station geolocalise.")
     history_station_default = str(filtered_stations.iloc[0]["station_display"])
     history_station_options = sorted(filtered_stations["station_display"].astype(str).unique().tolist())
     history_station_display = st.selectbox(
@@ -1444,8 +1503,19 @@ with st.sidebar:
         options=history_station_options,
         index=history_station_options.index(history_station_default),
     )
-    history_sources = list(HISTORY_SOURCES)
-    st.caption("Historique: InfoClimat/SYNOP local")
+    history_source_options = [INFOCLIMAT_HISTORY_SOURCE, OPEN_METEO_SOURCE_LABEL]
+    if source_mode == SOURCE_MODE_INFO:
+        history_default_sources = [INFOCLIMAT_HISTORY_SOURCE]
+    elif source_mode == SOURCE_MODE_OPEN:
+        history_default_sources = [OPEN_METEO_SOURCE_LABEL]
+    else:
+        history_default_sources = [INFOCLIMAT_HISTORY_SOURCE, OPEN_METEO_SOURCE_LABEL]
+    history_sources = st.multiselect(
+        "Sources historique",
+        options=history_source_options,
+        default=history_default_sources,
+    )
+    st.caption("Historique compare: InfoClimat local et/ou Open-Meteo MeteoFrance")
     today_utc = datetime.now(timezone.utc).date()
     history_start = st.date_input(
         "Date debut",
@@ -1522,7 +1592,31 @@ with st.expander("Detail du calcul de fiabilite par station", expanded=False):
 st.subheader("Carte stations pluvio autour de la LGV SEA")
 map_obj = _build_map(lgv_lines, filtered_stations, metric_col, map_style=map_style)
 st_folium(map_obj, height=640, use_container_width=True)
-st.caption(f"Fond de carte actif: {map_style}")
+source_counts = (
+    filtered_stations.get("source", pd.Series(dtype=str))
+    .dropna()
+    .astype(str)
+    .value_counts()
+    .to_dict()
+)
+st.caption(f"Fond de carte actif: {map_style} | Stations visibles: {int(len(filtered_stations))} | Sources: {source_counts}")
+with st.expander("Localisation des stations (lat/lon)", expanded=False):
+    loc_cols = [
+        "station_display",
+        "station_id",
+        "station_commune_name",
+        "source",
+        "latitude",
+        "longitude",
+        "distance_to_lgv_km",
+        "date_obs_raw",
+    ]
+    loc_cols = [c for c in loc_cols if c in filtered_stations.columns]
+    st.dataframe(
+        filtered_stations[loc_cols].sort_values(["distance_to_lgv_km", "station_display"], ascending=[True, True]),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 st.subheader(f"Top {int(top_n)} stations - {metric_label}")
 top_df = filtered_stations.head(int(top_n)).copy()
@@ -1595,7 +1689,7 @@ if not worst_df.empty:
     worst_chart.update_layout(height=480, margin=dict(l=10, r=10, t=45, b=10))
     st.plotly_chart(worst_chart, use_container_width=True)
 
-st.caption("Comparatif multi-sources desactive: application verrouillee sur InfoClimat/SYNOP.")
+st.caption(f"Comparatif multi-sources actif. Mode courant: {source_mode}.")
 
 neighbor_df = _nearest_neighbors_for_station(
     stations_df=filtered_stations,
