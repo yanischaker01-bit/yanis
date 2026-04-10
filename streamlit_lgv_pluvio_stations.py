@@ -112,6 +112,8 @@ def _safe_weather_df(payload: Dict[str, object]) -> pd.DataFrame:
                 "rain_7d_mm",
                 "rain_30d_mm",
                 "rain_month_mm",
+                "selection_mode",
+                "rain_calc_method",
                 "_obs_ts",
             ]
         )
@@ -194,6 +196,19 @@ def _is_infoclimat_source(source: object) -> bool:
 def _is_open_meteo_source(source: object) -> bool:
     txt = str(source or "").strip().lower()
     return ("open" in txt) and ("meteo" in txt)
+
+
+def _is_infoclimat_row(row: Dict[str, object]) -> bool:
+    src_txt = str(row.get("source") or "").strip().lower()
+    sel_txt = str(row.get("selection_mode") or "").strip().lower()
+    calc_txt = str(row.get("rain_calc_method") or "").strip().lower()
+    return (
+        _is_infoclimat_source(src_txt)
+        or ("info_climat" in sel_txt)
+        or ("infoclimat" in sel_txt)
+        or ("synop" in sel_txt)
+        or ("synop" in calc_txt)
+    )
 
 
 def _create_base_map(location: List[float], zoom_start: int, map_style: str) -> folium.Map:
@@ -1293,7 +1308,7 @@ infoclimat_local_df, infoclimat_local_notice = _load_infoclimat_synop_local(max_
 if infoclimat_local_notice:
     data_build_notices.append(infoclimat_local_notice)
 
-raw_weather_rows = [row for row in raw_snapshot_weather if _is_infoclimat_source(row.get("source"))]
+raw_weather_rows = [row for row in raw_snapshot_weather if _is_infoclimat_row(row)]
 if not infoclimat_local_df.empty:
     known_communes = {
         str(row.get("station_id") or "").strip(): str(row.get("station_commune_name") or "").strip()
@@ -1312,8 +1327,16 @@ if not infoclimat_local_df.empty:
     raw_weather_rows.extend(infoclimat_local_df.to_dict(orient="records"))
 
 weather_df = _safe_weather_df({"weather": raw_weather_rows})
-weather_sources = weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str)
-weather_df = weather_df[weather_sources.map(_is_infoclimat_source)].copy()
+if not weather_df.empty:
+    weather_sources = weather_df.get("source", pd.Series("", index=weather_df.index)).fillna("").astype(str)
+    weather_selection_mode = weather_df.get("selection_mode", pd.Series("", index=weather_df.index)).fillna("").astype(str)
+    weather_calc_method = weather_df.get("rain_calc_method", pd.Series("", index=weather_df.index)).fillna("").astype(str)
+    info_mask = (
+        weather_sources.map(_is_infoclimat_source)
+        | weather_selection_mode.str.lower().str.contains("info_climat|infoclimat|synop", regex=True)
+        | weather_calc_method.str.lower().str.contains("synop", regex=False)
+    )
+    weather_df = weather_df[info_mask].copy()
 if weather_df.empty:
     st.warning(
         "Aucune donnee InfoClimat/SYNOP disponible pour le moment."
