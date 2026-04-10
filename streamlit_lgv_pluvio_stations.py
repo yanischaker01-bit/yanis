@@ -30,6 +30,10 @@ INFOCLIMAT_PRIORITY_MATCH_KM = 25.0
 INFOCLIMAT_STRICT_RADIUS_KM = 10.0
 INFOCLIMAT_MIN_STATIONS_COVERAGE = 4
 INFOCLIMAT_ADAPTIVE_RADII_KM = [10.0, 20.0, 30.0, 40.0, 50.0]
+OPEN_METEO_COMMUNE_OVERRIDES = {
+    "openmeteo_ref_07412": "Cognac",
+    "openmeteo_ref_07510": "Merignac",
+}
 INFOCLIMAT_PRIORITY_STATIONS = [
     {"name": "ST GERVAIS", "commune": "Saint-Gervais", "lat": 45.03, "lon": -0.47, "aliases": ["MF33415001", "ST GERVAIS"]},
     {"name": "MONTLIEU_SAPC", "commune": "Montlieu-la-Garde", "lat": 45.22, "lon": -0.29, "aliases": ["MF17243002", "MONTLIEU"]},
@@ -171,6 +175,13 @@ def _safe_weather_df(payload: Dict[str, object]) -> pd.DataFrame:
     commune_name = df["station_commune_name"].fillna("Inconnue").astype(str).str.strip()
     station_id = df["station_id"].fillna("station_inconnue").astype(str).str.strip()
     station_name = station_name.fillna("").astype(str).str.strip()
+
+    # Hard overrides requested for specific Open-Meteo reference ids.
+    for idx in df.index:
+        sid = str(station_id.loc[idx]).strip().lower()
+        forced_commune = OPEN_METEO_COMMUNE_OVERRIDES.get(sid, "")
+        if forced_commune:
+            commune_name.loc[idx] = str(forced_commune)
 
     # Enrich commune names: priority station mapping first, then nearest LGV commune by coordinates.
     for idx in df.index:
