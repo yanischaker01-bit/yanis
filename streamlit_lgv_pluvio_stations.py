@@ -1796,9 +1796,12 @@ def _build_commune_proxy_weather_df(
 def _enrich_commune_weather_with_reference_history(
     base_df: pd.DataFrame,
     reference_weather_df: pd.DataFrame,
+    replace_existing: bool = False,
+    target_cols: List[str] | None = None,
 ) -> Tuple[pd.DataFrame, str]:
     if base_df.empty or reference_weather_df.empty:
         return base_df.copy(), ""
+    cols_to_update = target_cols or ["rain_7d_mm", "rain_30d_mm", "rain_month_mm"]
 
     reference_communes = _build_lgv_communes_pluvio_table(reference_weather_df)
     if reference_communes.empty:
@@ -1837,18 +1840,23 @@ def _enrich_commune_weather_with_reference_history(
     out["commune_name_ref"] = out.get("station_commune_name", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
     out = out.merge(ref, how="left", on=["commune_code_ref", "commune_name_ref"])
 
-    backfilled = 0
+    updated_count = 0
     for target_col, ref_col in [
         ("rain_7d_mm", "ref_rain_7d_mm"),
         ("rain_30d_mm", "ref_rain_30d_mm"),
         ("rain_month_mm", "ref_rain_month_mm"),
     ]:
+        if target_col not in cols_to_update:
+            continue
         if target_col not in out.columns or ref_col not in out.columns:
             continue
         target_series = pd.to_numeric(out[target_col], errors="coerce")
         ref_series = pd.to_numeric(out[ref_col], errors="coerce")
-        fill_mask = target_series.isna() & ref_series.notna()
-        backfilled += int(fill_mask.sum())
+        if replace_existing:
+            fill_mask = ref_series.notna()
+        else:
+            fill_mask = target_series.isna() & ref_series.notna()
+        updated_count += int(fill_mask.sum())
         out.loc[fill_mask, target_col] = ref_series.loc[fill_mask]
 
     ref_source = out.get("ref_provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
@@ -1866,7 +1874,7 @@ def _enrich_commune_weather_with_reference_history(
         "history_backfill_commune",
     )
 
-    if backfilled <= 0:
+    if updated_count <= 0:
         return out.drop(
             columns=[
                 c for c in [
@@ -1884,7 +1892,8 @@ def _enrich_commune_weather_with_reference_history(
             errors="ignore",
         ), ""
 
-    notice = f"Historique 7j/30j/mois reconstitue pour {backfilled} champ(s) via reference communale."
+    action_label = "remplaces" if replace_existing else "reconstitues"
+    notice = f"Cumuls {action_label} pour {updated_count} champ(s) via reference communale."
     out = out.drop(
         columns=[
             c for c in [
@@ -2883,12 +2892,21 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
         )
         if open_meteo_notice:
             data_build_notices.append(open_meteo_notice)
-        if not open_meteo_ref_df.empty:
-            open_meteo_ref_df = open_meteo_ref_df.copy()
-            open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
-            data_build_notices.append(
-                "Open-Meteo MeteoFrance: grille active sur les communes traversees par la LGV SEA."
+    if not open_meteo_ref_df.empty:
+        open_meteo_ref_df = open_meteo_ref_df.copy()
+        open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
+        data_build_notices.append(
+            "Open-Meteo MeteoFrance: grille active sur les communes traversees par la LGV SEA."
+        )
+        if not meteo_france_df.empty:
+            meteo_france_df, mf_long_notice = _enrich_commune_weather_with_reference_history(
+                meteo_france_df,
+                open_meteo_ref_df,
+                replace_existing=True,
+                target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
             )
+            if mf_long_notice:
+                data_build_notices.append("Meteo-France Portail (cumuls longs): " + mf_long_notice)
     if open_meteo_ref_df.empty:
         open_meteo_ref_df, open_grid_notice = _load_open_meteo_grid_local()
         if open_grid_notice:
@@ -2899,6 +2917,15 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
             data_build_notices.append(
                 "Fallback Open-Meteo: grille locale chargee (seed/cache) pour garantir la couverture LGV."
             )
+            if not meteo_france_df.empty:
+                meteo_france_df, mf_long_notice = _enrich_commune_weather_with_reference_history(
+                    meteo_france_df,
+                    open_meteo_ref_df,
+                    replace_existing=True,
+                    target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
+                )
+                if mf_long_notice:
+                    data_build_notices.append("Meteo-France Portail (cumuls longs): " + mf_long_notice)
 
     if not open_meteo_ref_df.empty and ref_points_total > 0:
         coverage_col = "station_ref_id" if "station_ref_id" in open_meteo_ref_df.columns else "station_commune_name"
