@@ -55,7 +55,7 @@ INFOCLIMAT_PRIORITY_STATIONS = [
 ]
 
 HISTORY_MIN_DATE = date(2026, 1, 1)
-ENABLE_RAIN_30D = False
+ENABLE_RAIN_30D = True
 RAIN_METRICS = {
     "24h": "rain_24h_mm",
     "7 jours": "rain_7d_mm",
@@ -1507,7 +1507,41 @@ def _format_num(value: object, digits: int = 1, suffix: str = "") -> str:
 def _display_rain_30d_text(row: pd.Series) -> str:
     if not bool(ENABLE_RAIN_30D):
         return "Indisponible (non fiabilise pour exploitation)"
-    return _format_num(row.get("rain_30d_mm"), 1, " mm")
+    if not bool(row.get("rain_30d_is_reliable")):
+        return "Indisponible (source longue non fiable)"
+    value_txt = _format_num(row.get("rain_30d_mm"), 1, " mm")
+    src = str(row.get("rain_30d_source_label") or "").strip()
+    if src:
+        return f"{value_txt} [{src}]"
+    return value_txt
+
+
+def _rain_30d_source_label(row: pd.Series) -> str:
+    source = str(row.get("source") or "").strip()
+    backfill = str(row.get("history_backfill_source") or "").strip()
+    if _is_open_meteo_source(backfill):
+        return backfill
+    if _is_open_meteo_source(source):
+        return source
+    return ""
+
+
+def _apply_reliable_rain_30d_policy(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    if "rain_30d_mm" not in out.columns:
+        out["rain_30d_mm"] = np.nan
+    out["rain_30d_mm"] = pd.to_numeric(out.get("rain_30d_mm"), errors="coerce")
+    out["rain_30d_raw_mm"] = out["rain_30d_mm"]
+    out["rain_30d_source_label"] = out.apply(_rain_30d_source_label, axis=1)
+    out["rain_30d_is_reliable"] = out["rain_30d_source_label"].astype(str).str.len() > 0
+    if bool(ENABLE_RAIN_30D):
+        out.loc[~out["rain_30d_is_reliable"], "rain_30d_mm"] = np.nan
+    else:
+        out["rain_30d_mm"] = np.nan
+        out["rain_30d_is_reliable"] = False
+    return out
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -3004,6 +3038,8 @@ if weather_df.empty:
         )
         st.stop()
 
+weather_df = _apply_reliable_rain_30d_policy(weather_df)
+
 with st.sidebar:
     st.subheader("Filtres stations")
     if st.button("Rafraichir", use_container_width=True):
@@ -3188,7 +3224,12 @@ fallback_runtime_notices = [
 ]
 if fallback_runtime_notices:
     st.warning("Mode degrade actif: " + " | ".join(fallback_runtime_notices[:2]))
-if not bool(ENABLE_RAIN_30D):
+if bool(ENABLE_RAIN_30D):
+    st.caption(
+        "Le cumul 30 jours est affiche uniquement s'il provient d'une source longue fiable "
+        "(Open-Meteo MeteoFrance corridor ou backfill communal equivalent)."
+    )
+else:
     st.warning("Le cumul 30 jours est temporairement retire des usages exploitation car il n'est pas assez fiable.")
 
 st.subheader("Fiabilite & Metadonnees sources")
@@ -3452,6 +3493,7 @@ else:
         "commune_code",
         "commune_name",
         *[c for c in rain_cols_order if c in commune_pluvio_df.columns],
+        "rain_30d_source_label",
         "provider_source",
         "provider_station",
         "provider_station_dist_km",
@@ -3612,6 +3654,8 @@ station_cols = [
     "longitude",
     "rain_24h_mm",
     "rain_7d_mm",
+    "rain_30d_mm",
+    "rain_30d_source_label",
     "rain_month_mm",
     "near_station_count",
     "near_median_metric_mm",
