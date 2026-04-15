@@ -3128,6 +3128,7 @@ elif source_mode == SOURCE_MODE_OPEN:
         "Mode Open-Meteo strict: grille MeteoFrance calculee sur les communes traversees par la LGV SEA."
     )
 
+mf_notice = ""
 meteo_france_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_METEOFRANCE, SOURCE_MODE_MIX}:
     meteo_france_df, mf_notice = _fetch_meteo_france_portal_commune_weather()
@@ -3314,6 +3315,35 @@ if weather_df.empty:
         st.stop()
 
 weather_df = _apply_reliable_rain_30d_policy(weather_df)
+loaded_sources_all = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
+loaded_sources_label = ", ".join(loaded_sources_all) if loaded_sources_all else "Aucune"
+primary_source_status_notice = ""
+if source_mode == SOURCE_MODE_METEOFRANCE and METEO_FRANCE_SOURCE_LABEL not in loaded_sources_all:
+    mf_issue = str(mf_notice or "").strip()
+    if not mf_issue:
+        mf_issue_candidates = [
+            str(n).strip()
+            for n in data_build_notices
+            if "meteo-france" in str(n).lower()
+            and any(tok in str(n).lower() for tok in ["configure", "token", "http", "vide", "erreur", "indisponible", "aucune"])
+        ]
+        mf_issue = mf_issue_candidates[0] if mf_issue_candidates else "source primaire indisponible ou non repondante."
+    primary_source_status_notice = (
+        f"Mode demande: {source_mode}. Source effectivement servie: {loaded_sources_label}. "
+        + f"Cause probable cote Meteo-France: {mf_issue}"
+    )
+elif source_mode == SOURCE_MODE_OPEN and not any(_is_open_meteo_source(src) for src in loaded_sources_all):
+    om_issue_candidates = [
+        str(n).strip()
+        for n in data_build_notices
+        if "open-meteo" in str(n).lower()
+        and any(tok in str(n).lower() for tok in ["http", "vide", "erreur", "indisponible", "aucune"])
+    ]
+    om_issue = om_issue_candidates[0] if om_issue_candidates else "source Open-Meteo indisponible ou non repondante."
+    primary_source_status_notice = (
+        f"Mode demande: {source_mode}. Source effectivement servie: {loaded_sources_label}. "
+        + f"Cause probable cote Open-Meteo: {om_issue}"
+    )
 
 with st.sidebar:
     st.subheader("Filtres stations")
@@ -3356,7 +3386,8 @@ with st.sidebar:
     )
     source_options = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_sources = _multiselect_all("Sources stations", source_options, key="plv_sources")
-    st.caption(f"Mode source actif: {source_mode}")
+    st.caption(f"Mode demande: {source_mode}")
+    st.caption(f"Sources effectivement chargees: {loaded_sources_label}")
 
     commune_options = sorted(weather_df.get("station_commune_name", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
     selected_communes = _multiselect_all("Communes stations", commune_options, key="plv_communes")
@@ -3493,6 +3524,8 @@ else:
     st.caption(f"Snapshot: {snapshot_source} | timestamp inconnu")
 if data_build_notices:
     st.caption(" | ".join([n for n in data_build_notices if n][:3]))
+if primary_source_status_notice:
+    st.warning(primary_source_status_notice)
 fallback_runtime_notices = [
     str(n) for n in data_build_notices
     if any(tag in str(n).lower() for tag in ["fallback", "secours", "indisponible", "ignoree"])
