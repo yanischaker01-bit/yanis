@@ -55,10 +55,11 @@ INFOCLIMAT_PRIORITY_STATIONS = [
 ]
 
 HISTORY_MIN_DATE = date(2026, 1, 1)
+ENABLE_RAIN_30D = False
 RAIN_METRICS = {
     "24h": "rain_24h_mm",
     "7 jours": "rain_7d_mm",
-    "30 jours": "rain_30d_mm",
+    **({"30 jours": "rain_30d_mm"} if ENABLE_RAIN_30D else {}),
     "Mois courant": "rain_month_mm",
 }
 INFOCLIMAT_HISTORY_SOURCE = "InfoClimat SYNOP (local)"
@@ -1503,6 +1504,12 @@ def _format_num(value: object, digits: int = 1, suffix: str = "") -> str:
     return f"{float(num):.{digits}f}{suffix}"
 
 
+def _display_rain_30d_text(row: pd.Series) -> str:
+    if not bool(ENABLE_RAIN_30D):
+        return "Indisponible (non fiabilise pour exploitation)"
+    return _format_num(row.get("rain_30d_mm"), 1, " mm")
+
+
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r = 6371.0
     p1 = np.radians(float(lat1))
@@ -2116,7 +2123,10 @@ def _build_proximity_quality(
     work["source_note"] = work.get("source", pd.Series("", index=work.index)).map(_source_reliability_note)
     work["freshness_note"] = work["obs_age_h"].map(_freshness_note)
 
-    metrics_for_consistency = [c for c in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm"] if c in work.columns]
+    metrics_for_consistency = [
+        c for c in ["rain_24h_mm", "rain_7d_mm", "rain_month_mm"]
+        if c in work.columns
+    ]
     near_count_list: List[int] = []
     near_med_metric_list: List[float] = []
     near_delta_metric_mm_list: List[float] = []
@@ -2673,7 +2683,7 @@ def _build_map(
             f"Rang mensuel: #{int(monthly_rank) if pd.notna(monthly_rank) else 'N/A'} / {total_points}<br>"
             f"Niveau mensuel: {monthly_level}<br>"
             f"Cumul mensuel: {_format_num(month_val, 1, ' mm')}<br>"
-            f"Cumul 30 jours: {_format_num(row.get('rain_30d_mm'), 1, ' mm')}<br>"
+            f"Cumul 30 jours: {_display_rain_30d_text(row)}<br>"
             f"Cumul 7 jours: {_format_num(row.get('rain_7d_mm'), 1, ' mm')}<br>"
             f"Cumul 24h: {_format_num(row.get('rain_24h_mm'), 1, ' mm')}<br>"
             f"Cumul 12h: {_format_num(row.get('rain_12h_mm'), 1, ' mm')}<br>"
@@ -3178,6 +3188,8 @@ fallback_runtime_notices = [
 ]
 if fallback_runtime_notices:
     st.warning("Mode degrade actif: " + " | ".join(fallback_runtime_notices[:2]))
+if not bool(ENABLE_RAIN_30D):
+    st.warning("Le cumul 30 jours est temporairement retire des usages exploitation car il n'est pas assez fiable.")
 
 st.subheader("Fiabilite & Metadonnees sources")
 st.caption("Score fiabilite station = 0.42*note_source + 0.23*fraicheur_obs + 0.35*coherence_locale.")
@@ -3432,7 +3444,10 @@ else:
                 hide_index=True,
             )
 
-    rain_cols_order = [metric_col] + [c for c in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm"] if c != metric_col]
+    rain_cols_order = [metric_col] + [
+        c for c in ["rain_24h_mm", "rain_7d_mm", "rain_month_mm"]
+        if c != metric_col
+    ]
     commune_view_cols = [
         "commune_code",
         "commune_name",
@@ -3597,7 +3612,6 @@ station_cols = [
     "longitude",
     "rain_24h_mm",
     "rain_7d_mm",
-    "rain_30d_mm",
     "rain_month_mm",
     "near_station_count",
     "near_median_metric_mm",
