@@ -2541,6 +2541,15 @@ lgv_lines = _extract_lgv_lines(snapshot)
 snapshot_ts = pd.to_datetime(snapshot.get("timestamp_utc"), utc=True, errors="coerce")
 raw_snapshot_weather = snapshot.get("weather", []) if isinstance(snapshot, dict) else []
 raw_snapshot_weather = [row for row in raw_snapshot_weather if isinstance(row, dict)]
+snapshot_weather_df = _safe_weather_df({"weather": raw_snapshot_weather})
+if not snapshot_weather_df.empty:
+    snapshot_weather_df = snapshot_weather_df.copy()
+    snapshot_weather_df["selection_mode"] = (
+        snapshot_weather_df.get("selection_mode", pd.Series("", index=snapshot_weather_df.index))
+        .fillna("")
+        .astype(str)
+        .replace("", "snapshot_latest_weather")
+    )
 
 data_build_notices: List[str] = []
 infoclimat_local_df, infoclimat_local_notice = _load_infoclimat_synop_local(max_distance_km=LOCAL_INFOCLIMAT_RADIUS_KM)
@@ -2680,12 +2689,36 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} and not open_meteo_ref_df.
     weather_blocks.append(open_meteo_ref_df)
 if source_mode == SOURCE_MODE_MIX and not infoclimat_near_df.empty:
     weather_blocks.append(infoclimat_near_df)
-if (source_mode == SOURCE_MODE_METEOFRANCE) and meteo_france_df.empty and not open_meteo_ref_df.empty:
-    weather_blocks.append(open_meteo_ref_df)
-    data_build_notices.append("Fallback: Meteo-France indisponible, bascule Open-Meteo.")
-if (source_mode == SOURCE_MODE_OPEN) and open_meteo_ref_df.empty and not infoclimat_near_df.empty:
-    weather_blocks.append(infoclimat_near_df)
-    data_build_notices.append("Fallback: Open-Meteo indisponible, affichage temporaire InfoClimat proche LGV.")
+
+if source_mode == SOURCE_MODE_METEOFRANCE and meteo_france_df.empty:
+    if not open_meteo_ref_df.empty:
+        weather_blocks.append(open_meteo_ref_df)
+        data_build_notices.append("Fallback: Meteo-France indisponible, bascule Open-Meteo corridor.")
+    elif not infoclimat_near_df.empty:
+        weather_blocks.append(infoclimat_near_df)
+        data_build_notices.append("Fallback: Meteo-France indisponible, bascule SYNOP/InfoClimat proche LGV.")
+    elif not infoclimat_weather_df.empty:
+        weather_blocks.append(infoclimat_weather_df)
+        data_build_notices.append("Fallback: Meteo-France indisponible, utilisation du dernier pack SYNOP/InfoClimat disponible.")
+    elif not snapshot_weather_df.empty:
+        weather_blocks.append(snapshot_weather_df)
+        data_build_notices.append("Fallback ultime: Meteo-France indisponible, utilisation du dernier snapshot local exploitable.")
+
+if source_mode == SOURCE_MODE_OPEN and open_meteo_ref_df.empty:
+    if not infoclimat_near_df.empty:
+        weather_blocks.append(infoclimat_near_df)
+        data_build_notices.append("Fallback: Open-Meteo indisponible, affichage temporaire InfoClimat proche LGV.")
+    elif not infoclimat_weather_df.empty:
+        weather_blocks.append(infoclimat_weather_df)
+        data_build_notices.append("Fallback: Open-Meteo indisponible, utilisation du dernier pack SYNOP/InfoClimat disponible.")
+    elif not snapshot_weather_df.empty:
+        weather_blocks.append(snapshot_weather_df)
+        data_build_notices.append("Fallback ultime: Open-Meteo indisponible, utilisation du dernier snapshot local exploitable.")
+
+if source_mode == SOURCE_MODE_MIX and not weather_blocks and not snapshot_weather_df.empty:
+    weather_blocks.append(snapshot_weather_df)
+    data_build_notices.append("Fallback ultime: mix indisponible en live, utilisation du dernier snapshot local exploitable.")
+
 if weather_blocks:
     merged_rows = pd.concat(weather_blocks, ignore_index=True, sort=False).to_dict(orient="records")
     weather_df = _safe_weather_df({"weather": merged_rows})
@@ -2693,8 +2726,17 @@ else:
     weather_df = _safe_weather_df({"weather": []})
 
 if weather_df.empty:
-    st.warning(f"Aucune donnee disponible pour le mode source '{source_mode}'.")
-    st.stop()
+    if not snapshot_weather_df.empty:
+        weather_df = snapshot_weather_df.copy()
+        data_build_notices.append(
+            "Secours d'urgence: aucune source live exploitable, la page utilise le dernier snapshot local disponible."
+        )
+    else:
+        st.warning(
+            f"Aucune donnee disponible pour le mode source '{source_mode}'. "
+            + "Ni source primaire, ni fallback exploitable n'ont pu etre charges."
+        )
+        st.stop()
 
 with st.sidebar:
     st.subheader("Filtres stations")
@@ -2874,6 +2916,12 @@ else:
     st.caption(f"Snapshot: {snapshot_source} | timestamp inconnu")
 if data_build_notices:
     st.caption(" | ".join([n for n in data_build_notices if n][:3]))
+fallback_runtime_notices = [
+    str(n) for n in data_build_notices
+    if any(tag in str(n).lower() for tag in ["fallback", "secours", "indisponible", "ignoree"])
+]
+if fallback_runtime_notices:
+    st.warning("Mode degrade actif: " + " | ".join(fallback_runtime_notices[:2]))
 
 st.subheader("Fiabilite & Metadonnees sources")
 st.caption("Score fiabilite station = 0.42*note_source + 0.23*fraicheur_obs + 0.35*coherence_locale.")
