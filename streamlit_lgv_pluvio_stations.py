@@ -29,6 +29,7 @@ METEO_FRANCE_TOKEN_URL_DEFAULT = "https://portail-api.meteofrance.fr/token"
 METEO_FRANCE_DP_OBS_BASE_URL = "https://public-api.meteofrance.fr/public/DPObs"
 METEO_FRANCE_SOURCE_LABEL = "Meteo-France Portail API"
 OPEN_METEO_SOURCE_LABEL = "Open-Meteo MeteoFrance"
+OPEN_METEO_ARCHIVE_SOURCE_LABEL = "Open-Meteo archive (communes LGV)"
 SOURCE_MODE_METEOFRANCE = "Meteo-France Portail API"
 SOURCE_MODE_OPEN = "Open-Meteo MeteoFrance"
 SOURCE_MODE_MIX = "Meteo-France + Open-Meteo + InfoClimat"
@@ -1417,6 +1418,203 @@ def _fetch_open_meteo_reference_points(
     return out, notice
 
 
+def _open_meteo_archive_metrics_from_entry(entry: object) -> Dict[str, object]:
+    if not isinstance(entry, dict):
+        return {}
+    daily = entry.get("daily", {}) if isinstance(entry.get("daily"), dict) else {}
+    times = daily.get("time", []) or []
+    vals = daily.get("precipitation_sum", []) or []
+    if not times or not vals:
+        return {}
+
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(times, utc=True, errors="coerce"),
+            "precip_mm": pd.to_numeric(vals, errors="coerce"),
+        }
+    )
+    df = df.dropna(subset=["date"])
+    if df.empty:
+        return {}
+    df["precip_mm"] = pd.to_numeric(df["precip_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce").dt.normalize()
+    df = df.dropna(subset=["date"]).sort_values("date")
+    if df.empty:
+        return {}
+
+    last_date = pd.Timestamp(df["date"].max()).tz_convert("UTC")
+    lower_7d = last_date - pd.Timedelta(days=6)
+    lower_30d = last_date - pd.Timedelta(days=29)
+    month_start = pd.Timestamp(year=int(last_date.year), month=int(last_date.month), day=1, tz="UTC")
+    rain_24h = float(df.loc[df["date"] == last_date, "precip_mm"].sum())
+    rain_7d = float(df.loc[df["date"] >= lower_7d, "precip_mm"].sum())
+    rain_30d = float(df.loc[df["date"] >= lower_30d, "precip_mm"].sum())
+    rain_month = float(df.loc[df["date"] >= month_start, "precip_mm"].sum())
+
+    rain_24h = max(0.0, rain_24h)
+    rain_7d = max(rain_24h, rain_7d)
+    rain_30d = max(rain_7d, rain_30d)
+    rain_month = max(rain_24h, rain_month)
+
+    return {
+        "date_obs_raw": last_date.strftime("%Y-%m-%d"),
+        "date": last_date.isoformat(),
+        "rain_24h_mm": round(rain_24h, 3),
+        "rain_7d_mm": round(rain_7d, 3),
+        "rain_30d_mm": round(rain_30d, 3),
+        "rain_month_mm": round(rain_month, 3),
+    }
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _fetch_open_meteo_archive_reference_points(
+    points_key: Tuple[Tuple[str, str, str, float, float, float], ...],
+    model: str = OPEN_METEO_MODEL_METEOFRANCE,
+    lookback_days: int = 45,
+) -> Tuple[pd.DataFrame, str]:
+    if not points_key:
+        return pd.DataFrame(), "Open-Meteo archive: aucun point station."
+
+    rows: List[Dict[str, object]] = []
+    notices: List[str] = []
+    batch_size = 20
+    now_utc = datetime.now(timezone.utc)
+    lookback = max(32, min(int(lookback_days), 120))
+    start_date = (now_utc - pd.Timedelta(days=lookback)).strftime("%Y-%m-%d")
+    end_date = now_utc.strftime("%Y-%m-%d")
+
+    def _build_row(
+        ref_point: Tuple[str, str, str, float, float, float],
+        metrics: Dict[str, object],
+        used_model: str,
+    ) -> Dict[str, object]:
+        sid, sname, commune, lat, lon, dist = ref_point
+        station_name = _clean_station_label(sname) or commune or f"Open-Meteo archive {sid}"
+        station_commune = commune or _infer_commune_from_station_name(station_name)
+        commune_ref = station_commune or "commune LGV"
+        return {
+            "station_id": f"openmeteo_ref_{sid}",
+            "station_name": station_name,
+            "station_commune_name": station_commune,
+            "date_obs_raw": metrics.get("date_obs_raw"),
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "distance_to_lgv_km": None if float(dist) < 0 else float(dist),
+            "precipitation_mm": metrics.get("rain_24h_mm"),
+            "rain_24h_mm": metrics.get("rain_24h_mm"),
+            "rain_7d_mm": metrics.get("rain_7d_mm"),
+            "rain_30d_mm": metrics.get("rain_30d_mm"),
+            "rain_month_mm": metrics.get("rain_month_mm"),
+            "rain_12h_mm": np.nan,
+            "rain_instant_mm": np.nan,
+            "rain_forecast_mm": np.nan,
+            "rain_class": "NORMAL",
+            "source": OPEN_METEO_ARCHIVE_SOURCE_LABEL,
+            "selection_mode": "open_meteo_archive_lgv_commune",
+            "meteo_model": used_model,
+            "station_ref_id": sid,
+            "date": metrics.get("date"),
+            "history_backfill_source": OPEN_METEO_ARCHIVE_SOURCE_LABEL,
+            "history_backfill_station": commune_ref,
+            "history_backfill_obs_date": metrics.get("date_obs_raw"),
+            "rain_calc_method": "open_meteo_archive_daily_precipitation_sum",
+        }
+
+    def _fetch_single_point(
+        ref_point: Tuple[str, str, str, float, float, float],
+    ) -> Tuple[Dict[str, object], str, str]:
+        _, _, _, lat, lon, _ = ref_point
+        params: Dict[str, object] = {
+            "latitude": f"{float(lat):.6f}",
+            "longitude": f"{float(lon):.6f}",
+            "start_date": start_date,
+            "end_date": end_date,
+            "daily": "precipitation_sum",
+            "timezone": "UTC",
+            "models": model,
+        }
+        used_model = str(model)
+        try:
+            resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=35, max_attempts=2)
+            if resp.status_code != 200:
+                fallback_params = dict(params)
+                fallback_params.pop("models", None)
+                resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=35, max_attempts=2)
+                used_model = "open_meteo_default"
+            if resp.status_code != 200 or not resp.text.strip():
+                return {}, used_model, f"Open-Meteo archive point HTTP {resp.status_code}"
+            payload = resp.json()
+            entry = payload[0] if isinstance(payload, list) and payload else payload
+            metrics = _open_meteo_archive_metrics_from_entry(entry)
+            if not metrics:
+                return {}, used_model, "Open-Meteo archive point: serie vide"
+            return metrics, used_model, ""
+        except Exception as exc:
+            return {}, used_model, f"Open-Meteo archive point erreur: {exc}"
+
+    for i in range(0, len(points_key), batch_size):
+        batch = list(points_key[i : i + batch_size])
+        lats = ",".join(f"{float(x[3]):.6f}" for x in batch)
+        lons = ",".join(f"{float(x[4]):.6f}" for x in batch)
+        params: Dict[str, object] = {
+            "latitude": lats,
+            "longitude": lons,
+            "start_date": start_date,
+            "end_date": end_date,
+            "daily": "precipitation_sum",
+            "timezone": "UTC",
+            "models": model,
+        }
+        used_model = str(model)
+        batch_entries: List[object] = []
+        try:
+            resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=35, max_attempts=2)
+            if resp.status_code != 200:
+                fallback_params = dict(params)
+                fallback_params.pop("models", None)
+                resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=35, max_attempts=2)
+                used_model = "open_meteo_default"
+            if resp.status_code == 200 and resp.text.strip():
+                payload = resp.json()
+                if isinstance(payload, list):
+                    batch_entries = payload
+                elif isinstance(payload, dict) and len(batch) == 1:
+                    batch_entries = [payload]
+        except Exception as exc:
+            notices.append(f"Open-Meteo archive batch erreur: {exc}")
+
+        if len(batch_entries) == len(batch):
+            for idx, entry in enumerate(batch_entries):
+                metrics = _open_meteo_archive_metrics_from_entry(entry)
+                if not metrics:
+                    if len(notices) < 6:
+                        notices.append(f"Open-Meteo archive: serie vide pour {batch[idx][2] or batch[idx][0]}")
+                    continue
+                rows.append(_build_row(batch[idx], metrics, used_model))
+            continue
+
+        if len(batch) > 1 and len(notices) < 6:
+            notices.append("Open-Meteo archive: fallback unitaire sur certains points LGV.")
+        for ref_point in batch:
+            metrics, point_model, point_notice = _fetch_single_point(ref_point)
+            if point_notice and len(notices) < 6:
+                notices.append(point_notice)
+            if metrics:
+                rows.append(_build_row(ref_point, metrics, point_model))
+
+    out = pd.DataFrame(rows)
+    if out.empty:
+        detail = " | ".join(notices[:3]) if notices else "aucune donnee retournee"
+        return out, f"Open-Meteo archive: {detail}."
+    out = out.sort_values("distance_to_lgv_km", na_position="last").reset_index(drop=True)
+    model_values = out.get("meteo_model", pd.Series(dtype=str)).dropna().astype(str).unique().tolist()
+    model_name = str(model_values[0]) if model_values else "open_meteo_unknown"
+    notice = f"Open-Meteo archive: {len(out)} communes LGV consolidees sur {lookback} jours ({model_name})."
+    if notices:
+        notice = notice + " | " + " | ".join(notices[:2])
+    return out, notice
+
+
 def _build_source_metadata_table(stations_df: pd.DataFrame) -> pd.DataFrame:
     if stations_df.empty or "source" not in stations_df.columns:
         return pd.DataFrame()
@@ -1441,12 +1639,20 @@ def _build_source_metadata_table(stations_df: pd.DataFrame) -> pd.DataFrame:
             limits = "La mesure est indirecte pour certaines communes (proxy station)."
             usage = "Support de reference officielle pour arbitrage exploitation / maintenance."
         elif _is_open_meteo_source(source):
-            data_type = "Modele numerique (Open-Meteo)"
-            captation = "Maille modele MeteoFrance/Open-Meteo calculee sur des points geolocalises LGV."
-            refresh = "Horaire (reanalyse + prevision courte)"
-            method = "Interpolation modele sur coordonnees station puis cumuls glissants."
-            limits = "Ce n'est pas une mesure directe de pluviometre."
-            usage = "Garantir une couverture corridor exhaustive, meme sans station proche."
+            if "archive" in str(source).strip().lower():
+                data_type = "Archive journaliere modele (Open-Meteo)"
+                captation = "Precipitation journaliere archivee sur centroide ou point communal LGV."
+                refresh = "Quotidienne"
+                method = "Sommes journalieres archivees utilisees pour fiabiliser les cumuls 7j/30j/mois, alignees sur l'app monitoring LGV."
+                limits = "Modele numerique homogene, mais pas une mesure directe de pluviometre."
+                usage = "Reference corridor homogene pour saturation des sols, drainage et comparaison inter-communes."
+            else:
+                data_type = "Modele numerique (Open-Meteo)"
+                captation = "Maille modele geolocalisee sur la LGV; court terme live puis archive journaliere pour les cumuls longs."
+                refresh = "Horaire pour 12h/24h et prevision courte, quotidienne pour 7j/30j/mois"
+                method = "Flux live Open-Meteo pour le court terme, puis recalage des cumuls longs sur l'archive journaliere utilisee dans l'app monitoring."
+                limits = "Ce n'est pas une mesure directe de pluviometre."
+                usage = "Garantir une couverture corridor exhaustive, meme sans station proche."
         else:
             data_type = "Source diverse"
             captation = "Captation heterogene, harmonisee dans le pipeline."
@@ -1474,11 +1680,14 @@ def _build_source_metadata_table(stations_df: pd.DataFrame) -> pd.DataFrame:
 
 def _source_capture_label(source: object) -> str:
     txt = str(source or "").strip()
+    txt_norm = txt.lower()
     if _is_infoclimat_source(txt):
         return "Mesure station SYNOP / InfoClimat au sol"
     if txt == METEO_FRANCE_SOURCE_LABEL:
         return "Observation officielle SYNOP reprojetee sur commune LGV"
     if _is_open_meteo_source(txt):
+        if "archive" in txt_norm:
+            return "Archive journaliere modele sur commune LGV"
         return "Maille modele geolocalisee sur la LGV"
     return "Source harmonisee interne"
 
@@ -1632,7 +1841,17 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
         ]:
             if col in work.columns:
                 work[col] = pd.to_numeric(work[col], errors="coerce")
-        for col in ["station_id", "station_ref_id", "station_display", "station_commune_name", "source", "date_obs_raw"]:
+        for col in [
+            "station_id",
+            "station_ref_id",
+            "station_display",
+            "station_commune_name",
+            "source",
+            "date_obs_raw",
+            "history_backfill_source",
+            "history_backfill_station",
+            "history_backfill_obs_date",
+        ]:
             if col not in work.columns:
                 work[col] = ""
             work[col] = work[col].fillna("").astype(str)
@@ -1647,6 +1866,9 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
                 "station_commune_norm",
                 "source",
                 "date_obs_raw",
+                "history_backfill_source",
+                "history_backfill_station",
+                "history_backfill_obs_date",
                 "latitude",
                 "longitude",
                 "rain_24h_mm",
@@ -1734,6 +1956,10 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
             if pd.notna(clat) and pd.notna(clon) and pd.notna(plat) and pd.notna(plon):
                 provider_dist = _haversine_km(float(clat), float(clon), float(plat), float(plon))
 
+        provider_source = str(picked.get("history_backfill_source") or picked.get("source") or "")
+        provider_station = str(picked.get("history_backfill_station") or picked.get("station_display") or picked.get("station_id") or "")
+        provider_obs_date = str(picked.get("history_backfill_obs_date") or picked.get("date_obs_raw") or "")
+
         out_rows.append(
             {
                 "commune_code": code,
@@ -1742,11 +1968,11 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
                 "longitude": float(clon) if pd.notna(clon) else float(pd.to_numeric(picked.get("longitude"), errors="coerce")),
                 "distance_to_lgv_km": 0.0,
                 "provider_station_id": str(picked.get("station_id") or ""),
-                "provider_station": str(picked.get("station_display") or picked.get("station_id") or ""),
-                "provider_source": str(picked.get("source") or ""),
+                "provider_station": provider_station,
+                "provider_source": provider_source,
                 "provider_station_dist_km": round(float(provider_dist), 3) if pd.notna(provider_dist) else np.nan,
                 "match_mode": match_mode,
-                "date_obs_raw": str(picked.get("date_obs_raw") or ""),
+                "date_obs_raw": provider_obs_date,
                 "rain_24h_mm": pd.to_numeric(picked.get("rain_24h_mm"), errors="coerce"),
                 "rain_7d_mm": pd.to_numeric(picked.get("rain_7d_mm"), errors="coerce"),
                 "rain_30d_mm": pd.to_numeric(picked.get("rain_30d_mm"), errors="coerce"),
@@ -1902,8 +2128,10 @@ def _enrich_commune_weather_with_reference_history(
 
     ref_source = out.get("ref_provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
     ref_station = out.get("ref_provider_station", pd.Series("", index=out.index)).fillna("").astype(str)
+    ref_obs_date = out.get("ref_date_obs_raw", pd.Series("", index=out.index)).fillna("").astype(str)
     out["history_backfill_source"] = np.where(ref_source.str.len() > 0, ref_source, "")
     out["history_backfill_station"] = np.where(ref_station.str.len() > 0, ref_station, "")
+    out["history_backfill_obs_date"] = np.where(ref_obs_date.str.len() > 0, ref_obs_date, "")
 
     if "rain_calc_method" not in out.columns:
         out["rain_calc_method"] = ""
@@ -2434,9 +2662,14 @@ def _fetch_open_meteo_history(
     try:
         resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=30, max_attempts=2)
         if resp.status_code != 200:
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=30, max_attempts=2)
+        if resp.status_code != 200:
             return pd.DataFrame(), f"{source_label}: HTTP {resp.status_code}"
         payload = resp.json()
-        daily = payload.get("daily") if isinstance(payload, dict) else {}
+        entry = payload[0] if isinstance(payload, list) and payload else payload
+        daily = entry.get("daily") if isinstance(entry, dict) else {}
         times = daily.get("time") if isinstance(daily, dict) else []
         values = daily.get("precipitation_sum") if isinstance(daily, dict) else []
         out = pd.DataFrame({"date": times, "precip_mm": values})
@@ -2698,6 +2931,7 @@ def _build_map(
         capture_label = _source_capture_label(row.get("source"))
         hist_backfill_source = str(row.get("history_backfill_source") or "").strip()
         hist_backfill_station = str(row.get("history_backfill_station") or "").strip()
+        hist_backfill_obs_date = str(row.get("history_backfill_obs_date") or "").strip()
         hist_backfill_html = ""
         if hist_backfill_source:
             hist_backfill_html = (
@@ -2705,6 +2939,7 @@ def _build_map(
                 "<b>Traçabilite cumul long</b><br>"
                 f"7j/30j/mois consolides via: {hist_backfill_source}<br>"
                 f"Reference: {hist_backfill_station or 'commune LGV'}<br>"
+                f"Derniere date archive: {hist_backfill_obs_date or 'N/A'}<br>"
             )
         popup = (
             "<div style='font-size:13px;line-height:1.45;'>"
@@ -2910,7 +3145,8 @@ if source_mode in {SOURCE_MODE_METEOFRANCE, SOURCE_MODE_MIX}:
                 data_build_notices.append("Meteo-France Portail: " + mf_hist_notice)
 
 open_meteo_ref_df = pd.DataFrame()
-if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
+open_meteo_archive_ref_df = pd.DataFrame()
+if source_mode in {SOURCE_MODE_METEOFRANCE, SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
     ref_points_total = 0
     ref_points_key = _build_open_meteo_key_from_lgv_communes()
     ref_points_total = int(len(ref_points_key))
@@ -2936,40 +3172,79 @@ if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
         )
         if open_meteo_notice:
             data_build_notices.append(open_meteo_notice)
+        open_meteo_archive_ref_df, open_meteo_archive_notice = _fetch_open_meteo_archive_reference_points(
+            ref_points_key,
+            model=OPEN_METEO_MODEL_METEOFRANCE,
+        )
+        if open_meteo_archive_notice:
+            data_build_notices.append(open_meteo_archive_notice)
     if not open_meteo_ref_df.empty:
         open_meteo_ref_df = open_meteo_ref_df.copy()
         open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
         data_build_notices.append(
             "Open-Meteo MeteoFrance: grille active sur les communes traversees par la LGV SEA."
         )
-        if not meteo_france_df.empty:
+        if not open_meteo_archive_ref_df.empty:
+            open_meteo_ref_df, open_long_notice = _enrich_commune_weather_with_reference_history(
+                open_meteo_ref_df,
+                open_meteo_archive_ref_df,
+                replace_existing=True,
+                target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
+            )
+            if open_long_notice:
+                data_build_notices.append("Open-Meteo (cumuls longs): " + open_long_notice)
+        if not meteo_france_df.empty and not open_meteo_archive_ref_df.empty:
             meteo_france_df, mf_long_notice = _enrich_commune_weather_with_reference_history(
                 meteo_france_df,
-                open_meteo_ref_df,
+                open_meteo_archive_ref_df,
                 replace_existing=True,
                 target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
             )
             if mf_long_notice:
                 data_build_notices.append("Meteo-France Portail (cumuls longs): " + mf_long_notice)
     if open_meteo_ref_df.empty:
-        open_meteo_ref_df, open_grid_notice = _load_open_meteo_grid_local()
-        if open_grid_notice:
-            data_build_notices.append(open_grid_notice)
-        if not open_meteo_ref_df.empty:
-            open_meteo_ref_df = open_meteo_ref_df.copy()
-            open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
+        if not open_meteo_archive_ref_df.empty:
+            open_meteo_ref_df = open_meteo_archive_ref_df.copy()
             data_build_notices.append(
-                "Fallback Open-Meteo: grille locale chargee (seed/cache) pour garantir la couverture LGV."
+                "Fallback Open-Meteo: archive journaliere communale active, alignee avec l'app monitoring LGV."
             )
             if not meteo_france_df.empty:
                 meteo_france_df, mf_long_notice = _enrich_commune_weather_with_reference_history(
                     meteo_france_df,
-                    open_meteo_ref_df,
+                    open_meteo_archive_ref_df,
                     replace_existing=True,
                     target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
                 )
                 if mf_long_notice:
                     data_build_notices.append("Meteo-France Portail (cumuls longs): " + mf_long_notice)
+        else:
+            open_meteo_ref_df, open_grid_notice = _load_open_meteo_grid_local()
+            if open_grid_notice:
+                data_build_notices.append(open_grid_notice)
+            if not open_meteo_ref_df.empty:
+                open_meteo_ref_df = open_meteo_ref_df.copy()
+                open_meteo_ref_df["source"] = OPEN_METEO_SOURCE_LABEL
+                data_build_notices.append(
+                    "Fallback Open-Meteo: grille locale chargee (seed/cache) pour garantir la couverture LGV."
+                )
+                if not open_meteo_archive_ref_df.empty:
+                    open_meteo_ref_df, open_long_notice = _enrich_commune_weather_with_reference_history(
+                        open_meteo_ref_df,
+                        open_meteo_archive_ref_df,
+                        replace_existing=True,
+                        target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
+                    )
+                    if open_long_notice:
+                        data_build_notices.append("Open-Meteo (cumuls longs): " + open_long_notice)
+                if not meteo_france_df.empty and not open_meteo_archive_ref_df.empty:
+                    meteo_france_df, mf_long_notice = _enrich_commune_weather_with_reference_history(
+                        meteo_france_df,
+                        open_meteo_archive_ref_df,
+                        replace_existing=True,
+                        target_cols=["rain_7d_mm", "rain_30d_mm", "rain_month_mm"],
+                    )
+                    if mf_long_notice:
+                        data_build_notices.append("Meteo-France Portail (cumuls longs): " + mf_long_notice)
 
     if not open_meteo_ref_df.empty and ref_points_total > 0:
         coverage_col = "station_ref_id" if "station_ref_id" in open_meteo_ref_df.columns else "station_commune_name"
@@ -3157,8 +3432,8 @@ with st.sidebar:
     )
     st.markdown("---")
     st.subheader("Historique (depuis 2026)")
-    history_reference_mode = "Point station (coordonnees station)"
-    st.caption("Reference historique: point station geolocalise.")
+    history_reference_mode = "Commune LGV (aligne app PRO)"
+    st.caption("Reference historique: centroide communal LGV, aligne sur l'app monitoring.")
     history_station_default = str(filtered_stations.iloc[0]["station_display"])
     history_station_options = sorted(filtered_stations["station_display"].astype(str).unique().tolist())
     history_station_display = st.selectbox(
@@ -3226,8 +3501,8 @@ if fallback_runtime_notices:
     st.warning("Mode degrade actif: " + " | ".join(fallback_runtime_notices[:2]))
 if bool(ENABLE_RAIN_30D):
     st.caption(
-        "Le cumul 30 jours est affiche uniquement s'il provient d'une source longue fiable "
-        "(Open-Meteo MeteoFrance corridor ou backfill communal equivalent)."
+        "Le cumul 30 jours est affiche uniquement s'il provient d'une source longue fiabilisee "
+        "(Open-Meteo archive communal aligne sur l'app monitoring, ou backfill equivalent)."
     )
 else:
     st.warning("Le cumul 30 jours est temporairement retire des usages exploitation car il n'est pas assez fiable.")
@@ -3320,7 +3595,7 @@ with st.expander("Localisation des stations (lat/lon)", expanded=False):
     )
 
 open_loc_df = filtered_stations[
-    filtered_stations.get("source", pd.Series("", index=filtered_stations.index)).astype(str) == OPEN_METEO_SOURCE_LABEL
+    filtered_stations.get("source", pd.Series("", index=filtered_stations.index)).astype(str).map(_is_open_meteo_source)
 ].copy()
 st.subheader("Localisation Open-Meteo par commune")
 if open_loc_df.empty:
@@ -3672,6 +3947,7 @@ station_cols = [
     "reliability_reason",
     "history_backfill_source",
     "history_backfill_station",
+    "history_backfill_obs_date",
     "date_obs_raw",
 ]
 station_cols = [c for c in station_cols if c in filtered_stations.columns]
@@ -3829,9 +4105,12 @@ with meta_method_tab:
         2. Le point cartographique represente une station reelle ou un point geolocalise proxy rattache a une commune LGV.
         3. Le classement visuel est base sur la **pluie mensuelle**, plus pertinente pour suivre la saturation des sols,
            les remblais/deblais, les talus et la persistance d'un contexte humide.
-        4. Les cumuls 24h et 7 jours restent affiches dans les popups pour detecter un episode brutal ou recent.
-        5. Une source sans station proche est acceptee si elle ameliore la couverture corridor, mais sa lecture doit etre
-           nuancee par l'indicateur de fiabilite et le type de captation.
+        4. Les indicateurs courts (12h/24h et prevision proche) servent a reperer un episode brutal; les cumuls `7j/30j/mois`
+           servent a lire un contexte de saturation progressive critique pour talus, drainage, plateformes et acces maintenance.
+        5. Les cumuls longs Open-Meteo sont maintenant calcules sur **archive journaliere par commune LGV**, selon la meme logique
+           que l'app monitoring LGV, pour eviter les cumuls glissants incoherents ou uniformes.
+        6. Une source sans station proche est acceptee si elle ameliore la couverture corridor, mais sa lecture doit etre
+           nuancee par l'indicateur de fiabilite, la fraicheur et le type de captation.
         """
     )
     if data_build_notices:
@@ -3845,7 +4124,15 @@ with meta_source_tab:
 
         - `Meteo-France Portail API` : observations officielles SYNOP, robustes pour le reporting et l'arbitrage exploitation.
         - `InfoClimat / SYNOP` : stations au sol proches de la LGV, utiles pour confirmer localement une alerte.
-        - `Open-Meteo MeteoFrance` : grille modele sur points geolocalises, utile pour garder une couverture complete des 111 communes.
+        - `Open-Meteo MeteoFrance` : grille modele geolocalisee utile pour le court terme et la couverture integrale des 111 communes.
+        - `Open-Meteo archive (communes LGV)` : precipitation journaliere archivee sur point communal, utilisee pour fiabiliser les cumuls longs.
+
+        **Methodologie appliquee a date**
+
+        - `12h / 24h / prevision courte` : lecture court terme prioritaire pour l'exploitation, issue du flux live quand disponible.
+        - `7 jours / 30 jours / mois courant` : cumul fiabilise sur archive journaliere Open-Meteo, aligne sur l'app `lgv-sea-monitoring-meteo-gc`.
+        - `Projection communale` : chaque point est rattache a une commune LGV pour raisonner comme un gestionnaire de ligne, secteur par secteur.
+        - `Fiabilite` : la decision ne repose pas sur la source seule, mais sur la source, la fraicheur et la coherence avec les voisins.
         """
     )
     if source_meta_df.empty:
