@@ -1161,17 +1161,19 @@ def _fetch_meteo_france_portal_commune_weather() -> Tuple[pd.DataFrame, str]:
 
         step = pd.to_numeric(g.get("step_mm"), errors="coerce").fillna(0.0).clip(lower=0.0)
         ts = pd.to_datetime(g["_obs_ts"], utc=True, errors="coerce")
-        rain_12h = float(step[ts > lower_12h].sum())
-        rain_24h = float(step[ts > lower_24h].sum())
-        rain_7d = float(step[ts > lower_7d].sum())
-        rain_30d = float(step[ts > lower_30d].sum())
-        rain_month = float(step[ts >= month_start].sum())
+        span_h = float((ts.max() - ts.min()).total_seconds() / 3600.0) if len(ts) >= 2 else 0.0
+        rain_12h = float(step[ts > lower_12h].sum()) if span_h >= 6.0 else np.nan
+        rain_24h = float(step[ts > lower_24h].sum()) if span_h >= 18.0 else np.nan
+        rain_7d = float(step[ts > lower_7d].sum()) if span_h >= 5.0 * 24.0 else np.nan
+        rain_30d = float(step[ts > lower_30d].sum()) if span_h >= 25.0 * 24.0 else np.nan
+        month_has_coverage = ts.min() <= month_start if not ts.empty else False
+        rain_month = float(step[ts >= month_start].sum()) if month_has_coverage else np.nan
 
         rain_12h = max(rain_12h, float(rain_12h_direct) if pd.notna(rain_12h_direct) else 0.0)
         rain_24h = max(rain_24h, float(rain_24h_direct) if pd.notna(rain_24h_direct) else 0.0)
-        rain_7d = max(rain_7d, rain_24h)
-        rain_30d = max(rain_30d, rain_7d)
-        rain_month = max(rain_month, rain_24h)
+        rain_7d = max(rain_7d, rain_24h) if pd.notna(rain_7d) else np.nan
+        rain_30d = max(rain_30d, rain_7d) if pd.notna(rain_30d) and pd.notna(rain_7d) else np.nan
+        rain_month = max(rain_month, rain_24h) if pd.notna(rain_month) else np.nan
         rain_inst = max(0.0, float(rain_instant) if pd.notna(rain_instant) else 0.0)
 
         station_rows.append(
@@ -1194,6 +1196,8 @@ def _fetch_meteo_france_portal_commune_weather() -> Tuple[pd.DataFrame, str]:
                 "source": METEO_FRANCE_SOURCE_LABEL,
                 "selection_mode": "meteo_france_portail_synop_station",
                 "meteo_model": "mf_dpobs_synop",
+                "history_span_h": round(float(span_h), 1),
+                "rain_calc_method": "mf_portal_live_rr24_only_if_short_history",
             }
         )
 
@@ -1787,6 +1791,117 @@ def _build_commune_proxy_weather_df(
     ]
     keep_cols = [c for c in keep_cols if c in out.columns]
     return out[keep_cols].copy()
+
+
+def _enrich_commune_weather_with_reference_history(
+    base_df: pd.DataFrame,
+    reference_weather_df: pd.DataFrame,
+) -> Tuple[pd.DataFrame, str]:
+    if base_df.empty or reference_weather_df.empty:
+        return base_df.copy(), ""
+
+    reference_communes = _build_lgv_communes_pluvio_table(reference_weather_df)
+    if reference_communes.empty:
+        return base_df.copy(), ""
+
+    ref = reference_communes.copy()
+    ref["commune_code_ref"] = ref.get("commune_code", pd.Series("", index=ref.index)).fillna("").astype(str).str.strip()
+    ref["commune_name_ref"] = ref.get("commune_name", pd.Series("", index=ref.index)).fillna("").astype(str).str.strip()
+    ref = ref.rename(
+        columns={
+            "rain_7d_mm": "ref_rain_7d_mm",
+            "rain_30d_mm": "ref_rain_30d_mm",
+            "rain_month_mm": "ref_rain_month_mm",
+            "provider_source": "ref_provider_source",
+            "provider_station": "ref_provider_station",
+            "date_obs_raw": "ref_date_obs_raw",
+            "match_mode": "ref_match_mode",
+        }
+    )
+    ref_keep_cols = [
+        "commune_code_ref",
+        "commune_name_ref",
+        "ref_rain_7d_mm",
+        "ref_rain_30d_mm",
+        "ref_rain_month_mm",
+        "ref_provider_source",
+        "ref_provider_station",
+        "ref_date_obs_raw",
+        "ref_match_mode",
+    ]
+    ref_keep_cols = [c for c in ref_keep_cols if c in ref.columns]
+    ref = ref[ref_keep_cols].copy()
+
+    out = base_df.copy()
+    out["commune_code_ref"] = out.get("station_ref_id", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    out["commune_name_ref"] = out.get("station_commune_name", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    out = out.merge(ref, how="left", on=["commune_code_ref", "commune_name_ref"])
+
+    backfilled = 0
+    for target_col, ref_col in [
+        ("rain_7d_mm", "ref_rain_7d_mm"),
+        ("rain_30d_mm", "ref_rain_30d_mm"),
+        ("rain_month_mm", "ref_rain_month_mm"),
+    ]:
+        if target_col not in out.columns or ref_col not in out.columns:
+            continue
+        target_series = pd.to_numeric(out[target_col], errors="coerce")
+        ref_series = pd.to_numeric(out[ref_col], errors="coerce")
+        fill_mask = target_series.isna() & ref_series.notna()
+        backfilled += int(fill_mask.sum())
+        out.loc[fill_mask, target_col] = ref_series.loc[fill_mask]
+
+    ref_source = out.get("ref_provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
+    ref_station = out.get("ref_provider_station", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["history_backfill_source"] = np.where(ref_source.str.len() > 0, ref_source, "")
+    out["history_backfill_station"] = np.where(ref_station.str.len() > 0, ref_station, "")
+
+    if "rain_calc_method" not in out.columns:
+        out["rain_calc_method"] = ""
+    out["rain_calc_method"] = out["rain_calc_method"].fillna("").astype(str)
+    hist_mask = out.get("history_backfill_source", pd.Series("", index=out.index)).fillna("").astype(str).str.len() > 0
+    out.loc[hist_mask, "rain_calc_method"] = np.where(
+        out.loc[hist_mask, "rain_calc_method"].astype(str).str.len() > 0,
+        out.loc[hist_mask, "rain_calc_method"].astype(str) + ";history_backfill_commune",
+        "history_backfill_commune",
+    )
+
+    if backfilled <= 0:
+        return out.drop(
+            columns=[
+                c for c in [
+                    "commune_code_ref",
+                    "commune_name_ref",
+                    "ref_rain_7d_mm",
+                    "ref_rain_30d_mm",
+                    "ref_rain_month_mm",
+                    "ref_provider_source",
+                    "ref_provider_station",
+                    "ref_date_obs_raw",
+                    "ref_match_mode",
+                ] if c in out.columns
+            ],
+            errors="ignore",
+        ), ""
+
+    notice = f"Historique 7j/30j/mois reconstitue pour {backfilled} champ(s) via reference communale."
+    out = out.drop(
+        columns=[
+            c for c in [
+                "commune_code_ref",
+                "commune_name_ref",
+                "ref_rain_7d_mm",
+                "ref_rain_30d_mm",
+                "ref_rain_month_mm",
+                "ref_provider_source",
+                "ref_provider_station",
+                "ref_date_obs_raw",
+                "ref_match_mode",
+            ] if c in out.columns
+        ],
+        errors="ignore",
+    )
+    return out, notice
 
 
 def _filter_infoclimat_nearest_lgv(
@@ -2528,6 +2643,16 @@ def _build_map(
         near_count = pd.to_numeric(row.get("near_station_count"), errors="coerce")
         monthly_rank = pd.to_numeric(row.get("monthly_rank"), errors="coerce")
         capture_label = _source_capture_label(row.get("source"))
+        hist_backfill_source = str(row.get("history_backfill_source") or "").strip()
+        hist_backfill_station = str(row.get("history_backfill_station") or "").strip()
+        hist_backfill_html = ""
+        if hist_backfill_source:
+            hist_backfill_html = (
+                "<hr style='margin:6px 0;'>"
+                "<b>Traçabilite cumul long</b><br>"
+                f"7j/30j/mois consolides via: {hist_backfill_source}<br>"
+                f"Reference: {hist_backfill_station or 'commune LGV'}<br>"
+            )
         popup = (
             "<div style='font-size:13px;line-height:1.45;'>"
             f"<b>{row.get('station_display')}</b><br>"
@@ -2550,6 +2675,7 @@ def _build_map(
             f"Distance a la LGV: {_format_num(row.get('distance_to_lgv_km'), 1, ' km')}<br>"
             f"Date observation: {row.get('date_obs_raw') or 'N/A'}<br>"
             f"Age observation: {_format_num(obs_age_h, 1, ' h')}<br>"
+            f"{hist_backfill_html}"
             "<hr style='margin:6px 0;'>"
             "<b>Fiabilite de la donnee</b><br>"
             f"Score: {_format_num(rel_score, 1, '/100')} ({row.get('reliability_class', 'N/A')})<br>"
@@ -2662,6 +2788,17 @@ if not infoclimat_weather_df.empty:
     )
     infoclimat_weather_df = infoclimat_weather_df[info_mask].copy()
 
+reference_history_blocks: List[pd.DataFrame] = []
+if not snapshot_weather_df.empty:
+    reference_history_blocks.append(snapshot_weather_df.copy())
+if not infoclimat_weather_df.empty:
+    reference_history_blocks.append(infoclimat_weather_df.copy())
+reference_history_weather_df = (
+    _safe_weather_df({"weather": pd.concat(reference_history_blocks, ignore_index=True, sort=False).to_dict(orient="records")})
+    if reference_history_blocks
+    else pd.DataFrame()
+)
+
 infoclimat_near_df = pd.DataFrame()
 if not infoclimat_weather_df.empty:
     infoclimat_near_df, used_monitor_radius_km, adaptive_radius_used = _select_infoclimat_monitoring_set(
@@ -2711,6 +2848,13 @@ if source_mode in {SOURCE_MODE_METEOFRANCE, SOURCE_MODE_MIX}:
     if not meteo_france_df.empty:
         meteo_france_df = meteo_france_df.copy()
         meteo_france_df["source"] = METEO_FRANCE_SOURCE_LABEL
+        if not reference_history_weather_df.empty:
+            meteo_france_df, mf_hist_notice = _enrich_commune_weather_with_reference_history(
+                meteo_france_df,
+                reference_history_weather_df,
+            )
+            if mf_hist_notice:
+                data_build_notices.append("Meteo-France Portail: " + mf_hist_notice)
 
 open_meteo_ref_df = pd.DataFrame()
 if source_mode in {SOURCE_MODE_OPEN, SOURCE_MODE_MIX} or meteo_france_df.empty:
@@ -3441,6 +3585,8 @@ station_cols = [
     "reliability_score",
     "reliability_class",
     "reliability_reason",
+    "history_backfill_source",
+    "history_backfill_station",
     "date_obs_raw",
 ]
 station_cols = [c for c in station_cols if c in filtered_stations.columns]
