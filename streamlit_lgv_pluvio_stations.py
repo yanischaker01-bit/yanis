@@ -82,6 +82,8 @@ RELIABILITY_BORDER_COLORS = {
     "SURVEILLER": "#b45309",
     "A_VERIFIER": "#7f1d1d",
 }
+OPEN_METEO_LOCAL_MAX_AGE_H = 72.0
+WEATHER_STALE_ALERT_H = 72.0
 SOURCE_RELIABILITY_HINTS = {
     "SYNOP": 95.0,
     "INFOCLIMAT": 95.0,
@@ -819,6 +821,15 @@ def _load_open_meteo_grid_local() -> Tuple[pd.DataFrame, str]:
         work["rain_class"] = "NORMAL"
 
     work["_obs_ts"] = pd.to_datetime(work.get("date_obs_raw", pd.Series("", index=work.index)), utc=True, errors="coerce")
+    latest_obs_ts = pd.to_datetime(work["_obs_ts"], utc=True, errors="coerce").dropna().max()
+    if pd.notna(latest_obs_ts):
+        now_utc = pd.Timestamp.now(tz="UTC")
+        fallback_age_h = float((now_utc - latest_obs_ts).total_seconds() / 3600.0)
+        if fallback_age_h > float(OPEN_METEO_LOCAL_MAX_AGE_H):
+            return pd.DataFrame(), (
+                "Open-Meteo grille locale ignoree: fichier trop ancien pour un usage exploitation "
+                + f"(obs={latest_obs_ts.isoformat()}, age={fallback_age_h:.1f} h, seuil={OPEN_METEO_LOCAL_MAX_AGE_H:.0f} h)."
+            )
     work = work.sort_values(["_obs_ts", "distance_to_lgv_km"], ascending=[False, True], na_position="last")
     work = work.drop_duplicates(subset=["station_id"], keep="first")
 
@@ -1901,10 +1912,12 @@ def _build_proximity_quality(
     if "_obs_ts" not in work.columns:
         work["_obs_ts"] = pd.to_datetime(work.get("date_obs_raw"), utc=True, errors="coerce")
     obs_ts = pd.to_datetime(work["_obs_ts"], utc=True, errors="coerce")
+    now_utc = pd.Timestamp.now(tz="UTC")
     if snapshot_ts is not None and not pd.isna(snapshot_ts):
-        obs_age_h = (snapshot_ts - obs_ts).dt.total_seconds() / 3600.0
+        reference_ts = max(pd.Timestamp(snapshot_ts), now_utc)
     else:
-        obs_age_h = pd.Series([np.nan] * len(work), index=work.index, dtype=float)
+        reference_ts = now_utc
+    obs_age_h = (reference_ts - obs_ts).dt.total_seconds() / 3600.0
     work["obs_age_h"] = pd.to_numeric(obs_age_h, errors="coerce").fillna(999.0).clip(lower=0.0)
     work["source_note"] = work.get("source", pd.Series("", index=work.index)).map(_source_reliability_note)
     work["freshness_note"] = work["obs_age_h"].map(_freshness_note)
@@ -2004,14 +2017,23 @@ def _build_proximity_quality(
         + pd.to_numeric(work["reliability_freshness_component"], errors="coerce").fillna(0.0)
         + pd.to_numeric(work["reliability_coherence_component"], errors="coerce").fillna(0.0)
     ).clip(lower=0.0, upper=100.0)
+    stale_mask = pd.to_numeric(work["obs_age_h"], errors="coerce").fillna(999.0) > float(WEATHER_STALE_ALERT_H)
+    work.loc[stale_mask, "reliability_score"] = (
+        pd.to_numeric(work.loc[stale_mask, "reliability_score"], errors="coerce").fillna(0.0) - 25.0
+    ).clip(lower=0.0, upper=100.0)
     work["reliability_class"] = work["reliability_score"].map(_reliability_class)
+    work.loc[stale_mask, "reliability_class"] = "A_VERIFIER"
     work["reliability_reason"] = np.where(
-        work["near_station_count"] < int(min_neighbors),
-        "Peu de stations voisines pour confirmer la coherence",
+        stale_mask,
+        "Observation trop ancienne pour un usage exploitation",
         np.where(
-            work["near_delta_metric_pct"].fillna(0.0) >= 60.0,
-            "Ecart eleve vs mediane des stations proches",
-            "Coherence locale satisfaisante",
+            work["near_station_count"] < int(min_neighbors),
+            "Peu de stations voisines pour confirmer la coherence",
+            np.where(
+                work["near_delta_metric_pct"].fillna(0.0) >= 60.0,
+                "Ecart eleve vs mediane des stations proches",
+                "Coherence locale satisfaisante",
+            ),
         ),
     )
     return work
