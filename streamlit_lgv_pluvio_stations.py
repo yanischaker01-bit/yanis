@@ -3006,6 +3006,35 @@ def _build_map(
     return m
 
 
+def _build_commune_map_input(commune_pluvio_df: pd.DataFrame) -> pd.DataFrame:
+    if commune_pluvio_df.empty:
+        return pd.DataFrame()
+
+    out = commune_pluvio_df.copy()
+    out["station_id"] = "commune_lgv_" + out.get("commune_code", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["station_name"] = out.get("commune_name", pd.Series("Commune LGV", index=out.index)).fillna("Commune LGV").astype(str)
+    out["station_display"] = out["station_name"].astype(str) + " (commune LGV)"
+    out["station_commune_name"] = out["station_name"].astype(str)
+    out["source"] = out.get("provider_source", pd.Series("", index=out.index)).fillna("Sans source").astype(str)
+    out["distance_to_lgv_km"] = 0.0
+    out["rain_12h_mm"] = np.nan
+    out["rain_forecast_mm"] = np.nan
+    out["history_backfill_source"] = out.get("provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["history_backfill_station"] = out.get("provider_station", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["history_backfill_obs_date"] = out.get("date_obs_raw", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["reliability_score"] = out["source"].map(_source_reliability_note).astype(float)
+    out["reliability_class"] = out["reliability_score"].map(_reliability_class)
+    out["reliability_reason"] = np.where(
+        out["provider_source"].fillna("").astype(str).str.len() > 0,
+        "Lecture corridor communale LGV",
+        "Commune LGV sans source exploitable",
+    )
+    out["obs_age_h"] = np.nan
+    out["near_station_count"] = 0
+    out["near_delta_metric_pct"] = np.nan
+    return out
+
+
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
@@ -3493,13 +3522,20 @@ selected_station_df = filtered_stations[filtered_stations["station_display"].ast
 selected_station = selected_station_df.iloc[0].to_dict() if not selected_station_df.empty else filtered_stations.iloc[0].to_dict()
 history_station_id = str(selected_station.get("station_id") or "")
 
+commune_source_df = weather_df.copy()
+if not commune_source_df.empty and selected_sources:
+    commune_source_df = commune_source_df[commune_source_df["source"].astype(str).isin(selected_sources)]
+commune_pluvio_df = _build_lgv_communes_pluvio_table(commune_source_df)
+map_points_df = _build_commune_map_input(commune_pluvio_df) if not commune_pluvio_df.empty else filtered_stations.copy()
+map_points_count = int(len(map_points_df))
+
 reliability_series = pd.to_numeric(filtered_stations.get("reliability_score"), errors="coerce").fillna(0.0)
 reliability_class = filtered_stations.get("reliability_class", pd.Series("A_VERIFIER", index=filtered_stations.index)).astype(str)
 incoherence_count = int(filtered_stations.get("incoherence_flag", pd.Series(False, index=filtered_stations.index)).fillna(False).sum())
 
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
-k1.metric("Stations filtrees", int(len(filtered_stations)))
-k2.metric("Communes", int(filtered_stations["station_commune_name"].astype(str).nunique()))
+k1.metric("Points carte LGV", map_points_count)
+k2.metric("Communes", int(len(commune_pluvio_df)) if not commune_pluvio_df.empty else int(filtered_stations["station_commune_name"].astype(str).nunique()))
 k3.metric(f"Max {metric_label}", f"{float(filtered_stations[metric_col].max()):.1f} mm")
 k4.metric(f"Moyenne {metric_label}", f"{float(filtered_stations[metric_col].mean()):.1f} mm")
 k5.metric("Distance max filtre", f"{float(max_distance_km):.1f} km")
@@ -3569,17 +3605,17 @@ with st.expander("Detail du calcul de fiabilite par station", expanded=False):
         hide_index=True,
     )
 
-st.subheader("Carte stations pluvio autour de la LGV SEA")
-map_obj = _build_map(lgv_lines, filtered_stations, metric_col, map_style=map_style)
+st.subheader("Carte pluvio des communes LGV SEA")
+map_obj = _build_map(lgv_lines, map_points_df, metric_col, map_style=map_style)
 st_folium(map_obj, height=640, use_container_width=True)
 source_counts = (
-    filtered_stations.get("source", pd.Series(dtype=str))
+    map_points_df.get("source", pd.Series(dtype=str))
     .dropna()
     .astype(str)
     .value_counts()
     .to_dict()
 )
-st.caption(f"Fond de carte actif: {map_style} | Stations visibles: {int(len(filtered_stations))} | Sources: {source_counts}")
+st.caption(f"Fond de carte actif: {map_style} | Points visibles: {map_points_count} | Sources: {source_counts}")
 st.caption(
     "Lecture carte orientee gestionnaire de ligne: remplissage du point = pression pluvio mensuelle, "
     "contour = fiabilite de la donnee, ordre d'affichage = stations les plus arrosees sur le mois."
@@ -3648,10 +3684,6 @@ else:
         hide_index=True,
     )
 
-commune_source_df = weather_df.copy()
-if not commune_source_df.empty and selected_sources:
-    commune_source_df = commune_source_df[commune_source_df["source"].astype(str).isin(selected_sources)]
-commune_pluvio_df = _build_lgv_communes_pluvio_table(commune_source_df)
 st.subheader("Pluviometrie - Toutes les communes traversees par la LGV SEA")
 if commune_pluvio_df.empty:
     st.info("Impossible de construire la vue commune LGV (catalogue ou donnees indisponibles).")
@@ -3694,10 +3726,6 @@ else:
     s5.metric("Distance ref mediane", f"{float(median_provider_dist):.1f} km" if pd.notna(median_provider_dist) else "N/A")
 
     st.caption(f"Sources actives: {active_sources_label}.")
-    st.caption(
-        "La carte exhaustive des 111 communes a ete retiree pour privilegier une lecture plus operationnelle: "
-        "couverture, communes sans mesure, source mobilisee et export direct."
-    )
 
     summary_left, summary_right = st.columns([1.15, 0.85])
     with summary_left:
