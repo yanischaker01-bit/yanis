@@ -1719,6 +1719,76 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _build_commune_proxy_weather_df(
+    stations_df: pd.DataFrame,
+    source_label: str,
+    selection_mode: str,
+) -> pd.DataFrame:
+    commune_df = _build_lgv_communes_pluvio_table(stations_df)
+    if commune_df.empty:
+        return pd.DataFrame()
+
+    out = commune_df.copy()
+    out["station_id"] = (
+        "commune_proxy_"
+        + out.get("commune_code", pd.Series("", index=out.index)).fillna("").astype(str).replace("", "na")
+    )
+    out["station_ref_id"] = out.get("commune_code", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["station_name"] = out.get("commune_name", pd.Series("Commune LGV", index=out.index)).fillna("Commune LGV").astype(str)
+    out["station_commune_name"] = out["station_name"]
+    out["station_display"] = out["station_name"].astype(str) + " (proxy commune LGV)"
+    out["source"] = str(source_label)
+    out["selection_mode"] = str(selection_mode)
+    out["distance_to_lgv_km"] = 0.0
+    out["provider_source"] = out.get("provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["rain_calc_method"] = (
+        "lgv_commune_proxy_from_station_source="
+        + out["provider_source"].replace("", "inconnue").astype(str)
+    )
+    out["meteo_model"] = out.get("provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["_obs_ts"] = pd.to_datetime(out.get("date_obs_raw", pd.Series("", index=out.index)), utc=True, errors="coerce")
+    rain_cols = [c for c in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm"] if c in out.columns]
+    if rain_cols:
+        data_mask = pd.Series(False, index=out.index)
+        for col in rain_cols:
+            data_mask = data_mask | pd.to_numeric(out[col], errors="coerce").notna()
+        if "provider_station" in out.columns:
+            data_mask = data_mask | out["provider_station"].fillna("").astype(str).str.len().gt(0)
+        out = out[data_mask].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        "station_id",
+        "station_ref_id",
+        "station_name",
+        "station_display",
+        "station_commune_name",
+        "date_obs_raw",
+        "_obs_ts",
+        "latitude",
+        "longitude",
+        "distance_to_lgv_km",
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "rain_12h_mm",
+        "rain_instant_mm",
+        "rain_forecast_mm",
+        "source",
+        "selection_mode",
+        "meteo_model",
+        "provider_station",
+        "provider_source",
+        "provider_station_dist_km",
+        "match_mode",
+        "rain_calc_method",
+    ]
+    keep_cols = [c for c in keep_cols if c in out.columns]
+    return out[keep_cols].copy()
+
+
 def _filter_infoclimat_nearest_lgv(
     stations_df: pd.DataFrame,
     max_distance_km: float,
@@ -2550,6 +2620,11 @@ if not snapshot_weather_df.empty:
         .astype(str)
         .replace("", "snapshot_latest_weather")
     )
+snapshot_commune_proxy_df = _build_commune_proxy_weather_df(
+    snapshot_weather_df,
+    source_label="Snapshot local proxy communes LGV",
+    selection_mode="snapshot_commune_proxy_weather",
+)
 
 data_build_notices: List[str] = []
 infoclimat_local_df, infoclimat_local_notice = _load_infoclimat_synop_local(max_distance_km=LOCAL_INFOCLIMAT_RADIUS_KM)
@@ -2609,6 +2684,16 @@ if not infoclimat_weather_df.empty:
         data_build_notices.append(
             f"InfoClimat proche LGV: aucune station retenue (distance<={float(infoclimat_near_max_km):.0f} km)."
         )
+infoclimat_near_commune_proxy_df = _build_commune_proxy_weather_df(
+    infoclimat_near_df,
+    source_label="SYNOP/InfoClimat proxy communes LGV",
+    selection_mode="infoclimat_commune_proxy_weather",
+)
+infoclimat_full_commune_proxy_df = _build_commune_proxy_weather_df(
+    infoclimat_weather_df,
+    source_label="SYNOP/InfoClimat pack proxy communes LGV",
+    selection_mode="infoclimat_full_commune_proxy_weather",
+)
 if source_mode == SOURCE_MODE_METEOFRANCE:
     data_build_notices.append(
         "Mode Meteo-France strict: donnees officielles SYNOP (Portail API) projetees sur toutes les communes LGV."
@@ -2694,30 +2779,30 @@ if source_mode == SOURCE_MODE_METEOFRANCE and meteo_france_df.empty:
     if not open_meteo_ref_df.empty:
         weather_blocks.append(open_meteo_ref_df)
         data_build_notices.append("Fallback: Meteo-France indisponible, bascule Open-Meteo corridor.")
-    elif not infoclimat_near_df.empty:
-        weather_blocks.append(infoclimat_near_df)
-        data_build_notices.append("Fallback: Meteo-France indisponible, bascule SYNOP/InfoClimat proche LGV.")
-    elif not infoclimat_weather_df.empty:
-        weather_blocks.append(infoclimat_weather_df)
-        data_build_notices.append("Fallback: Meteo-France indisponible, utilisation du dernier pack SYNOP/InfoClimat disponible.")
-    elif not snapshot_weather_df.empty:
-        weather_blocks.append(snapshot_weather_df)
-        data_build_notices.append("Fallback ultime: Meteo-France indisponible, utilisation du dernier snapshot local exploitable.")
+    elif not infoclimat_near_commune_proxy_df.empty:
+        weather_blocks.append(infoclimat_near_commune_proxy_df)
+        data_build_notices.append("Fallback: Meteo-France indisponible, bascule proxy communes LGV depuis SYNOP/InfoClimat proche.")
+    elif not infoclimat_full_commune_proxy_df.empty:
+        weather_blocks.append(infoclimat_full_commune_proxy_df)
+        data_build_notices.append("Fallback: Meteo-France indisponible, utilisation du dernier pack SYNOP/InfoClimat reprojete sur communes LGV.")
+    elif not snapshot_commune_proxy_df.empty:
+        weather_blocks.append(snapshot_commune_proxy_df)
+        data_build_notices.append("Fallback ultime: Meteo-France indisponible, utilisation du dernier snapshot reprojete sur communes LGV.")
 
 if source_mode == SOURCE_MODE_OPEN and open_meteo_ref_df.empty:
-    if not infoclimat_near_df.empty:
-        weather_blocks.append(infoclimat_near_df)
-        data_build_notices.append("Fallback: Open-Meteo indisponible, affichage temporaire InfoClimat proche LGV.")
-    elif not infoclimat_weather_df.empty:
-        weather_blocks.append(infoclimat_weather_df)
-        data_build_notices.append("Fallback: Open-Meteo indisponible, utilisation du dernier pack SYNOP/InfoClimat disponible.")
-    elif not snapshot_weather_df.empty:
-        weather_blocks.append(snapshot_weather_df)
-        data_build_notices.append("Fallback ultime: Open-Meteo indisponible, utilisation du dernier snapshot local exploitable.")
+    if not infoclimat_near_commune_proxy_df.empty:
+        weather_blocks.append(infoclimat_near_commune_proxy_df)
+        data_build_notices.append("Fallback: Open-Meteo indisponible, proxy communes LGV depuis InfoClimat proche.")
+    elif not infoclimat_full_commune_proxy_df.empty:
+        weather_blocks.append(infoclimat_full_commune_proxy_df)
+        data_build_notices.append("Fallback: Open-Meteo indisponible, dernier pack SYNOP/InfoClimat reprojete sur communes LGV.")
+    elif not snapshot_commune_proxy_df.empty:
+        weather_blocks.append(snapshot_commune_proxy_df)
+        data_build_notices.append("Fallback ultime: Open-Meteo indisponible, snapshot reprojete sur communes LGV.")
 
-if source_mode == SOURCE_MODE_MIX and not weather_blocks and not snapshot_weather_df.empty:
-    weather_blocks.append(snapshot_weather_df)
-    data_build_notices.append("Fallback ultime: mix indisponible en live, utilisation du dernier snapshot local exploitable.")
+if source_mode == SOURCE_MODE_MIX and not weather_blocks and not snapshot_commune_proxy_df.empty:
+    weather_blocks.append(snapshot_commune_proxy_df)
+    data_build_notices.append("Fallback ultime: mix indisponible en live, utilisation du dernier snapshot reprojete sur communes LGV.")
 
 if weather_blocks:
     merged_rows = pd.concat(weather_blocks, ignore_index=True, sort=False).to_dict(orient="records")
@@ -2726,10 +2811,10 @@ else:
     weather_df = _safe_weather_df({"weather": []})
 
 if weather_df.empty:
-    if not snapshot_weather_df.empty:
-        weather_df = snapshot_weather_df.copy()
+    if not snapshot_commune_proxy_df.empty:
+        weather_df = snapshot_commune_proxy_df.copy()
         data_build_notices.append(
-            "Secours d'urgence: aucune source live exploitable, la page utilise le dernier snapshot local disponible."
+            "Secours d'urgence: aucune source live exploitable, la page utilise le dernier snapshot reprojete sur communes LGV."
         )
     else:
         st.warning(
