@@ -1474,14 +1474,14 @@ def _open_meteo_archive_metrics_from_entry(entry: object) -> Dict[str, object]:
 def _fetch_open_meteo_archive_reference_points(
     points_key: Tuple[Tuple[str, str, str, float, float, float], ...],
     model: str = OPEN_METEO_MODEL_METEOFRANCE,
-    lookback_days: int = OPEN_METEO_ARCHIVE_LOOKBACK_DAYS,
+    lookback_days: int = 45,
 ) -> Tuple[pd.DataFrame, str]:
     if not points_key:
         return pd.DataFrame(), "Open-Meteo archive: aucun point station."
 
     rows: List[Dict[str, object]] = []
     notices: List[str] = []
-    batch_size = max(5, int(OPEN_METEO_ARCHIVE_BATCH_SIZE))
+    batch_size = 20
     now_utc = datetime.now(timezone.utc)
     lookback = max(32, min(int(lookback_days), 120))
     start_date = (now_utc - pd.Timedelta(days=lookback)).strftime("%Y-%m-%d")
@@ -1539,21 +1539,11 @@ def _fetch_open_meteo_archive_reference_points(
         }
         used_model = str(model)
         try:
-            resp = _http_get_with_retry(
-                OPEN_METEO_ARCHIVE_URL,
-                params=params,
-                timeout=int(OPEN_METEO_ARCHIVE_TIMEOUT_S),
-                max_attempts=2,
-            )
+            resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=35, max_attempts=2)
             if resp.status_code != 200:
                 fallback_params = dict(params)
                 fallback_params.pop("models", None)
-                resp = _http_get_with_retry(
-                    OPEN_METEO_ARCHIVE_URL,
-                    params=fallback_params,
-                    timeout=int(OPEN_METEO_ARCHIVE_TIMEOUT_S),
-                    max_attempts=2,
-                )
+                resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=35, max_attempts=2)
                 used_model = "open_meteo_default"
             if resp.status_code != 200 or not resp.text.strip():
                 return {}, used_model, f"Open-Meteo archive point HTTP {resp.status_code}"
@@ -1582,21 +1572,11 @@ def _fetch_open_meteo_archive_reference_points(
         used_model = str(model)
         batch_entries: List[object] = []
         try:
-            resp = _http_get_with_retry(
-                OPEN_METEO_ARCHIVE_URL,
-                params=params,
-                timeout=int(OPEN_METEO_ARCHIVE_TIMEOUT_S),
-                max_attempts=2,
-            )
+            resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=params, timeout=35, max_attempts=2)
             if resp.status_code != 200:
                 fallback_params = dict(params)
                 fallback_params.pop("models", None)
-                resp = _http_get_with_retry(
-                    OPEN_METEO_ARCHIVE_URL,
-                    params=fallback_params,
-                    timeout=int(OPEN_METEO_ARCHIVE_TIMEOUT_S),
-                    max_attempts=2,
-                )
+                resp = _http_get_with_retry(OPEN_METEO_ARCHIVE_URL, params=fallback_params, timeout=35, max_attempts=2)
                 used_model = "open_meteo_default"
             if resp.status_code == 200 and resp.text.strip():
                 payload = resp.json()
@@ -1617,13 +1597,8 @@ def _fetch_open_meteo_archive_reference_points(
                 rows.append(_build_row(batch[idx], metrics, used_model))
             continue
 
-        if len(batch) > int(OPEN_METEO_ARCHIVE_UNITARY_FALLBACK_MAX_BATCH):
-            if len(notices) < 6:
-                notices.append("Open-Meteo archive: batch incomplet, fallback unitaire saute pour garder un chargement fluide.")
-            continue
-
         if len(batch) > 1 and len(notices) < 6:
-            notices.append("Open-Meteo archive: fallback unitaire limite a un petit lot LGV.")
+            notices.append("Open-Meteo archive: fallback unitaire sur certains points LGV.")
         for ref_point in batch:
             metrics, point_model, point_notice = _fetch_single_point(ref_point)
             if point_notice and len(notices) < 6:
@@ -2418,72 +2393,85 @@ def _build_proximity_quality(
         c for c in ["rain_24h_mm", "rain_7d_mm", "rain_month_mm"]
         if c in work.columns
     ]
-    n = int(len(work))
-    near_count_list = np.zeros(n, dtype=int)
-    near_med_metric_list = np.full(n, np.nan, dtype=float)
-    near_delta_metric_mm_list = np.full(n, np.nan, dtype=float)
-    near_delta_metric_pct_list = np.full(n, np.nan, dtype=float)
-    coherence_note_list = np.full(n, 45.0, dtype=float)
+    near_count_list: List[int] = []
+    near_med_metric_list: List[float] = []
+    near_delta_metric_mm_list: List[float] = []
+    near_delta_metric_pct_list: List[float] = []
+    coherence_note_list: List[float] = []
 
-    lat_vals = pd.to_numeric(work.get("latitude"), errors="coerce").to_numpy(dtype=float)
-    lon_vals = pd.to_numeric(work.get("longitude"), errors="coerce").to_numpy(dtype=float)
-    valid_coords = np.isfinite(lat_vals) & np.isfinite(lon_vals)
-    if valid_coords.any():
-        lat_rad = np.radians(lat_vals[valid_coords])
-        lon_rad = np.radians(lon_vals[valid_coords])
-        lat1 = lat_rad[:, None]
-        lat2 = lat_rad[None, :]
-        lon1 = lon_rad[:, None]
-        lon2 = lon_rad[None, :]
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
-        dist_matrix_valid = 6371.0 * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
-        np.fill_diagonal(dist_matrix_valid, np.inf)
-        valid_indices = np.flatnonzero(valid_coords)
+    for idx, row in work.iterrows():
+        lat = pd.to_numeric(row.get("latitude"), errors="coerce")
+        lon = pd.to_numeric(row.get("longitude"), errors="coerce")
+        station_id = str(row.get("station_id") or "")
+        if pd.isna(lat) or pd.isna(lon):
+            near_count_list.append(0)
+            near_med_metric_list.append(np.nan)
+            near_delta_metric_mm_list.append(np.nan)
+            near_delta_metric_pct_list.append(np.nan)
+            coherence_note_list.append(45.0)
+            continue
 
-        metric_values = pd.to_numeric(work.get(metric_col), errors="coerce").to_numpy(dtype=float)
-        metric_arrays = {
-            mcol: pd.to_numeric(work.get(mcol), errors="coerce").to_numpy(dtype=float)
-            for mcol in metrics_for_consistency
-        }
+        neighbors = work.copy()
+        neighbors = neighbors[neighbors["station_id"].astype(str) != station_id].copy()
+        if neighbors.empty:
+            near_count_list.append(0)
+            near_med_metric_list.append(np.nan)
+            near_delta_metric_mm_list.append(np.nan)
+            near_delta_metric_pct_list.append(np.nan)
+            coherence_note_list.append(45.0)
+            continue
 
-        for pos, idx in enumerate(valid_indices):
-            neighbor_positions = dist_matrix_valid[pos] <= float(compare_radius_km)
-            if not np.any(neighbor_positions):
+        neighbors["_dist_station_km"] = neighbors.apply(
+            lambda r: _haversine_km(
+                float(lat),
+                float(lon),
+                float(pd.to_numeric(r.get("latitude"), errors="coerce")),
+                float(pd.to_numeric(r.get("longitude"), errors="coerce")),
+            )
+            if (pd.notna(pd.to_numeric(r.get("latitude"), errors="coerce")) and pd.notna(pd.to_numeric(r.get("longitude"), errors="coerce")))
+            else np.nan,
+            axis=1,
+        )
+        neighbors = neighbors[
+            pd.to_numeric(neighbors["_dist_station_km"], errors="coerce").fillna(9999.0) <= float(compare_radius_km)
+        ].copy()
+        neighbors = neighbors.dropna(subset=["_dist_station_km"])
+        near_count = int(len(neighbors))
+        near_count_list.append(near_count)
+        if near_count <= 0:
+            near_med_metric_list.append(np.nan)
+            near_delta_metric_mm_list.append(np.nan)
+            near_delta_metric_pct_list.append(np.nan)
+            coherence_note_list.append(45.0)
+            continue
+
+        metric_val = pd.to_numeric(row.get(metric_col), errors="coerce")
+        near_med_metric = pd.to_numeric(neighbors.get(metric_col), errors="coerce").median(skipna=True)
+        near_med_metric_list.append(float(near_med_metric) if pd.notna(near_med_metric) else np.nan)
+        if pd.isna(metric_val) or pd.isna(near_med_metric):
+            near_delta_metric_mm_list.append(np.nan)
+            near_delta_metric_pct_list.append(np.nan)
+        else:
+            delta_mm = abs(float(metric_val) - float(near_med_metric))
+            delta_pct = 100.0 * delta_mm / max(5.0, float(near_med_metric))
+            near_delta_metric_mm_list.append(delta_mm)
+            near_delta_metric_pct_list.append(delta_pct)
+
+        consistency_notes: List[float] = []
+        for mcol in metrics_for_consistency:
+            val = pd.to_numeric(row.get(mcol), errors="coerce")
+            med = pd.to_numeric(neighbors.get(mcol), errors="coerce").median(skipna=True)
+            if pd.isna(val) or pd.isna(med):
                 continue
+            rel = abs(float(val) - float(med)) / max(5.0, float(med))
+            metric_note = max(0.0, 100.0 - rel * 120.0)
+            consistency_notes.append(metric_note)
 
-            neighbor_indices = valid_indices[neighbor_positions]
-            near_count = int(neighbor_indices.size)
-            near_count_list[idx] = near_count
-            if near_count <= 0:
-                continue
-
-            near_metric_vals = metric_values[neighbor_indices]
-            if np.isfinite(near_metric_vals).any():
-                near_med_metric = float(np.nanmedian(near_metric_vals))
-                near_med_metric_list[idx] = near_med_metric
-                metric_val = metric_values[idx]
-                if np.isfinite(metric_val):
-                    delta_mm = abs(float(metric_val) - near_med_metric)
-                    near_delta_metric_mm_list[idx] = delta_mm
-                    near_delta_metric_pct_list[idx] = 100.0 * delta_mm / max(5.0, near_med_metric)
-
-            consistency_notes: List[float] = []
-            for mcol, arr in metric_arrays.items():
-                val = arr[idx]
-                near_vals = arr[neighbor_indices]
-                if not np.isfinite(val) or not np.isfinite(near_vals).any():
-                    continue
-                med = float(np.nanmedian(near_vals))
-                rel = abs(float(val) - med) / max(5.0, med)
-                consistency_notes.append(max(0.0, 100.0 - rel * 120.0))
-
-            if near_count < int(min_neighbors):
-                base_consistency = float(np.mean(consistency_notes)) if consistency_notes else 58.0
-                coherence_note_list[idx] = min(72.0, base_consistency)
-            else:
-                coherence_note_list[idx] = float(np.mean(consistency_notes)) if consistency_notes else 65.0
+        if near_count < int(min_neighbors):
+            base_consistency = float(np.mean(consistency_notes)) if consistency_notes else 58.0
+            coherence_note_list.append(min(72.0, base_consistency))
+        else:
+            coherence_note_list.append(float(np.mean(consistency_notes)) if consistency_notes else 65.0)
 
     work["near_station_count"] = pd.Series(near_count_list, index=work.index, dtype=int)
     work["near_median_metric_mm"] = pd.Series(near_med_metric_list, index=work.index, dtype=float)
@@ -3362,6 +3350,33 @@ if weather_df.empty:
 weather_df = _apply_reliable_rain_30d_policy(weather_df)
 loaded_sources_all = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
 loaded_sources_label = ", ".join(loaded_sources_all) if loaded_sources_all else "Aucune"
+primary_source_status_notice = ""
+if source_mode == SOURCE_MODE_METEOFRANCE and METEO_FRANCE_SOURCE_LABEL not in loaded_sources_all:
+    mf_issue = str(mf_notice or "").strip()
+    if not mf_issue:
+        mf_issue_candidates = [
+            str(n).strip()
+            for n in data_build_notices
+            if "meteo-france" in str(n).lower()
+            and any(tok in str(n).lower() for tok in ["configure", "token", "http", "vide", "erreur", "indisponible", "aucune"])
+        ]
+        mf_issue = mf_issue_candidates[0] if mf_issue_candidates else "source primaire indisponible ou non repondante."
+    primary_source_status_notice = (
+        f"Mode demande: {source_mode}. Source effectivement servie: {loaded_sources_label}. "
+        + f"Cause probable cote Meteo-France: {mf_issue}"
+    )
+elif source_mode == SOURCE_MODE_OPEN and not any(_is_open_meteo_source(src) for src in loaded_sources_all):
+    om_issue_candidates = [
+        str(n).strip()
+        for n in data_build_notices
+        if "open-meteo" in str(n).lower()
+        and any(tok in str(n).lower() for tok in ["http", "vide", "erreur", "indisponible", "aucune"])
+    ]
+    om_issue = om_issue_candidates[0] if om_issue_candidates else "source Open-Meteo indisponible ou non repondante."
+    primary_source_status_notice = (
+        f"Mode demande: {source_mode}. Source effectivement servie: {loaded_sources_label}. "
+        + f"Cause probable cote Open-Meteo: {om_issue}"
+    )
 
 with st.sidebar:
     st.subheader("Filtres stations")
@@ -3528,6 +3543,9 @@ if not commune_source_df.empty and selected_sources:
 commune_pluvio_df = _build_lgv_communes_pluvio_table(commune_source_df)
 map_points_df = _build_commune_map_input(commune_pluvio_df) if not commune_pluvio_df.empty else filtered_stations.copy()
 map_points_count = int(len(map_points_df))
+map_reliability_series = pd.to_numeric(map_points_df.get("reliability_score"), errors="coerce").fillna(0.0)
+map_reliability_class = map_points_df.get("reliability_class", pd.Series("A_VERIFIER", index=map_points_df.index)).astype(str)
+map_metric_series = pd.to_numeric(map_points_df.get(metric_col), errors="coerce")
 
 reliability_series = pd.to_numeric(filtered_stations.get("reliability_score"), errors="coerce").fillna(0.0)
 reliability_class = filtered_stations.get("reliability_class", pd.Series("A_VERIFIER", index=filtered_stations.index)).astype(str)
@@ -3536,36 +3554,27 @@ incoherence_count = int(filtered_stations.get("incoherence_flag", pd.Series(Fals
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
 k1.metric("Points carte LGV", map_points_count)
 k2.metric("Communes", int(len(commune_pluvio_df)) if not commune_pluvio_df.empty else int(filtered_stations["station_commune_name"].astype(str).nunique()))
-k3.metric(f"Max {metric_label}", f"{float(filtered_stations[metric_col].max()):.1f} mm")
-k4.metric(f"Moyenne {metric_label}", f"{float(filtered_stations[metric_col].mean()):.1f} mm")
+k3.metric(f"Max {metric_label}", f"{float(map_metric_series.max()):.1f} mm" if map_metric_series.notna().any() else "N/A")
+k4.metric(f"Moyenne {metric_label}", f"{float(map_metric_series.mean()):.1f} mm" if map_metric_series.notna().any() else "N/A")
 k5.metric("Distance max filtre", f"{float(max_distance_km):.1f} km")
-k6.metric("Fiabilite moyenne", f"{float(reliability_series.mean()):.1f}/100")
-k7.metric("Stations FIABLE", int((reliability_class == "FIABLE").sum()))
+k6.metric("Fiabilite moyenne", f"{float(map_reliability_series.mean()):.1f}/100" if not map_reliability_series.empty else "N/A")
+k7.metric("Points FIABLE", int((map_reliability_class == "FIABLE").sum()))
 k8.metric("Incoherences proximite", incoherence_count)
 
 if snapshot_ts is not None and not pd.isna(snapshot_ts):
     st.caption(f"Snapshot: {snapshot_source} | timestamp_utc={snapshot_ts.isoformat()}")
 else:
     st.caption(f"Snapshot: {snapshot_source} | timestamp inconnu")
-main_page_notices = [
-    str(n).strip()
-    for n in data_build_notices
-    if str(n).strip()
-    and not any(
-        tag in str(n).lower()
-        for tag in [
-            "http",
-            "token",
-            "configure",
-            "expecting value",
-            "fallback unitaire",
-            "batch erreur",
-            "source effectivement servie",
-        ]
-    )
+if data_build_notices:
+    st.caption(" | ".join([n for n in data_build_notices if n][:3]))
+if primary_source_status_notice:
+    st.warning(primary_source_status_notice)
+fallback_runtime_notices = [
+    str(n) for n in data_build_notices
+    if any(tag in str(n).lower() for tag in ["fallback", "secours", "indisponible", "ignoree"])
 ]
-if main_page_notices:
-    st.caption(" | ".join(main_page_notices[:2]))
+if fallback_runtime_notices:
+    st.warning("Mode degrade actif: " + " | ".join(fallback_runtime_notices[:2]))
 if bool(ENABLE_RAIN_30D):
     st.caption(
         "Le cumul 30 jours est affiche uniquement s'il provient d'une source longue fiabilisee "
