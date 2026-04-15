@@ -52,6 +52,12 @@ jobs:
           cp reports/lgv_dashboard_latest.html site/reports/lgv_dashboard_latest.html
           cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
 
+      - name: Wake Streamlit pluvio app
+        env:
+          STREAMLIT_APP_URL: https://lgvpluviostations.streamlit.app/
+        run: |
+          curl -L --silent --show-error --max-time 120 "$STREAMLIT_APP_URL" > /dev/null || true
+
       - name: Setup Pages
         uses: actions/configure-pages@v5
         with:

@@ -70,11 +70,29 @@ HISTORY_SOURCE_COLORS = {
     METEO_FRANCE_SOURCE_LABEL: "#0b3d91",
     OPEN_METEO_SOURCE_LABEL: "#1d4ed8",
 }
+MONTHLY_ALERT_COLORS = {
+    "FAIBLE": "#16a34a",
+    "MODERE": "#65a30d",
+    "ELEVE": "#ea580c",
+    "CRITIQUE": "#dc2626",
+    "INCONNU": "#64748b",
+}
+RELIABILITY_BORDER_COLORS = {
+    "FIABLE": "#0f766e",
+    "SURVEILLER": "#b45309",
+    "A_VERIFIER": "#7f1d1d",
+}
 SOURCE_RELIABILITY_HINTS = {
     "SYNOP": 95.0,
     "INFOCLIMAT": 95.0,
     "METEOFRANCE": 93.0,
     "OPEN_METEO": 84.0,
+}
+COMMUNE_MATCH_MODE_LABELS = {
+    "code_exact": "Code commune exact",
+    "commune_name": "Nom de commune",
+    "nearest_station": "Station la plus proche",
+    "no_data": "Sans donnee",
 }
 LOCAL_INFOCLIMAT_RADIUS_KM = 250.0
 MAP_TILE_STYLES = {
@@ -1394,38 +1412,80 @@ def _build_source_metadata_table(stations_df: pd.DataFrame) -> pd.DataFrame:
         dist = pd.to_numeric(sub.get("distance_to_lgv_km"), errors="coerce")
         if _is_infoclimat_source(source):
             data_type = "Stations observations (SYNOP/InfoClimat)"
+            captation = "Mesure directe au sol via station SYNOP / station proche LGV."
             refresh = "Horaire (observation)"
             method = "Mesures station + calcul cumuls 24h/7j/30j puis controle de coherence locale."
             limits = "Densite de stations variable selon secteurs LGV."
+            usage = "Affiner la lecture locale au droit de la plateforme et confirmer une alerte."
         elif str(source or "").strip() == METEO_FRANCE_SOURCE_LABEL:
             data_type = "Stations officielles (Meteo-France Portail API)"
+            captation = "Observation officielle SYNOP au sol, reprojetee sur chaque commune LGV."
             refresh = "Tri-horaire (SYNOP)"
             method = "Observations SYNOP officielles projetees sur chaque commune LGV (station la plus proche)."
             limits = "La mesure est indirecte pour certaines communes (proxy station)."
+            usage = "Support de reference officielle pour arbitrage exploitation / maintenance."
         elif _is_open_meteo_source(source):
             data_type = "Modele numerique (Open-Meteo)"
+            captation = "Maille modele MeteoFrance/Open-Meteo calculee sur des points geolocalises LGV."
             refresh = "Horaire (reanalyse + prevision courte)"
             method = "Interpolation modele sur coordonnees station puis cumuls glissants."
             limits = "Ce n'est pas une mesure directe de pluviometre."
+            usage = "Garantir une couverture corridor exhaustive, meme sans station proche."
         else:
             data_type = "Source diverse"
+            captation = "Captation heterogene, harmonisee dans le pipeline."
             refresh = "Selon source"
             method = "Harmonisation interne puis controle de coherence."
             limits = "Metadonnees limitees."
+            usage = "Usage secondaire, a confirmer avant decision terrain."
         rows.append(
             {
                 "source": source,
                 "type_data": data_type,
+                "captation": captation,
                 "maj_typique": refresh,
                 "nb_stations": int(len(sub)),
                 "distance_mediane_lgv_km": round(float(dist.median()), 2) if dist.notna().any() else np.nan,
                 "age_median_h": round(float(age_h.median()), 1) if age_h.notna().any() else np.nan,
                 "fiabilite_mediane_100": round(float(rel.median()), 1) if rel.notna().any() else np.nan,
                 "methodologie": method,
+                "usage_ferroviaire": usage,
                 "limites": limits,
             }
         )
     return pd.DataFrame(rows).sort_values(["fiabilite_mediane_100", "nb_stations"], ascending=[False, False], na_position="last")
+
+
+def _source_capture_label(source: object) -> str:
+    txt = str(source or "").strip()
+    if _is_infoclimat_source(txt):
+        return "Mesure station SYNOP / InfoClimat au sol"
+    if txt == METEO_FRANCE_SOURCE_LABEL:
+        return "Observation officielle SYNOP reprojetee sur commune LGV"
+    if _is_open_meteo_source(txt):
+        return "Maille modele geolocalisee sur la LGV"
+    return "Source harmonisee interne"
+
+
+def _monthly_alert_level(month_mm: object) -> str:
+    val = pd.to_numeric(month_mm, errors="coerce")
+    if pd.isna(val):
+        return "INCONNU"
+    v = float(val)
+    if v >= 180.0:
+        return "CRITIQUE"
+    if v >= 120.0:
+        return "ELEVE"
+    if v >= 70.0:
+        return "MODERE"
+    return "FAIBLE"
+
+
+def _format_num(value: object, digits: int = 1, suffix: str = "") -> str:
+    num = pd.to_numeric(value, errors="coerce")
+    if pd.isna(num):
+        return "N/A"
+    return f"{float(num):.{digits}f}{suffix}"
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -2327,44 +2387,98 @@ def _build_map(
     if stations_df.empty:
         return m
 
-    metric_vals = pd.to_numeric(stations_df.get(rain_col), errors="coerce")
-    vmax = float(metric_vals.max()) if metric_vals.notna().any() else 1.0
-    vmax = max(vmax, 1.0)
-    for _, row in stations_df.iterrows():
+    plot_df = stations_df.copy()
+    for col in [
+        rain_col,
+        "rain_24h_mm",
+        "rain_7d_mm",
+        "rain_30d_mm",
+        "rain_month_mm",
+        "rain_12h_mm",
+        "rain_forecast_mm",
+        "distance_to_lgv_km",
+        "reliability_score",
+        "obs_age_h",
+        "near_station_count",
+        "near_delta_metric_pct",
+    ]:
+        if col not in plot_df.columns:
+            plot_df[col] = np.nan
+        plot_df[col] = pd.to_numeric(plot_df.get(col), errors="coerce")
+    plot_df["monthly_rank"] = plot_df["rain_month_mm"].rank(method="dense", ascending=False).astype("Int64")
+    plot_df["monthly_alert_level"] = plot_df["rain_month_mm"].map(_monthly_alert_level)
+    plot_df = plot_df.sort_values(
+        ["rain_month_mm", rain_col, "reliability_score", "distance_to_lgv_km"],
+        ascending=[True, True, True, False],
+        na_position="last",
+    )
+
+    month_vals = pd.to_numeric(plot_df.get("rain_month_mm"), errors="coerce")
+    month_vmax = float(month_vals.max()) if month_vals.notna().any() else 1.0
+    month_vmax = max(month_vmax, 1.0)
+    total_points = int(len(plot_df))
+
+    for _, row in plot_df.iterrows():
         lat = pd.to_numeric(row.get("latitude"), errors="coerce")
         lon = pd.to_numeric(row.get("longitude"), errors="coerce")
         val = pd.to_numeric(row.get(rain_col), errors="coerce")
-        if pd.isna(lat) or pd.isna(lon) or pd.isna(val):
+        month_val = pd.to_numeric(row.get("rain_month_mm"), errors="coerce")
+        if pd.isna(lat) or pd.isna(lon) or (pd.isna(val) and pd.isna(month_val)):
             continue
-        ratio = max(0.0, min(1.0, float(val) / vmax))
+        month_ratio = max(0.0, min(1.0, float(0.0 if pd.isna(month_val) else month_val) / month_vmax))
+        monthly_level = str(row.get("monthly_alert_level") or "INCONNU")
+        fill_color = MONTHLY_ALERT_COLORS.get(monthly_level, MONTHLY_ALERT_COLORS["INCONNU"])
         rclass = str(row.get("reliability_class") or "")
-        if rclass == "A_VERIFIER":
-            color = "#7f1d1d"
-        elif rclass == "SURVEILLER":
-            color = "#b45309"
-        else:
-            color = "#16a34a" if ratio < 0.33 else ("#ea580c" if ratio < 0.66 else "#dc2626")
+        color = RELIABILITY_BORDER_COLORS.get(rclass, "#334155")
         rel_score = pd.to_numeric(row.get("reliability_score"), errors="coerce")
         near_delta_pct = pd.to_numeric(row.get("near_delta_metric_pct"), errors="coerce")
+        obs_age_h = pd.to_numeric(row.get("obs_age_h"), errors="coerce")
+        near_count = pd.to_numeric(row.get("near_station_count"), errors="coerce")
+        monthly_rank = pd.to_numeric(row.get("monthly_rank"), errors="coerce")
+        capture_label = _source_capture_label(row.get("source"))
         popup = (
-            f"<b>Station:</b> {row.get('station_display')}<br>"
-            f"<b>Commune:</b> {row.get('station_commune_name')}<br>"
-            f"<b>Source:</b> {row.get('source')}<br>"
-            f"<b>Distance LGV:</b> {row.get('distance_to_lgv_km')} km<br>"
-            f"<b>{rain_col}:</b> {float(val):.1f} mm<br>"
-            f"<b>Score fiabilite:</b> {0.0 if pd.isna(rel_score) else float(rel_score):.1f}/100 ({row.get('reliability_class', 'N/A')})<br>"
-            f"<b>Ecart vs stations proches:</b> {0.0 if pd.isna(near_delta_pct) else float(near_delta_pct):.1f}%<br>"
-            f"<b>Obs:</b> {row.get('date_obs_raw')}"
+            "<div style='font-size:13px;line-height:1.45;'>"
+            f"<b>{row.get('station_display')}</b><br>"
+            f"Commune LGV: {row.get('station_commune_name')}<br>"
+            f"Source: {row.get('source')}<br>"
+            f"Type de captation: {capture_label}<br>"
+            "<hr style='margin:6px 0;'>"
+            "<b>Priorisation ferroviaire pluie mensuelle</b><br>"
+            f"Rang mensuel: #{int(monthly_rank) if pd.notna(monthly_rank) else 'N/A'} / {total_points}<br>"
+            f"Niveau mensuel: {monthly_level}<br>"
+            f"Cumul mensuel: {_format_num(month_val, 1, ' mm')}<br>"
+            f"Cumul 30 jours: {_format_num(row.get('rain_30d_mm'), 1, ' mm')}<br>"
+            f"Cumul 7 jours: {_format_num(row.get('rain_7d_mm'), 1, ' mm')}<br>"
+            f"Cumul 24h: {_format_num(row.get('rain_24h_mm'), 1, ' mm')}<br>"
+            f"Cumul 12h: {_format_num(row.get('rain_12h_mm'), 1, ' mm')}<br>"
+            f"Prevision courte: {_format_num(row.get('rain_forecast_mm'), 1, ' mm')}<br>"
+            f"Indicateur affiche: {rain_col} = {_format_num(val, 1, ' mm')}<br>"
+            "<hr style='margin:6px 0;'>"
+            "<b>Contexte d'exploitation</b><br>"
+            f"Distance a la LGV: {_format_num(row.get('distance_to_lgv_km'), 1, ' km')}<br>"
+            f"Date observation: {row.get('date_obs_raw') or 'N/A'}<br>"
+            f"Age observation: {_format_num(obs_age_h, 1, ' h')}<br>"
+            "<hr style='margin:6px 0;'>"
+            "<b>Fiabilite de la donnee</b><br>"
+            f"Score: {_format_num(rel_score, 1, '/100')} ({row.get('reliability_class', 'N/A')})<br>"
+            f"Voisins compares: {int(near_count) if pd.notna(near_count) else 0}<br>"
+            f"Ecart vs voisins: {_format_num(near_delta_pct, 1, ' %')}<br>"
+            f"Lecture qualite: {row.get('reliability_reason') or 'N/A'}"
+            "</div>"
         )
         folium.CircleMarker(
             [float(lat), float(lon)],
-            radius=5 + 6 * ratio,
+            radius=5 + 7 * month_ratio,
             color=color,
             fill=True,
+            fill_color=fill_color,
             fill_opacity=0.85,
-            weight=1,
-            popup=folium.Popup(popup, max_width=380),
-            tooltip=f"{row.get('station_display')} | {float(val):.1f} mm",
+            weight=2,
+            popup=folium.Popup(popup, max_width=420),
+            tooltip=(
+                f"#{int(monthly_rank) if pd.notna(monthly_rank) else '-'} "
+                f"{row.get('station_display')} | mensuel {_format_num(month_val, 1, ' mm')}"
+            ),
         ).add_to(m)
 
     return m
@@ -2649,10 +2763,17 @@ filtered_stations = _build_proximity_quality(
     compare_radius_km=float(compare_radius_km),
     min_neighbors=int(min_neighbors),
 )
+filtered_stations["rain_month_mm"] = pd.to_numeric(filtered_stations.get("rain_month_mm"), errors="coerce")
+filtered_stations["monthly_rank"] = filtered_stations["rain_month_mm"].rank(method="dense", ascending=False).astype("Int64")
+filtered_stations["monthly_alert_level"] = filtered_stations["rain_month_mm"].map(_monthly_alert_level)
 filtered_stations["incoherence_flag"] = (
     pd.to_numeric(filtered_stations.get("near_delta_metric_pct"), errors="coerce").fillna(0.0) >= float(incoherence_alert_pct)
 )
-filtered_stations = filtered_stations.sort_values([metric_col, "distance_to_lgv_km"], ascending=[False, True], na_position="last")
+filtered_stations = filtered_stations.sort_values(
+    [metric_col, "rain_month_mm", "distance_to_lgv_km"],
+    ascending=[False, False, True],
+    na_position="last",
+)
 
 top_n_max = max(1, int(len(filtered_stations)))
 top_n_key = f"plv_top_n_{int(top_n_max)}"
@@ -2774,6 +2895,31 @@ source_counts = (
     .to_dict()
 )
 st.caption(f"Fond de carte actif: {map_style} | Stations visibles: {int(len(filtered_stations))} | Sources: {source_counts}")
+st.caption(
+    "Lecture carte orientee gestionnaire de ligne: remplissage du point = pression pluvio mensuelle, "
+    "contour = fiabilite de la donnee, ordre d'affichage = stations les plus arrosees sur le mois."
+)
+st.markdown("**Priorisation mensuelle des points a surveiller**")
+monthly_priority_cols = [
+    "monthly_rank",
+    "monthly_alert_level",
+    "station_display",
+    "station_commune_name",
+    "source",
+    "rain_month_mm",
+    "rain_7d_mm",
+    "rain_24h_mm",
+    "distance_to_lgv_km",
+    "reliability_class",
+    "reliability_score",
+]
+monthly_priority_cols = [c for c in monthly_priority_cols if c in filtered_stations.columns]
+monthly_priority_df = (
+    filtered_stations[monthly_priority_cols]
+    .sort_values(["rain_month_mm", "reliability_score"], ascending=[False, False], na_position="last")
+    .head(20)
+)
+st.dataframe(monthly_priority_df, use_container_width=True, hide_index=True)
 with st.expander("Localisation des stations (lat/lon)", expanded=False):
     loc_cols = [
         "station_display",
@@ -2825,35 +2971,165 @@ st.subheader("Pluviometrie - Toutes les communes traversees par la LGV SEA")
 if commune_pluvio_df.empty:
     st.info("Impossible de construire la vue commune LGV (catalogue ou donnees indisponibles).")
 else:
-    n_total_communes = int(len(commune_pluvio_df))
-    n_with_data = int(pd.to_numeric(commune_pluvio_df.get(metric_col), errors="coerce").notna().sum())
-    st.caption(
-        f"Couverture communes LGV: {n_with_data}/{n_total_communes} (source(s) active(s): {selected_sources})."
+    active_sources_label = ", ".join(selected_sources) if selected_sources else "Toutes sources"
+    commune_pluvio_df = commune_pluvio_df.copy()
+    commune_pluvio_df["match_mode_label"] = (
+        commune_pluvio_df.get("match_mode", pd.Series("", index=commune_pluvio_df.index))
+        .fillna("")
+        .astype(str)
+        .map(lambda v: COMMUNE_MATCH_MODE_LABELS.get(str(v), str(v) or "Inconnu"))
     )
-    commune_map_df = commune_pluvio_df.copy()
-    commune_map_df["station_display"] = commune_map_df["commune_name"].astype(str) + " (commune LGV)"
-    commune_map_df["station_id"] = commune_map_df["commune_code"].astype(str)
-    commune_map_df["station_commune_name"] = commune_map_df["commune_name"].astype(str)
-    commune_map_df["source"] = commune_map_df.get("provider_source", pd.Series("", index=commune_map_df.index)).fillna("").astype(str)
-    commune_map_df["date_obs_raw"] = commune_map_df.get("date_obs_raw", pd.Series("", index=commune_map_df.index)).fillna("").astype(str)
-    commune_map_df["distance_to_lgv_km"] = 0.0
-    commune_map = _build_map(lgv_lines, commune_map_df, metric_col, map_style=map_style)
-    st_folium(commune_map, height=560, use_container_width=True, key="lgv_communes_full_map")
+    commune_pluvio_df["provider_source_label"] = (
+        commune_pluvio_df.get("provider_source", pd.Series("", index=commune_pluvio_df.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .replace("", "Sans source")
+    )
+    metric_series = pd.to_numeric(commune_pluvio_df.get(metric_col), errors="coerce")
+    provider_dist_series = pd.to_numeric(commune_pluvio_df.get("provider_station_dist_km"), errors="coerce")
+    n_total_communes = int(len(commune_pluvio_df))
+    n_with_data = int(metric_series.notna().sum())
+    coverage_pct = round(100.0 * n_with_data / max(1, n_total_communes), 1)
+    missing_df = commune_pluvio_df[metric_series.isna()].copy()
+    covered_df = commune_pluvio_df[metric_series.notna()].copy()
+    max_metric_val = float(metric_series.max()) if metric_series.notna().any() else np.nan
+    median_provider_dist = float(provider_dist_series.dropna().median()) if provider_dist_series.notna().any() else np.nan
+
+    dominant_source = "N/A"
+    dominant_source_counts = covered_df["provider_source_label"].value_counts() if not covered_df.empty else pd.Series(dtype=int)
+    if not dominant_source_counts.empty:
+        dominant_source = f"{dominant_source_counts.index[0]} ({int(dominant_source_counts.iloc[0])})"
+
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Couverture LGV", f"{n_with_data}/{n_total_communes}", delta=f"{coverage_pct:.1f}%")
+    s2.metric("Communes sans mesure", int(len(missing_df)))
+    s3.metric(f"Max {metric_label}", f"{float(max_metric_val):.1f} mm" if pd.notna(max_metric_val) else "N/A")
+    s4.metric("Source dominante", dominant_source)
+    s5.metric("Distance ref mediane", f"{float(median_provider_dist):.1f} km" if pd.notna(median_provider_dist) else "N/A")
+
+    st.caption(f"Sources actives: {active_sources_label}.")
+    st.caption(
+        "La carte exhaustive des 111 communes a ete retiree pour privilegier une lecture plus operationnelle: "
+        "couverture, communes sans mesure, source mobilisee et export direct."
+    )
+
+    summary_left, summary_right = st.columns([1.15, 0.85])
+    with summary_left:
+        source_summary = (
+            commune_pluvio_df.groupby("provider_source_label", dropna=False)
+            .agg(
+                communes=("commune_code", "nunique"),
+                communes_couvertes=(metric_col, lambda s: int(pd.to_numeric(s, errors="coerce").notna().sum())),
+                pluie_moy_mm=(metric_col, lambda s: round(float(pd.to_numeric(s, errors="coerce").mean()), 1) if pd.to_numeric(s, errors="coerce").notna().any() else np.nan),
+            )
+            .reset_index()
+            .sort_values(["communes_couvertes", "communes"], ascending=[False, False])
+        )
+        source_chart = px.bar(
+            source_summary,
+            x="communes_couvertes",
+            y="provider_source_label",
+            orientation="h",
+            color="provider_source_label",
+            labels={
+                "communes_couvertes": "Communes avec mesure",
+                "provider_source_label": "Source",
+            },
+            title="Couverture par source active",
+            hover_data=["communes", "pluie_moy_mm"],
+        )
+        source_chart.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10), showlegend=False)
+        st.plotly_chart(source_chart, use_container_width=True)
+
+    with summary_right:
+        match_summary = (
+            commune_pluvio_df.groupby("match_mode_label", dropna=False)
+            .agg(communes=("commune_code", "nunique"))
+            .reset_index()
+            .sort_values("communes", ascending=False)
+        )
+        match_chart = px.bar(
+            match_summary,
+            x="communes",
+            y="match_mode_label",
+            orientation="h",
+            color="match_mode_label",
+            labels={
+                "communes": "Communes",
+                "match_mode_label": "Mode d'appairage",
+            },
+            title="Qualite d'appairage commune/station",
+        )
+        match_chart.update_layout(height=320, margin=dict(l=10, r=10, t=45, b=10), showlegend=False)
+        st.plotly_chart(match_chart, use_container_width=True)
+
+    if not missing_df.empty:
+        missing_cols = [c for c in ["commune_code", "commune_name", "match_mode_label"] if c in missing_df.columns]
+        with st.expander(f"Communes sans mesure sur le filtre courant ({int(len(missing_df))})", expanded=False):
+            st.dataframe(
+                missing_df[missing_cols].sort_values(["commune_name", "commune_code"], ascending=[True, True]),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    review_queue = commune_pluvio_df[
+        metric_series.isna()
+        | (
+            commune_pluvio_df.get("match_mode", pd.Series("", index=commune_pluvio_df.index))
+            .fillna("")
+            .astype(str)
+            .eq("nearest_station")
+        )
+        | (provider_dist_series.fillna(0.0) > 10.0)
+    ].copy()
+    if not review_queue.empty:
+        review_cols = [
+            "commune_code",
+            "commune_name",
+            "provider_source_label",
+            "provider_station",
+            "provider_station_dist_km",
+            "match_mode_label",
+            metric_col,
+            "date_obs_raw",
+        ]
+        review_cols = [c for c in review_cols if c in review_queue.columns]
+        with st.expander("Communes a controler en priorite", expanded=False):
+            st.dataframe(
+                review_queue[review_cols].sort_values(
+                    ["provider_station_dist_km", "commune_name"],
+                    ascending=[False, True],
+                    na_position="last",
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    rain_cols_order = [metric_col] + [c for c in ["rain_24h_mm", "rain_7d_mm", "rain_30d_mm", "rain_month_mm"] if c != metric_col]
     commune_view_cols = [
         "commune_code",
         "commune_name",
+        *[c for c in rain_cols_order if c in commune_pluvio_df.columns],
         "provider_source",
         "provider_station",
         "provider_station_dist_km",
-        "match_mode",
-        "rain_24h_mm",
-        "rain_7d_mm",
-        "rain_30d_mm",
-        "rain_month_mm",
+        "match_mode_label",
         "date_obs_raw",
     ]
     commune_view_cols = [c for c in commune_view_cols if c in commune_pluvio_df.columns]
-    st.dataframe(commune_pluvio_df[commune_view_cols], use_container_width=True, hide_index=True)
+    commune_view = commune_pluvio_df[commune_view_cols].copy()
+    if metric_col in commune_view.columns:
+        commune_view = commune_view.sort_values([metric_col, "commune_name"], ascending=[False, True], na_position="last")
+    commune_export_name = f"lgv_communes_pluvio_{metric_col}.csv"
+    st.download_button(
+        "Exporter le tableau communes LGV (CSV)",
+        data=commune_view.to_csv(index=False).encode("utf-8-sig"),
+        file_name=commune_export_name,
+        mime="text/csv",
+        use_container_width=False,
+    )
+    st.dataframe(commune_view, use_container_width=True, hide_index=True)
 
 st.subheader(f"Top {int(top_n)} stations - {metric_label}")
 top_df = filtered_stations.head(int(top_n)).copy()
@@ -3152,3 +3428,96 @@ else:
                 np.nan,
             ).round(1)
             st.dataframe(summary, use_container_width=True, hide_index=True)
+
+st.subheader("Metadata")
+meta_method_tab, meta_source_tab, meta_fiability_tab = st.tabs(
+    ["Methodologie", "Sources & captation", "Fiabilite operationnelle"]
+)
+
+with meta_method_tab:
+    st.markdown(
+        """
+        **Lecture metier orientee gestionnaire de ligne ferroviaire**
+
+        1. La carte sert d'abord a prioriser les rondes, visites plateforme, verification drainage et points sensibles GC.
+        2. Le point cartographique represente une station reelle ou un point geolocalise proxy rattache a une commune LGV.
+        3. Le classement visuel est base sur la **pluie mensuelle**, plus pertinente pour suivre la saturation des sols,
+           les remblais/deblais, les talus et la persistance d'un contexte humide.
+        4. Les cumuls 24h et 7 jours restent affiches dans les popups pour detecter un episode brutal ou recent.
+        5. Une source sans station proche est acceptee si elle ameliore la couverture corridor, mais sa lecture doit etre
+           nuancee par l'indicateur de fiabilite et le type de captation.
+        """
+    )
+    if data_build_notices:
+        notices_df = pd.DataFrame({"etape_pipeline": [str(n) for n in data_build_notices if str(n).strip()]})
+        st.dataframe(notices_df, use_container_width=True, hide_index=True)
+
+with meta_source_tab:
+    st.markdown(
+        """
+        **Types de donnees meteo utilises**
+
+        - `Meteo-France Portail API` : observations officielles SYNOP, robustes pour le reporting et l'arbitrage exploitation.
+        - `InfoClimat / SYNOP` : stations au sol proches de la LGV, utiles pour confirmer localement une alerte.
+        - `Open-Meteo MeteoFrance` : grille modele sur points geolocalises, utile pour garder une couverture complete des 111 communes.
+        """
+    )
+    if source_meta_df.empty:
+        st.info("Metadonnees sources indisponibles sur ce filtre.")
+    else:
+        source_meta_view_cols = [
+            "source",
+            "type_data",
+            "captation",
+            "maj_typique",
+            "nb_stations",
+            "distance_mediane_lgv_km",
+            "age_median_h",
+            "fiabilite_mediane_100",
+            "methodologie",
+            "usage_ferroviaire",
+            "limites",
+        ]
+        source_meta_view_cols = [c for c in source_meta_view_cols if c in source_meta_df.columns]
+        st.dataframe(source_meta_df[source_meta_view_cols], use_container_width=True, hide_index=True)
+
+with meta_fiability_tab:
+    st.markdown(
+        """
+        **Comment la fiabilite est calculee**
+
+        - `42% note_source` : confiance initiale selon la nature de la source.
+        - `23% fraicheur_obs` : penalite si la derniere observation devient ancienne.
+        - `35% coherence_locale` : comparaison avec les stations voisines dans le rayon choisi.
+
+        **Classes de lecture**
+
+        - `FIABLE` : donnee exploitable directement pour prioriser la surveillance.
+        - `SURVEILLER` : donnee utile mais a croiser avec le contexte local.
+        - `A_VERIFIER` : donnee a confirmer avant decision terrain ou restriction d'exploitation.
+        """
+    )
+    st.caption(
+        "Sur la carte, le contour du point represente la fiabilite; dans les popups, "
+        "le gestionnaire voit aussi l'age de l'observation, le nombre de voisins compares et l'ecart a la mediane locale."
+    )
+    fiability_summary = pd.DataFrame(
+        [
+            {
+                "classe": "FIABLE",
+                "score_min": 85,
+                "usage_recommande": "Pilotage direct des rondes et priorisation plateforme / talus.",
+            },
+            {
+                "classe": "SURVEILLER",
+                "score_min": 65,
+                "usage_recommande": "Confirmer avec une seconde source, l'historique et le contexte terrain.",
+            },
+            {
+                "classe": "A_VERIFIER",
+                "score_min": 0,
+                "usage_recommande": "Ne pas engager seul une decision d'exploitation sans verification complementaire.",
+            },
+        ]
+    )
+    st.dataframe(fiability_summary, use_container_width=True, hide_index=True)
