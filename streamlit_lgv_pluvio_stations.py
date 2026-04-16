@@ -884,6 +884,15 @@ def _runtime_secret_or_env(*keys: str) -> str:
     return ""
 
 
+def _meteo_france_portal_is_configured() -> bool:
+    direct_token = _runtime_secret_or_env("METEOFRANCE_ACCESS_TOKEN", "METEO_FRANCE_ACCESS_TOKEN")
+    if direct_token:
+        return True
+    client_id = _runtime_secret_or_env("METEOFRANCE_CLIENT_ID", "METEO_FRANCE_CLIENT_ID")
+    client_secret = _runtime_secret_or_env("METEOFRANCE_CLIENT_SECRET", "METEO_FRANCE_CLIENT_SECRET")
+    return bool(client_id and client_secret)
+
+
 def _normalize_col_key(txt: object) -> str:
     return "".join(ch for ch in _ascii_norm(txt) if ch.isalnum())
 
@@ -1732,10 +1741,45 @@ def _display_rain_30d_text(row: pd.Series) -> str:
 def _rain_30d_source_label(row: pd.Series) -> str:
     source = str(row.get("source") or "").strip()
     backfill = str(row.get("history_backfill_source") or "").strip()
+    calc_method = str(row.get("rain_calc_method") or "").strip().lower()
+    source_norm = source.lower()
+    backfill_norm = backfill.lower()
     if _is_open_meteo_source(backfill):
         return backfill
     if _is_open_meteo_source(source):
         return source
+    if backfill and (
+        _is_infoclimat_source(backfill)
+        or "archive" in backfill_norm
+        or "meteo-france" in backfill_norm
+        or "meteo france" in backfill_norm
+    ):
+        return backfill
+    has_consolidated_history = any(
+        token in calc_method
+        for token in [
+            "daily_history",
+            "history_aggregate",
+            "history_backfill",
+            "archive_daily",
+            "archive",
+        ]
+    )
+    if has_consolidated_history and (
+        _is_infoclimat_source(source)
+        or "synop" in source_norm
+        or "meteo-france" in source_norm
+        or "meteo france" in source_norm
+    ):
+        return source or "Historique SYNOP consolide"
+    history_span_h = pd.to_numeric(row.get("history_span_h"), errors="coerce")
+    if pd.notna(history_span_h) and float(history_span_h) >= 25.0 * 24.0 and (
+        _is_infoclimat_source(source)
+        or "synop" in source_norm
+        or "meteo-france" in source_norm
+        or "meteo france" in source_norm
+    ):
+        return source or "Historique SYNOP consolide"
     return ""
 
 
@@ -1946,6 +1990,8 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
                     "rain_24h_mm": np.nan,
                     "rain_7d_mm": np.nan,
                     "rain_30d_mm": np.nan,
+                    "rain_30d_source_label": "",
+                    "rain_30d_is_reliable": False,
                     "rain_month_mm": np.nan,
                     "rain_12h_mm": np.nan,
                     "rain_instant_mm": np.nan,
@@ -1963,6 +2009,8 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
         provider_source = str(picked.get("history_backfill_source") or picked.get("source") or "")
         provider_station = str(picked.get("history_backfill_station") or picked.get("station_display") or picked.get("station_id") or "")
         provider_obs_date = str(picked.get("history_backfill_obs_date") or picked.get("date_obs_raw") or "")
+        rain_30d_source_label = _rain_30d_source_label(picked)
+        rain_30d_is_reliable = bool(rain_30d_source_label)
 
         out_rows.append(
             {
@@ -1980,6 +2028,8 @@ def _build_lgv_communes_pluvio_table(stations_df: pd.DataFrame) -> pd.DataFrame:
                 "rain_24h_mm": pd.to_numeric(picked.get("rain_24h_mm"), errors="coerce"),
                 "rain_7d_mm": pd.to_numeric(picked.get("rain_7d_mm"), errors="coerce"),
                 "rain_30d_mm": pd.to_numeric(picked.get("rain_30d_mm"), errors="coerce"),
+                "rain_30d_source_label": rain_30d_source_label,
+                "rain_30d_is_reliable": rain_30d_is_reliable,
                 "rain_month_mm": pd.to_numeric(picked.get("rain_month_mm"), errors="coerce"),
                 "rain_12h_mm": pd.to_numeric(picked.get("rain_12h_mm"), errors="coerce"),
                 "rain_instant_mm": pd.to_numeric(picked.get("rain_instant_mm"), errors="coerce"),
@@ -3010,6 +3060,10 @@ def _build_commune_map_input(commune_pluvio_df: pd.DataFrame) -> pd.DataFrame:
     out["history_backfill_source"] = out.get("provider_source", pd.Series("", index=out.index)).fillna("").astype(str)
     out["history_backfill_station"] = out.get("provider_station", pd.Series("", index=out.index)).fillna("").astype(str)
     out["history_backfill_obs_date"] = out.get("date_obs_raw", pd.Series("", index=out.index)).fillna("").astype(str)
+    if "rain_30d_source_label" not in out.columns:
+        out["rain_30d_source_label"] = ""
+    out["rain_30d_source_label"] = out.apply(_rain_30d_source_label, axis=1)
+    out["rain_30d_is_reliable"] = out["rain_30d_source_label"].astype(str).str.len() > 0
     out["reliability_score"] = out["source"].map(_source_reliability_note).astype(float)
     out["reliability_class"] = out["reliability_score"].map(_reliability_class)
     out["reliability_reason"] = np.where(
@@ -3026,19 +3080,22 @@ def _build_commune_map_input(commune_pluvio_df: pd.DataFrame) -> pd.DataFrame:
 st.set_page_config(page_title="LGV SEA Pluvio Stations Pro", page_icon=":umbrella:", layout="wide")
 st.title("LGV SEA - Pluviometrie Stations Pro")
 st.caption(
-    "Version pro: Meteo-France Portail API par defaut (officiel), Open-Meteo en secours, "
-    "et option InfoClimat proche LGV pour comparaison."
+    "Version pro: selection automatique de la source la plus exploitable "
+    "(Meteo-France Portail API si configure, sinon Open-Meteo), "
+    "avec option InfoClimat proche LGV pour comparaison."
 )
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
+source_mode_options = [SOURCE_MODE_METEOFRANCE, SOURCE_MODE_OPEN, SOURCE_MODE_MIX]
+default_source_mode = SOURCE_MODE_METEOFRANCE if _meteo_france_portal_is_configured() else SOURCE_MODE_OPEN
 with st.sidebar:
     st.subheader("Sources")
     source_mode = st.selectbox(
         "Jeu de donnees",
-        options=[SOURCE_MODE_METEOFRANCE, SOURCE_MODE_OPEN, SOURCE_MODE_MIX],
-        index=0,
+        options=source_mode_options,
+        index=source_mode_options.index(default_source_mode),
         help=(
-            "Meteo-France Portail API par defaut. "
-            "Open-Meteo disponible en mode strict ou en mode mixte avec InfoClimat."
+            "Demarrage automatique sur la source la plus exploitable pour cet environnement. "
+            "Meteo-France reste prioritaire quand ses secrets sont disponibles."
         ),
     )
     infoclimat_near_max_km = float(INFOCLIMAT_STRICT_RADIUS_KM)
@@ -3350,33 +3407,6 @@ if weather_df.empty:
 weather_df = _apply_reliable_rain_30d_policy(weather_df)
 loaded_sources_all = sorted(weather_df.get("source", pd.Series(dtype=str)).dropna().astype(str).unique().tolist())
 loaded_sources_label = ", ".join(loaded_sources_all) if loaded_sources_all else "Aucune"
-primary_source_status_notice = ""
-if source_mode == SOURCE_MODE_METEOFRANCE and METEO_FRANCE_SOURCE_LABEL not in loaded_sources_all:
-    mf_issue = str(mf_notice or "").strip()
-    if not mf_issue:
-        mf_issue_candidates = [
-            str(n).strip()
-            for n in data_build_notices
-            if "meteo-france" in str(n).lower()
-            and any(tok in str(n).lower() for tok in ["configure", "token", "http", "vide", "erreur", "indisponible", "aucune"])
-        ]
-        mf_issue = mf_issue_candidates[0] if mf_issue_candidates else "source primaire indisponible ou non repondante."
-    primary_source_status_notice = (
-        f"Mode demande: {source_mode}. Source effectivement servie: {loaded_sources_label}. "
-        + f"Cause probable cote Meteo-France: {mf_issue}"
-    )
-elif source_mode == SOURCE_MODE_OPEN and not any(_is_open_meteo_source(src) for src in loaded_sources_all):
-    om_issue_candidates = [
-        str(n).strip()
-        for n in data_build_notices
-        if "open-meteo" in str(n).lower()
-        and any(tok in str(n).lower() for tok in ["http", "vide", "erreur", "indisponible", "aucune"])
-    ]
-    om_issue = om_issue_candidates[0] if om_issue_candidates else "source Open-Meteo indisponible ou non repondante."
-    primary_source_status_notice = (
-        f"Mode demande: {source_mode}. Source effectivement servie: {loaded_sources_label}. "
-        + f"Cause probable cote Open-Meteo: {om_issue}"
-    )
 
 with st.sidebar:
     st.subheader("Filtres stations")
@@ -3567,18 +3597,10 @@ else:
     st.caption(f"Snapshot: {snapshot_source} | timestamp inconnu")
 if data_build_notices:
     st.caption(" | ".join([n for n in data_build_notices if n][:3]))
-if primary_source_status_notice:
-    st.warning(primary_source_status_notice)
-fallback_runtime_notices = [
-    str(n) for n in data_build_notices
-    if any(tag in str(n).lower() for tag in ["fallback", "secours", "indisponible", "ignoree"])
-]
-if fallback_runtime_notices:
-    st.warning("Mode degrade actif: " + " | ".join(fallback_runtime_notices[:2]))
 if bool(ENABLE_RAIN_30D):
     st.caption(
         "Le cumul 30 jours est affiche uniquement s'il provient d'une source longue fiabilisee "
-        "(Open-Meteo archive communal aligne sur l'app monitoring, ou backfill equivalent)."
+        "(Open-Meteo archive communal, backfill communal equivalent, ou historique SYNOP consolide)."
     )
 else:
     st.warning("Le cumul 30 jours est temporairement retire des usages exploitation car il n'est pas assez fiable.")
