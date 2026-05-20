@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carte LGV SEA – LISEA</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:'Segoe UI',Arial,sans-serif;background:#1a1a2e}
+  #map{position:absolute;top:0;bottom:0;width:100%;z-index:1}
+  #loader{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+    background:white;padding:24px 36px;border-radius:12px;
+    box-shadow:0 4px 24px rgba(0,0,0,.35);z-index:9999;text-align:center;
+    font-size:14px;color:#1a1a2e;font-weight:500}
+  #loader::after{content:'';display:block;margin:14px auto 0;width:34px;height:34px;
+    border:4px solid #eee;border-top:4px solid #cc0000;border-radius:50%;
+    animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  /* Popup */
+  .popup-card{max-width:290px;font-size:12.5px}
+  .popup-card h3{font-size:13.5px;color:#1a1a2e;margin-bottom:8px;
+    border-bottom:2px solid #cc0000;padding-bottom:5px;line-height:1.3}
+  .popup-card table{width:100%;border-collapse:collapse}
+  .popup-card td{padding:3px 5px;vertical-align:top;border-bottom:1px solid #f0f0f0}
+  .popup-card td:first-child{font-weight:600;color:#666;white-space:nowrap;
+    width:85px;font-size:11.5px}
+  .popup-card img{width:100%;border-radius:6px;margin-top:10px;cursor:zoom-in;
+    transition:transform .2s;box-shadow:0 2px 8px rgba(0,0,0,.2)}
+  .popup-card img:hover{transform:scale(1.03)}
+  .btn-sp{display:block;margin-top:10px;text-align:center;background:#0078d4;
+    color:white !important;padding:6px 10px;border-radius:6px;text-decoration:none;
+    font-size:11.5px;font-weight:600;letter-spacing:.3px}
+  .btn-sp:hover{background:#005ea2}
+  /* Légende */
+  .lgv-legend{background:white;padding:11px 15px;border-radius:8px;
+    box-shadow:0 2px 10px rgba(0,0,0,.2);font-size:11.5px;min-width:170px}
+  .lgv-legend h4{font-size:12px;font-weight:700;margin-bottom:9px;
+    color:#1a1a2e;border-bottom:1px solid #eee;padding-bottom:5px}
+  .li{display:flex;align-items:center;gap:8px;margin:4px 0;line-height:1.3}
+  .lc{width:14px;height:14px;border-radius:3px;flex-shrink:0;
+    border:1px solid rgba(0,0,0,.15)}
+  .ll{width:22px;height:3px;flex-shrink:0;border-radius:2px}
+  /* Compteur */
+  .leaflet-control-layers-list label{font-size:12px}
+</style>
+</head>
+<body>
+<div id="loader">Chargement des données LGV SEA…</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+<script>
+// ─── CARTE DE BASE ───
+var map = L.map('map',{zoomControl:false}).setView([46.3,-0.2],8);
+L.control.zoom({position:'topright'}).addTo(map);
+L.control.scale({imperial:false,position:'bottomright'}).addTo(map);
+
+var osm=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {attribution:'© OpenStreetMap',maxZoom:19});
+var sat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+  {attribution:'© Esri World Imagery',maxZoom:19});
+var ign=L.tileLayer(
+  'https://wxs.ign.fr/decouverte/geoportail/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0'+
+  '&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/png&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2'+
+  '&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}',
+  {attribution:'© IGN Géoportail',maxZoom:18});
+osm.addTo(map);
+var baseMaps={'🗺 OpenStreetMap':osm,'🛰 Satellite (Esri)':sat,'📍 IGN Plan':ign};
+
+// ─── HELPERS ───
+function c(v){return(v===null||v===undefined||String(v).match(/^(nan|NaN|None|null|undefined)$/i))?'':String(v)}
+function row(k,v){v=c(v);return v?'<tr><th>'+k+'</th><td>'+v+'</td></tr>':''}
+function mkIcon(emoji,sz){sz=sz||22;
+  return L.divIcon({className:'',
+    html:'<div style="font-size:'+sz+'px;line-height:1;filter:drop-shadow(1px 1px 2px rgba(0,0,0,.5))">'+emoji+'</div>',
+    iconSize:[sz,sz],iconAnchor:[sz/2,sz/2],popupAnchor:[0,-(sz/2+2)]})}
+function clusterIco(color){
+  return function(cl){return L.divIcon({
+    html:'<div style="background:'+color+';color:#fff;border-radius:50%;width:34px;height:34px;'+
+      'line-height:34px;text-align:center;font-weight:700;font-size:13px;'+
+      'box-shadow:0 2px 8px rgba(0,0,0,.4);border:2px solid rgba(255,255,255,.6)">'+cl.getChildCount()+'</div>',
+    iconSize:[34,34],iconAnchor:[17,17]})}
+}
+function photoHtml(p){
+  if(!p._ph_b64||p._ph_b64==='null')return'';
+  return'<img src="data:image/jpeg;base64,'+p._ph_b64+'" title="Cliquer pour agrandir">'
+}
+function spHtml(p){
+  if(!p._sp_url||p._sp_url==='null'||p._sp_url==='None')return'';
+  return'<a class="btn-sp" href="'+p._sp_url+'" target="_blank">📂 Ouvrir dans SharePoint</a>'
+}
+// Récupération du PK (plusieurs noms possibles selon les fichiers)
+function getPk(p){
+  return p.PK || p.pk || p._pk_fmt || p.pk_ef || '';
+}
+function popupOA(p){
+  return'<div class="popup-card"><h3>'+c(p.CODE_OBJET)+' – '+c(p.LIBELLE_LO||p.LIBELLE)+'</h3><table>'+
+    row('PK',getPk(p))+row('Voie',p.VOIE)+row('Commune',p.COMMUNE)+
+    row('Famille',p.LIBELLE_FA)+row('Dept',p.DEPARTEMEN)+
+    '</table>'+photoHtml(p)+spHtml(p)+'</div>'
+}
+function popupOH(p){
+  return'<div class="popup-card"><h3>'+c(p.code_objet)+' – '+c(p.libelle_ob)+'</h3><table>'+
+    row('PK',getPk(p))+row('Voie',p.voie)+
+    row('Longueur',p.longueur?p.longueur+' m':'')+
+    row('Type',p.type_objet)+row('Structure',p.structure)+
+    row("Cours d'eau",p.ecoul_nom)+
+    '</table>'+photoHtml(p)+spHtml(p)+'</div>'
+}
+function popupPAM(p){
+  return'<div class="popup-card"><h3>'+c(p.libelle)+'</h3></table>'+
+    row('Axe',p.axe)+row('PK EF',p.pk_ef)+row('PK GC',p.pk_gc)+
+    row('Décalage',p.decalage)+row('Commentaire',p.commentair)+
+    '</table>'+photoHtml(p)+spHtml(p)+'</div>'
+}
+
+// ─── CHARGEMENT PROGRESSIF ───────────────────────────────────────────────────
+function loadJSON(name){
+  return fetch('data/'+name+'.geojson')
+    .then(function(r){if(!r.ok)throw new Error(name+' : HTTP '+r.status);return r.json();});
+}
+
+function showError(msg){
+  var el=document.getElementById('loader');
+  if(!el)return;
+  el.style.cssText='position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);'+
+    'background:white;padding:24px 30px;border-radius:12px;z-index:9999;max-width:460px;text-align:center;line-height:1.6';
+  el.innerHTML='<b style="color:#cc0000;font-size:15px">⚠ Erreur de chargement</b><br><br>'+
+    'Pour afficher la carte en local, lancez le serveur :<br><br>'+
+    '<code style="background:#f5f5f5;padding:7px 14px;border-radius:4px;font-size:13px;display:block">python serve.py</code><br>'+
+    'puis ouvrez <b>http://localhost:8050</b><br><br>'+
+    '<small style="color:#888">'+msg+'</small>';
+}
+
+if(location.protocol==='file:'){
+  showError('Protocole file:// – les fichiers de données ne peuvent pas être chargés directement.');
+} else {
+
+// Phase 1 : couches légères
+Promise.all(['rail','pk','acces','old','mc','n2'].map(loadJSON))
+.then(function(d){
+  var rail=d[0],pk=d[1],acces=d[2],old=d[3],mc=d[4],n2=d[5];
+  document.getElementById('loader').remove();
+
+  // Tracé
+  var railLayer=L.geoJSON(rail,{
+    style:{color:'#cc0000',weight:4.5,opacity:.95},
+    onEachFeature:function(f,l){l.bindTooltip(c(f.properties.Name)||'LGV SEA',{sticky:true})}
+  }).addTo(map);
+  try{map.fitBounds(railLayer.getBounds().pad(.05));}catch(e){}
+
+  // PK
+  var pkLayer=L.geoJSON(pk,{
+    pointToLayer:function(f,ll){
+      return L.circleMarker(ll,{radius:4,color:'#333',fillColor:'#fff',fillOpacity:1,weight:1.5})},
+    onEachFeature:function(f,l){l.bindTooltip(c(f.properties.Name),{direction:'top'})}
+  });
+
+  // Accès
+  var accLayer=L.geoJSON(acces,{
+    pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon('🚧',20)})},
+    onEachFeature:function(f,l){
+      var p=f.properties;
+      l.bindPopup('<div class="popup-card"><h3>'+c(p.Name||p.name||'Accès')+'</h3>'+
+        (c(p.description)||'')+'<br>'+spHtml(p)+'</div>',{maxWidth:300})
+    }
+  }).addTo(map);
+
+  // OLD
+  var oldLayer=L.geoJSON(old,{
+    style:{color:'#0055ff',weight:1,fillColor:'#0080ff',fillOpacity:.25},
+    onEachFeature:function(f,l){
+      var p=f.properties;
+      l.bindPopup('<div class="popup-card"><h3>Zone OLD</h3><table>'+
+        row('Code',p.CODE)+row('Libellé',p.libelle)+'</table></div>')
+    }
+  }).addTo(map);
+
+  // MC
+  var mcLayer=L.geoJSON(mc,{
+    style:{color:'#9c27b0',weight:1.5,fillColor:'#9c27b0',fillOpacity:.2},
+    pointToLayer:function(f,ll){return L.circleMarker(ll,{radius:5,color:'#9c27b0',fillOpacity:.7})},
+    onEachFeature:function(f,l){
+      var p=f.properties;
+      l.bindPopup('<div class="popup-card"><h3>Mesure compensatoire</h3><tr>'+
+        row('Projet',p.projet)+row('Thème',p.theme)+row('Type',p.type)+
+        row('Classe',p.classe)+row('M.O.',p.maitre_ouvrage)+
+        row('Communes',p.liste_communes)+'</table></div>',{maxWidth:300})
+    }
+  });
+
+  // N2
+  var n2Layer=L.geoJSON(n2,{
+    style:{color:'#2e7d32',weight:1.5,fillColor:'#4caf50',fillOpacity:.18},
+    onEachFeature:function(f,l){
+      var p=f.properties;
+      l.bindPopup('<div class="popup-card"><h3>Natura 2000</h3></table>'+
+        row('Code',p.cd_sig)+row('Type',p.type_espac)+
+        row('Nom',p.nom_site||p.lb_site)+'</table></div>')
+    }
+  });
+
+  // Clusters pour les données lourdes
+  var oaCluster=L.markerClusterGroup({iconCreateFunction:clusterIco('#00bcd4'),maxClusterRadius:50,spiderfyOnMaxZoom:true,showCoverageOnHover:false});
+  var ohCluster=L.markerClusterGroup({iconCreateFunction:clusterIco('#ff8800'),maxClusterRadius:50,spiderfyOnMaxZoom:true,showCoverageOnHover:false});
+  var pamCluster=L.markerClusterGroup({iconCreateFunction:clusterIco('#9c27b0'),maxClusterRadius:50,spiderfyOnMaxZoom:true,showCoverageOnHover:false});
+
+  // Ajout des clusters (vides pour l'instant)
+  oaCluster.addTo(map);
+  ohCluster.addTo(map);
+  pamCluster.addTo(map);
+
+  // Contrôle des couches
+  var overlays={};
+  overlays['<span style="color:#cc0000;font-weight:700">━</span> Tracé LGV']=railLayer;
+  overlays['<span style="font-size:10px;color:#555">⬤</span> PK kilométriques']=pkLayer;
+  overlays['🚧 Accès PTLO / PTLA']=accLayer;
+  overlays['🏗 Ouvrages d\'Art (<span id="cnt-oa">chargement…</span>)']=oaCluster;
+  overlays['💧 Ouvrages Hydrauliques (<span id="cnt-oh">chargement…</span>)']=ohCluster;
+  overlays['🌱 PAM (<span id="cnt-pam">chargement…</span>)']=pamCluster;
+  overlays['<span style="color:#0055ff">▬</span> Zones OLD']=oldLayer;
+  overlays['<span style="color:#9c27b0">▬</span> Mesures compensatoires']=mcLayer;
+  overlays['<span style="color:#2e7d32">▬</span> Natura 2000']=n2Layer;
+  L.control.layers(baseMaps,overlays,{position:'topright',collapsed:false}).addTo(map);
+
+  // Légende (apostrophe correctement échappée)
+  var legend=L.control({position:'bottomleft'});
+  legend.onAdd=function(){
+    var d=L.DomUtil.create('div','lgv-legend');
+    d.innerHTML='<h4>Légende LGV SEA</h4>'+
+      '<div class="li"><div class="ll" style="background:#cc0000"></div>Tracé LGV</div>'+
+      '<div class="li"><span style="font-size:15px">🏗</span> Ouvrages d\'Art</div>'+
+      '<div class="li"><span style="font-size:15px">💧</span> Ouvrages Hydrauliques</div>'+
+      '<div class="li"><span style="font-size:15px">🌱</span> PAM</div>'+
+      '<div class="li"><span style="font-size:15px">🚧</span> Accès PTLO/PTLA</div>'+
+      '<div class="li"><div class="lc" style="background:#0080ff;opacity:.6"></div>Zones OLD</div>'+
+      '<div class="li"><div class="lc" style="background:#9c27b0;opacity:.5"></div>Mesures comp.</div>'+
+      '<div class="li"><div class="lc" style="background:#4caf50;opacity:.5"></div>Natura 2000</div>';
+    return d;
+  };
+  legend.addTo(map);
+
+  // ── Phase 2 : couches lourdes (OA, OH, PAM) en parallèle ──────────────────
+  loadJSON('oa').then(function(oa){
+    L.geoJSON(oa,{
+      pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon('🏗',22)})},
+      onEachFeature:function(f,l){l.bindPopup(popupOA(f.properties),{maxWidth:310})}
+    }).addTo(oaCluster);
+    var el=document.getElementById('cnt-oa');
+    if(el)el.textContent=(oa.features||[]).length;
+  }).catch(function(e){console.warn('OA :',e);});
+
+  loadJSON('oh').then(function(oh){
+    L.geoJSON(oh,{
+      pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon('💧',20)})},
+      onEachFeature:function(f,l){l.bindPopup(popupOH(f.properties),{maxWidth:310})}
+    }).addTo(ohCluster);
+    var el=document.getElementById('cnt-oh');
+    if(el)el.textContent=(oh.features||[]).length;
+  }).catch(function(e){console.warn('OH :',e);});
+
+  loadJSON('pam').then(function(pam){
+    L.geoJSON(pam,{
+      pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon('🌱',20)})},
+      onEachFeature:function(f,l){l.bindPopup(popupPAM(f.properties),{maxWidth:310})}
+    }).addTo(pamCluster);
+    var el=document.getElementById('cnt-pam');
+    if(el)el.textContent=(pam.features||[]).length;
+  }).catch(function(e){console.warn('PAM :',e);});
+
+}).catch(function(err){
+  showError(err.message);
+  console.error(err);
+});
+
+} // end else (not file://)
+</script>
+</body>
+</html>
