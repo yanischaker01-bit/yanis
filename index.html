@@ -60,14 +60,14 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 .tip-n2{background:rgba(27,94,32,.82);color:white;border:none;
   font-size:9.5px;font-weight:600;padding:1px 5px;border-radius:3px;white-space:nowrap;
   pointer-events:none;text-align:center}
-/* tip-pk/oa/n2 masqués par défaut, révélés par classe zoom sur #map */
-/* tip-oh est sticky (hover) – non masqué */
-.leaflet-tooltip.tip-pk,.leaflet-tooltip.tip-oa,.leaflet-tooltip.tip-n2{display:none}
+/* tip-pk/oa/n2/oh masqués par défaut, révélés par classe zoom sur #map */
+.leaflet-tooltip.tip-pk,.leaflet-tooltip.tip-oa,.leaflet-tooltip.tip-n2,.leaflet-tooltip.tip-oh{display:none}
 .lbl-pk50 .leaflet-tooltip.tip-pk50{display:block}
 .lbl-pk10 .leaflet-tooltip.tip-pk10{display:block}
 .lbl-pk1 .leaflet-tooltip.tip-pk1{display:block}
 .lbl-pkh .leaflet-tooltip.tip-pkh{display:block}
 .lbl-oa .leaflet-tooltip.tip-oa{display:block}
+.lbl-oh .leaflet-tooltip.tip-oh{display:block}
 .lbl-n2 .leaflet-tooltip.tip-n2{display:block}
 /* Panneau liste des couches */
 #layers-panel{position:absolute;top:60px;left:0;z-index:800;
@@ -436,7 +436,8 @@ var boisLayer=L.geoJSON(null,{
   onEachFeature:function(f,l){
     var p=f.properties;
     l.bindTooltip("🌳 "+c(p.TYPE_OBJET),{sticky:true});
-    l.bindPopup(function(){return popupBois(l.feature.properties);},{maxWidth:300});
+    l.on("click",function(e){L.DomEvent.stopPropagation(e);
+      openDetail("🌳 "+c(p.TYPE_OBJET||"Boisement"),buildDetailTable(p));});
   }
 }).addTo(map);
 
@@ -465,7 +466,7 @@ function _restoreLayerStates(){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260523";
+var _cbv="?v=20260520b";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -501,7 +502,11 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   var railLayer=L.geoJSON(rail,{
     pane:"pane-rail",
     style:{color:"#cc0000",weight:4.5,opacity:.95},
-    onEachFeature:function(f,l){l.bindTooltip(c(f.properties.Name)||"LGV SEA",{sticky:true})}
+    onEachFeature:function(f,l){
+      l.bindTooltip(c(f.properties.Name)||"LGV SEA",{sticky:true});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);
+        openDetail("🚄 "+c(f.properties.Name||"LGV SEA"),buildDetailTable(f.properties));});
+    }
   }).addTo(map);
   try{map.fitBounds(railLayer.getBounds().pad(.05));}catch(e){}
   if(map.getZoom()<7)map.setZoom(7);
@@ -550,10 +555,11 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   });
   // Legacy reference pour layer control toggle
   var pkLayer=pk1Layer;
-  // PK 100m : hectométriques – init paresseuse (crée ~3000 DOM uniquement si zoom≥12)
+  // PK 100m : hectométriques – init paresseuse (crée ~3000 DOM uniquement si zoom≥16)
   _pkHData=pkH;
-  var pkHectoLayer=L.layerGroup(); // rempli dans updateVisibility au premier zoom≥12
+  var pkHectoLayer=L.layerGroup(); // rempli dans updateVisibility au premier zoom≥16
   addPKtoIndex(pk);
+  addPKHectoToIndex(pkH);
 
   // ── Accès ──────────────────────────────────────────────────────────────
   var accLayer=L.geoJSON(acces,{
@@ -562,7 +568,8 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     onEachFeature:function(f,l){
       var p=f.properties;
       l.bindTooltip(c(p.NOM_ACCES||p.Name||p.name||"Accès"),{sticky:true});
-      l.bindPopup(function(){return popupACC(l.feature.properties);},{maxWidth:300});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);
+        openDetail("🚧 "+c(p.NOM_ACCES||p.Name||p.name||"Accès"),buildDetailTable(p));});
     }
   }); // accLayer ajouté via updateVisibility (zoom>=12)
   layerData.acces=(acces.features||[]).map(function(f){return{props:f.properties,layer:null,bbox:null,geom:f.geometry};});
@@ -574,8 +581,8 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     onEachFeature:function(f,l){
       var p=f.properties;
       l.bindTooltip("Zone OLD "+(c(p.CODE)||""),{sticky:true});
-      l.bindPopup("<div class=\"popup-card\"><h3>Zone OLD</h3><table>"+
-        row("Code",p.CODE)+row("Libellé",p.libelle)+"</table></div>")
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);
+        openDetail("🔷 Zone OLD "+c(p.CODE||""),buildDetailTable(p));});
     }
   }).addTo(map);
   layerData.old=(old.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -587,10 +594,9 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     pointToLayer:function(f,ll){return L.circleMarker(ll,{radius:6,color:"#7b1fa2",weight:2,fillColor:"#ce93d8",fillOpacity:.75,pane:"pane-mc"})},
     onEachFeature:function(f,l){
       var p=f.properties;
-      l.bindPopup("<div class=\"popup-card\"><h3>Mesure compensatoire</h3><table>"+
-        row("Projet",p.projet)+row("Thème",p.theme)+row("Type",p.type)+
-        row("Classe",p.classe)+row("M.O.",p.maitre_ouvrage)+
-        row("Communes",p.liste_communes)+"</table></div>",{maxWidth:300})
+      l.bindTooltip(c(p.projet||p.type||"MC"),{sticky:true});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);
+        openDetail("🌿 Mesure compensatoire",buildDetailTable(p));});
     }
   });
   layerData.mc=(mc.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -615,8 +621,8 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var t=c(p.type_complet);
       var nom=c(p.sitename||p.cd_sig||"");
       l.bindTooltip(nom,{permanent:true,sticky:false,className:"tip-n2",direction:"center"});
-      l.bindPopup("<div class=\"popup-card\"><h3>Natura 2000 "+n2Badge(t)+"</h3><table>"+
-        row("Code",p.cd_sig)+row("Nom",nom)+row("Type",t)+"</table></div>",{maxWidth:300})
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);
+        openDetail("Natura 2000 "+n2Badge(t)+" "+nom,buildDetailTable(p));});
     }
   }).addTo(map);
   layerData.n2=(n2.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -632,7 +638,8 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     onEachFeature:function(f,l){
       var p=f.properties;
       l.bindTooltip("🐑 "+c(p.Appellation||p.Name),{sticky:true});
-      l.bindPopup(popupEco(p),{maxWidth:300});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);
+        openDetail("🐑 "+c(p.Appellation||p.Name||"Écopâturage"),buildDetailTable(p));});
     }
   }).addTo(map);
   layerData.eco=(eco.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -645,7 +652,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   oaCluster.addTo(map);
   pamCluster.addTo(map);
 
-  // OH couche (lignes) – étiquettes sticky (hover) pour éviter 3500+ DOM permanents
+  // OH couche (lignes) – étiquettes permanentes masquées par CSS, révélées au zoom≥15
   var ohLayer=L.geoJSON(null,{
     pane:"pane-oh",
     style:{color:"#ef6c00",weight:4.5,opacity:.95},
@@ -653,7 +660,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var p=f.properties;
       var cod=c(p.code_objet),libob=c(p.libelle_ob);
       var lbl=(cod&&libob)?cod+" – "+libob:(cod||libob);
-      l.bindTooltip(lbl,{sticky:true,className:"tip-oh"});
+      l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oh"});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOH(l.feature.properties);});
     }
   }).addTo(map);
@@ -662,7 +669,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   var overlays={};
   overlays["<span style=\"color:#cc0000;font-weight:700\">━</span> Tracé LGV"]=railLayer;
   overlays["<span style=\"font-size:10px;color:#333\">⬤</span> PK (zoom-adaptatif)"]=pkLayer;
-  overlays["<span style=\"font-size:9px;color:#555\">⬤</span> PK hectométriques (zoom≥14)"]=pkHectoLayer;
+  overlays["<span style=\"font-size:9px;color:#555\">⬤</span> PK hectométriques (zoom≥16)"]=pkHectoLayer;
   overlays["🚧 Accès PTLO / PTLA (zoom≥12)"]=accLayer;
   overlays["🏗 OA – Ouvrages d'Art (<span id=\"cnt-oa\">…</span>)"]=oaCluster;
   overlays["<span style=\"color:#ff8c00\">━</span> OH – Ouvrages Hydrauliques (<span id=\"cnt-oh\">…</span>)"]=ohLayer;
@@ -716,15 +723,15 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   function updateVisibility(){
     var z=map.getZoom();
     // ── PK zoom-adaptatif ──────────────────────────────────────────────
-    // z ≥ 7  → PK 50km   z ≥ 10 → + PK 10km   z ≥ 12 → + PK 1km   z ≥ 14 → PK 100m
+    // z7-9: PK 50km | z10-12: PK 10km | z13-15: PK 1km | z≥16: PK 100m (tous)
     if(!_pkOff){
       if(z>=7)layerOn(pk50Layer); else layerOff(pk50Layer);
       if(z>=10)layerOn(pk10Layer); else layerOff(pk10Layer);
-      if(z>=12)layerOn(pk1Layer);  else layerOff(pk1Layer);
+      if(z>=13)layerOn(pk1Layer);  else layerOff(pk1Layer);
     } else {
       [pk50Layer,pk10Layer,pk1Layer].forEach(layerOff);
     }
-    if(!_pkHectoOff&&z>=14){
+    if(!_pkHectoOff&&z>=16){
       if(!_pkHInited&&_pkHData){
         _pkHInited=true;
         L.geoJSON(_pkHData,{
@@ -740,14 +747,16 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     // ── Accès (zoom ≥ 12) ──────────────────────────────────────────────
     if(!_accOff&&z>=12)layerOn(accLayer); else layerOff(accLayer);
     // ── Labels CSS permanents ──────────────────────────────────────────
-    // Labels exclusifs : un seul niveau par zoom pour éviter la surcharge
+    // Exclusifs PK : un seul niveau visible par plage de zoom
     mapEl.classList.toggle("lbl-pk50", !_pkOff&&z>=7&&z<10);
-    mapEl.classList.toggle("lbl-pk10", !_pkOff&&z>=10&&z<12);
-    mapEl.classList.toggle("lbl-pk1",  !_pkOff&&z>=12&&z<14);
-    mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=14);
+    mapEl.classList.toggle("lbl-pk10", !_pkOff&&z>=10&&z<13);
+    mapEl.classList.toggle("lbl-pk1",  !_pkOff&&z>=13&&z<16);
+    mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=16);
     mapEl.classList.toggle("lbl-n2", z>=8);
     mapEl.classList.toggle("lbl-oa", z>=10);
+    mapEl.classList.toggle("lbl-oh", z>=15);
   }
+  map.on("click",function(){closeDetail();});
   map.on("zoomend",updateVisibility);
   updateVisibility();
 
@@ -759,7 +768,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     var defs=[
       {label:"Tracé LGV",             lsKey:"rail",    layer:railLayer,    color:"#cc0000", type:"line"},
       {label:"PK (zoom-adaptatif)",    lsKey:"pk",      layer:pkLayer,      color:"#333",    type:"dot"},
-      {label:"PK 100m (zoom≥14)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
+      {label:"PK 100m (zoom≥16)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
       {label:"Accès (zoom≥12)"+n1("acces"), lsKey:"acces", layer:accLayer,  emoji:"🚧"},
       {label:"OA – Ouvrages d'Art",    lsKey:"oa",      layer:oaCluster,   emoji:"🏗",     lpId:"lp-oa"},
       {label:"OH – Hydrauliques",      lsKey:"oh",      layer:ohLayer,     color:"#ff8c00", type:"line", lpId:"lp-oh"},
@@ -1051,13 +1060,22 @@ function buildSearchIndex(){
       sub:[c(p.CODE_AXE),c(p.PK_DEB_STR||p.PK_DEB),c(p.PK_FIN_STR||p.PK_FIN)].filter(Boolean).join(" • "),geom:f.geom});
   });
 }
-// Ajouter PK dans l'index une fois chargés
+// Ajouter PK 1km dans l'index une fois chargés
 var _pkLoaded=false;
 function addPKtoIndex(fc){
   if(_pkLoaded)return;_pkLoaded=true;
   (fc.features||[]).forEach(function(f){
     searchIndex.push({type:"PK",label:c(f.properties._pk_label||f.properties.Name),
-      sub:c(f.properties._voie),geom:f.geometry});
+      sub:c(f.properties._voie||""),geom:f.geometry});
+  });
+}
+// Ajouter PK 100m dans l'index (pour recherche "235+1" → PK 235+100)
+var _pkHLoaded=false;
+function addPKHectoToIndex(fc){
+  if(_pkHLoaded||!fc)return;_pkHLoaded=true;
+  (fc.features||[]).forEach(function(f){
+    searchIndex.push({type:"PK",label:c(f.properties._pk_label||f.properties.Name),
+      sub:c(f.properties._voie||""),geom:f.geometry});
   });
 }
 
