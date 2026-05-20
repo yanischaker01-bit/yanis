@@ -45,9 +45,9 @@ jobs:
           mkdir -p site
           git archive origin/gh-pages | tar -x -C site/
 
-      - name: Add dashboard at /dashboard/
+      - name: Add dashboard and snapshot
         run: |
-          mkdir -p site/dashboard/reports
+          mkdir -p site/dashboard/reports site/reports
           if [ ! -f reports/lgv_dashboard_latest.html ]; then
             echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
           fi
@@ -57,6 +57,7 @@ jobs:
           cp reports/lgv_dashboard_latest.html site/dashboard/index.html
           cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
           cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
+          cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
 
       - name: Wake Streamlit pluvio app
         env:
