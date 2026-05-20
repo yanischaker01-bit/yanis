@@ -9,7 +9,7 @@ on:
     - cron: "15 * * * *"
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
@@ -39,18 +39,24 @@ jobs:
         run: |
           python run_once_dashboard.py || (sleep 20 && python run_once_dashboard.py) || true
 
-      - name: Prepare public artifact
+      - name: Fetch carte LGV SEA from gh-pages
         run: |
-          mkdir -p site/reports
+          git fetch origin gh-pages
+          mkdir -p site
+          git archive origin/gh-pages | tar -x -C site/
+
+      - name: Add dashboard at /dashboard/
+        run: |
+          mkdir -p site/dashboard/reports
           if [ ! -f reports/lgv_dashboard_latest.html ]; then
             echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
           fi
           if [ ! -f reports/streamlit_snapshot_latest.json ]; then
             echo "{}" > reports/streamlit_snapshot_latest.json
           fi
-          cp reports/lgv_dashboard_latest.html site/index.html
-          cp reports/lgv_dashboard_latest.html site/reports/lgv_dashboard_latest.html
-          cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
+          cp reports/lgv_dashboard_latest.html site/dashboard/index.html
+          cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
+          cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
 
       - name: Wake Streamlit pluvio app
         env:
