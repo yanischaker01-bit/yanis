@@ -252,7 +252,7 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 // ═══════════════════════════════════════════════════════════════
 
 // ─── PANES (z-order) ───
-var map=L.map("map",{zoomControl:false}).setView([46.3,-0.2],8);
+var map=L.map("map",{zoomControl:false,preferCanvas:true}).setView([46.3,-0.2],8);
 ["pane-bois","pane-old","pane-eco","pane-mc","pane-n2","pane-oh",
  "pane-rail","pane-oa","pane-acces","pane-pk","pane-kml","pane-focus"].forEach(function(p,i){
   map.createPane(p).style.zIndex=400+i*5;
@@ -373,10 +373,56 @@ function popupBois(p){
 // ─── DONNÉES CHARGÉES (pour table + recherche) ───
 var layerData={oa:[],oh:[],acces:[],pam:[],mc:[],old:[],eco:[],bois:[],n2:[]};
 var layerObjs={};   // {name: L.Layer}
-var _loading={oa:true,oh:true,pam:true};  // Phase 2 en cours
+var _loading={oa:true,oh:true,pam:true,bois:true};  // Phase 2 en cours
+
+// ─── PERF : bois en Phase 2, pkHecto lazy ───
+var _pkHData=null,_pkHInited=false;
+function boisColor(type){
+  var t=(type||"").toUpperCase();
+  if(t.includes("RIPISYLVE"))return"#1b5e20";
+  if(t.includes("BOIS"))return"#388e3c";
+  if(t.includes("HAIE"))return"#558b2f";
+  return"#33691e";
+}
+var boisLayer=L.geoJSON(null,{
+  pane:"pane-bois",
+  style:function(f){
+    var t=(f.properties||{}).TYPE_OBJET;
+    return{color:"#FFEB3B",weight:2,fillColor:boisColor(t),fillOpacity:.5,dashArray:"6 3"};
+  },
+  onEachFeature:function(f,l){
+    var p=f.properties;
+    l.bindTooltip("🌳 "+c(p.TYPE_OBJET),{sticky:true});
+    l.bindPopup(function(){return popupBois(l.feature.properties);},{maxWidth:300});
+  }
+}).addTo(map);
+
+// ─── PERSISTANCE ÉTAT COUCHES ───
+var _lpDefs=null;
+function _saveLayerStates(){
+  if(!_lpDefs)return;
+  try{
+    var s={};
+    _lpDefs.forEach(function(d){s[d.lsKey||d.label]=map.hasLayer(d.layer);});
+    localStorage.setItem("lgv_layers_v2",JSON.stringify(s));
+  }catch(e){}
+}
+function _restoreLayerStates(){
+  if(!_lpDefs)return;
+  try{
+    var s=JSON.parse(localStorage.getItem("lgv_layers_v2")||"{}");
+    _lpDefs.forEach(function(d){
+      var key=d.lsKey||d.label;
+      if(!(key in s))return;
+      var on=s[key];
+      if(on&&!map.hasLayer(d.layer))d.layer.addTo(map);
+      else if(!on&&map.hasLayer(d.layer))map.removeLayer(d.layer);
+    });
+  }catch(e){}
+}
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260520";
+var _cbv="?v=20260521";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -403,9 +449,9 @@ if(location.protocol==="file:"){
   showError("Protocole file:// – les fichiers de données ne peuvent pas être chargés directement.");
 } else {
 
-Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(loadJSONSafe))
+Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONSafe))
 .then(function(d){
-  var rail=d[0],pk=d[1],pkH=d[2],acces=d[3],old=d[4],mc=d[5],n2=d[6],eco=d[7],bois=d[8];
+  var rail=d[0],pk=d[1],pkH=d[2],acces=d[3],old=d[4],mc=d[5],n2=d[6],eco=d[7];
   document.getElementById("loader").remove();
 
   // ── Tracé ──────────────────────────────────────────────────────────────
@@ -457,14 +503,9 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
   });
   // Legacy reference pour layer control toggle
   var pkLayer=pk1Layer;
-  // PK 100m : hectométriques
-  var pkHectoLayer=L.geoJSON(pkH,{
-    pane:"pane-pk",
-    pointToLayer:function(f,ll){return L.circleMarker(ll,mkPkStyle(2.5,"#666","#eee",1))},
-    onEachFeature:function(f,l){
-      l.bindTooltip(c(f.properties._pk_label),{permanent:true,direction:"top",className:"tip-pk tip-pkh",offset:[0,-4]});
-    }
-  });
+  // PK 100m : hectométriques – init paresseuse (crée ~3000 DOM uniquement si zoom≥12)
+  _pkHData=pkH;
+  var pkHectoLayer=L.layerGroup(); // rempli dans updateVisibility au premier zoom≥12
   addPKtoIndex(pk);
 
   // ── Accès ──────────────────────────────────────────────────────────────
@@ -548,29 +589,6 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
     }
   }).addTo(map);
   layerData.eco=(eco.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
-
-  // ── Boisements ─────────────────────────────────────────────────────────
-  function boisColor(type){
-    var t=(type||"").toUpperCase();
-    if(t.includes("RIPISYLVE"))return"#1b5e20";
-    if(t.includes("BOIS"))return"#388e3c";
-    if(t.includes("HAIE"))return"#558b2f";
-    return"#33691e";
-  }
-  var boisLayer=L.geoJSON(bois,{
-    pane:"pane-bois",
-    style:function(f){
-      var t=f.properties.TYPE_OBJET;
-      return{color:"#FFEB3B",weight:2.5,fillColor:boisColor(t),fillOpacity:.55,dashArray:"6 3"};
-    },
-    onEachFeature:function(f,l){
-      var p=f.properties;
-      l.bindTooltip("🌳 "+c(p.TYPE_OBJET),{sticky:true});
-      l.bindPopup(function(){return popupBois(l.feature.properties);},{maxWidth:300});
-    }
-  }).addTo(map);
-  layerData.bois=(bois.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
-  refreshTableIfOpen();
 
   // ── Clusters OA / PAM (phase 2 viendra remplir) ───────────────────────
   var oaCluster=makePointGroup({iconCreateFunction:clusterIco("#00bcd4"),
@@ -658,7 +676,19 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
     } else {
       [pk50Layer,pk10Layer,pk1Layer].forEach(layerOff);
     }
-    if(!_pkHectoOff&&z>=12)layerOn(pkHectoLayer); else if(_pkHectoOff||z<12)layerOff(pkHectoLayer);
+    if(!_pkHectoOff&&z>=12){
+      if(!_pkHInited&&_pkHData){
+        _pkHInited=true;
+        L.geoJSON(_pkHData,{
+          pane:"pane-pk",
+          pointToLayer:function(f,ll){return L.circleMarker(ll,mkPkStyle(2.5,"#666","#eee",1));},
+          onEachFeature:function(f,l){
+            l.bindTooltip(c(f.properties._pk_label),{permanent:true,direction:"top",className:"tip-pk tip-pkh",offset:[0,-4]});
+          }
+        }).addTo(pkHectoLayer);
+      }
+      layerOn(pkHectoLayer);
+    } else layerOff(pkHectoLayer);
     // ── Accès (zoom ≥ 12) ──────────────────────────────────────────────
     if(!_accOff&&z>=12)layerOn(accLayer); else layerOff(accLayer);
     // ── Labels CSS permanents ──────────────────────────────────────────
@@ -676,21 +706,32 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
   function initLayersPanel(){
     var body=document.getElementById("layers-panel-body");
     if(!body)return;
+    function n1(key){var n=(layerData[key]||[]).length;return n?" ("+n+")":"";}
     var defs=[
-      {label:"Tracé LGV", layer:railLayer, color:"#cc0000", type:"line"},
-      {label:"PK (zoom-adapt.)", layer:pkLayer, color:"#333", type:"dot"},
-      {label:"PK 100m (zoom≥12)", layer:pkHectoLayer, color:"#666", type:"dot"},
-      {label:"Accès (zoom≥12)", layer:accLayer, emoji:"🚧"},
-      {label:"OA – Ouvrages d'Art", layer:oaCluster, emoji:"🏗", lpId:"lp-oa"},
-      {label:"OH – Hydrauliques", layer:ohLayer, color:"#ff8c00", type:"line", lpId:"lp-oh"},
-      {label:"PAM", layer:pamCluster, emoji:"🌱", lpId:"lp-pam"},
-      {label:"Zones OLD", layer:oldLayer, color:"#3366ff", type:"fill"},
-      {label:"Mesures comp.", layer:mcLayer, color:"#9c27b0", type:"fill"},
-      {label:"Natura 2000", layer:n2Layer, color:"#1b5e20", type:"fill"},
-      {label:"Écopâturage", layer:ecoLayer, color:"#81c784", type:"fill"},
-      {label:"Boisements", layer:boisLayer, color:"#388e3c", type:"fill"},
+      {label:"Tracé LGV",             lsKey:"rail",    layer:railLayer,    color:"#cc0000", type:"line"},
+      {label:"PK (zoom-adaptatif)",    lsKey:"pk",      layer:pkLayer,      color:"#333",    type:"dot"},
+      {label:"PK 100m (zoom≥12)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
+      {label:"Accès (zoom≥12)"+n1("acces"), lsKey:"acces", layer:accLayer,  emoji:"🚧"},
+      {label:"OA – Ouvrages d'Art",    lsKey:"oa",      layer:oaCluster,   emoji:"🏗",     lpId:"lp-oa"},
+      {label:"OH – Hydrauliques",      lsKey:"oh",      layer:ohLayer,     color:"#ff8c00", type:"line", lpId:"lp-oh"},
+      {label:"PAM",                    lsKey:"pam",     layer:pamCluster,  emoji:"🌱",     lpId:"lp-pam"},
+      {label:"Zones OLD"+n1("old"),    lsKey:"old",     layer:oldLayer,    color:"#3366ff", type:"fill"},
+      {label:"Mesures comp."+n1("mc"), lsKey:"mc",      layer:mcLayer,     color:"#9c27b0", type:"fill"},
+      {label:"Natura 2000"+n1("n2"),   lsKey:"n2",      layer:n2Layer,     color:"#1b5e20", type:"fill"},
+      {label:"Écopâturage"+n1("eco"),  lsKey:"eco",     layer:ecoLayer,    color:"#81c784", type:"fill"},
+      {label:"Boisements",             lsKey:"bois",    layer:boisLayer,   color:"#388e3c", type:"fill", lpId:"lp-bois"},
     ];
+    _lpDefs=defs;
+    _restoreLayerStates();
     body.innerHTML="";
+    // ── Boutons Tout ✓ / Tout ✗ ──
+    var toolbar=document.createElement("div");
+    toolbar.style.cssText="display:flex;gap:6px;padding:3px 2px 8px;border-bottom:1px solid #eee;margin-bottom:4px";
+    toolbar.innerHTML=
+      "<button onclick=\"window.setAllLayers(true)\" style=\"flex:1;background:#e8f5e9;border:1px solid #a5d6a7;border-radius:4px;padding:5px;font-size:11.5px;cursor:pointer;color:#2e7d32;font-weight:700\">✓ Tout</button>"+
+      "<button onclick=\"window.setAllLayers(false)\" style=\"flex:1;background:#ffebee;border:1px solid #ef9a9a;border-radius:4px;padding:5px;font-size:11.5px;cursor:pointer;color:#c62828;font-weight:700\">✗ Aucun</button>";
+    body.appendChild(toolbar);
+    // ── Items ──
     defs.forEach(function(d){
       var item=document.createElement("div");
       item.className="lp-item";
@@ -704,6 +745,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
         if(d.layer===pkHectoLayer)_pkHectoOff=!chk.checked;
         if(d.layer===accLayer)_accOff=!chk.checked;
         updateVisibility();
+        _saveLayerStates();
       });
       var sw="";
       if(d.emoji) sw="<span style=\"font-size:13px\">"+d.emoji+"</span>";
@@ -715,11 +757,26 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
       item.insertBefore(chk,item.firstChild);
       body.appendChild(item);
     });
+    // ── Sync depuis le contrôle Leaflet ──
     map.on("overlayadd overlayremove",function(){
       body.querySelectorAll(".lp-item input").forEach(function(cb,i){
         if(defs[i])cb.checked=map.hasLayer(defs[i].layer);
       });
+      _saveLayerStates();
     });
+    // ── Tout cocher / décocher ──
+    window.setAllLayers=function(on){
+      defs.forEach(function(d){
+        if(on&&!map.hasLayer(d.layer))d.layer.addTo(map);
+        else if(!on&&map.hasLayer(d.layer))map.removeLayer(d.layer);
+        if(d.layer===pkLayer)_pkOff=!on;
+        if(d.layer===pkHectoLayer)_pkHectoOff=!on;
+        if(d.layer===accLayer)_accOff=!on;
+      });
+      updateVisibility();
+      _saveLayerStates();
+      body.querySelectorAll(".lp-item input").forEach(function(cb){cb.checked=on;});
+    };
   }
   initLayersPanel();
   // Mise à jour badge panel couches après Phase 2
@@ -732,17 +789,19 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
   function updateLoadStatus(){
     var sl=document.getElementById("load-status");
     if(!sl)return;
-    var any=_loading.oa||_loading.oh||_loading.pam;
+    var any=_loading.oa||_loading.oh||_loading.pam||_loading.bois;
     if(!any){sl.style.display="none";return;}
     var parts=[];
-    parts.push(_loading.oa?"🏗 OA ⏳":"🏗 OA ✅ "+layerData.oa.length);
-    parts.push(_loading.oh?"💧 OH ⏳":"💧 OH ✅ "+layerData.oh.length);
-    parts.push(_loading.pam?"🌱 PAM ⏳":"🌱 PAM ✅ "+layerData.pam.length);
+    parts.push(_loading.oa?"🏗 OA ⏳":"🏗 "+layerData.oa.length+" OA");
+    parts.push(_loading.oh?"💧 OH ⏳":"💧 "+layerData.oh.length+" OH");
+    parts.push(_loading.pam?"🌱 PAM ⏳":"🌱 "+layerData.pam.length+" PAM");
+    parts.push(_loading.bois?"🌳 Boisements ⏳":"🌳 "+layerData.bois.length+" boisements");
     sl.textContent=parts.join("   ");
     sl.style.display="block";
   }
   window._updateLoadStatus=updateLoadStatus;
   updateLoadStatus();
+  refreshTableIfOpen();
 
   // ─── Phase 2 : couches lourdes ──────────────────────────────────────────
   // Garde les propriétés mais retire _ph_b64 de layerData (trop lourd en mémoire)
@@ -820,6 +879,23 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco","bois"].map(lo
     if(window._updateLoadStatus)_updateLoadStatus();
     refreshTableIfOpen();
     console.error("PAM erreur:",e);
+  });
+
+  // ── Boisements (Phase 2 – 2,3 Mo, canvas) ────────────────────────────────
+  loadJSONSafe("bois").then(function(boisData){
+    boisLayer.addData(boisData);
+    var bcnt=(boisData.features||[]).length;
+    layerData.bois=(boisData.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
+    _loading.bois=false;
+    if(window._updateLpCount)_updateLpCount("bois",bcnt);
+    if(window._updateLoadStatus)_updateLoadStatus();
+    buildSearchIndex();
+    refreshTableIfOpen();
+  }).catch(function(e){
+    _loading.bois=false;
+    if(window._updateLpCount)_updateLpCount("bois",0);
+    if(window._updateLoadStatus)_updateLoadStatus();
+    console.error("Bois erreur:",e);
   });
 
   // ── Restaurer KML depuis localStorage ────────────────────────────────────
@@ -1007,11 +1083,15 @@ function fillTable(){
       return _tblSortAsc?va.localeCompare(vb,undefined,{numeric:true}):vb.localeCompare(va,undefined,{numeric:true});
     });
   }
-  data.forEach(function(f,i){
+  var MAX_ROWS=300;
+  var shown=data.slice(0,MAX_ROWS);
+  shown.forEach(function(f,i){
     html+="<tr><td><button class=\"tbl-zoom\" onclick=\"zoomToFeature("+i+")\" title=\"Zoom\">🔍</button></td>";
     cols.forEach(function(k){html+="<td title=\""+esc(c(f.props[k]))+"\">"+esc(c(f.props[k]))+"</td>";});
     html+="</tr>";
   });
+  if(data.length>MAX_ROWS)html+="<tr><td colspan=\""+(cols.length+1)+"\" style=\"padding:8px;color:#888;text-align:center;font-size:11px\">"+
+    "… "+(data.length-MAX_ROWS)+" lignes supplémentaires — affinez le filtre pour voir plus</td></tr>";
   html+="</tbody></table>";
   document.getElementById("tbl-scroll").innerHTML=html;
   document.getElementById("tbl-scroll")._data=data;
