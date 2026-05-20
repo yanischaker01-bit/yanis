@@ -465,7 +465,7 @@ function _restoreLayerStates(){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260522";
+var _cbv="?v=20260523";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -740,12 +740,13 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     // ── Accès (zoom ≥ 12) ──────────────────────────────────────────────
     if(!_accOff&&z>=12)layerOn(accLayer); else layerOff(accLayer);
     // ── Labels CSS permanents ──────────────────────────────────────────
-    mapEl.classList.toggle("lbl-pk50", z>=7);  // grands repères
-    mapEl.classList.toggle("lbl-pk10", z>=10); // repères 10 km
-    mapEl.classList.toggle("lbl-pk1", z>=12);  // repères 1 km
-    mapEl.classList.toggle("lbl-pkh", z>=14);  // hectométriques
-    mapEl.classList.toggle("lbl-n2", z>=8);    // Noms Natura 2000
-    mapEl.classList.toggle("lbl-oa", z>=10);   // OA labels (was z>=12)
+    // Labels exclusifs : un seul niveau par zoom pour éviter la surcharge
+    mapEl.classList.toggle("lbl-pk50", !_pkOff&&z>=7&&z<10);
+    mapEl.classList.toggle("lbl-pk10", !_pkOff&&z>=10&&z<12);
+    mapEl.classList.toggle("lbl-pk1",  !_pkOff&&z>=12&&z<14);
+    mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=14);
+    mapEl.classList.toggle("lbl-n2", z>=8);
+    mapEl.classList.toggle("lbl-oa", z>=10);
   }
   map.on("zoomend",updateVisibility);
   updateVisibility();
@@ -866,7 +867,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🏗",22),pane:"pane-oa"})},
       onEachFeature:function(f,l){
         var code=c(f.properties.CODE_OBJET);
-        var lib=c(f.properties.LIBELLE_LO||f.properties.LIBELLE);
+        var lib=c(f.properties.LIBELLE_LO);
         var lbl=(code&&lib)?code+" – "+lib:(code||lib);
         l.bindTooltip(lbl,{permanent:true,direction:"top",className:"tip-oa",offset:[0,-13]});
         l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOA(l.feature.properties);});
@@ -998,7 +999,7 @@ function buildSearchIndex(){
   // OA
   layerData.oa.forEach(function(f){
     var p=f.props;
-    searchIndex.push({type:"OA",label:c(p.CODE_OBJET)+" – "+c(p.LIBELLE_LO||p.LIBELLE),
+    searchIndex.push({type:"OA",label:c(p.CODE_OBJET)+" – "+c(p.LIBELLE_LO),
       sub:c(p._pk_fmt),geom:f.geom});
   });
   // OH
@@ -1068,9 +1069,12 @@ document.getElementById("search-input").addEventListener("input",function(){
   if(q.length<2){res.style.display="none";return;}
   _searchTimeout=setTimeout(function(){
     var ql=q.toLowerCase();
-    var isPkQuery=/^\d{1,3}\+\d{1,3}$/.test(q.trim())||/^pk\s*\d/i.test(q.trim());
+    var isPkQuery=/\d{1,3}\s*\+\s*\d{1,3}/.test(q.trim())||/^pk\s*\d/i.test(q.trim());
+    var qlNorm=ql.replace(/\s*\+\s*/g,"+");
     var hits=searchIndex.filter(function(x){
-      return x.label.toLowerCase().includes(ql)||x.sub.toLowerCase().includes(ql);
+      var ln=x.label.toLowerCase().replace(/\s*\+\s*/g,"+");
+      var sn=x.sub.toLowerCase().replace(/\s*\+\s*/g,"+");
+      return ln.includes(qlNorm)||sn.includes(qlNorm);
     });
     if(isPkQuery){hits.sort(function(a,b){return(a.type==="PK"?0:1)-(b.type==="PK"?0:1);});}
     hits=hits.slice(0,12);
@@ -1306,12 +1310,18 @@ function removeKMLLayer(name){
   }catch(e){}
   refreshKMLSection();
 }
+function clearAllKML(){
+  Object.keys(_kmlLayers).slice().forEach(removeKMLLayer);
+}
 function refreshKMLSection(){
   var section=document.getElementById("kml-layers-section");
   if(!section)return;
   var names=Object.keys(_kmlLayers);
   if(!names.length){section.innerHTML="";return;}
-  var html="<div style=\"font-size:10px;font-weight:700;color:#888;margin:10px 0 4px;border-top:1px solid #eee;padding-top:8px\">FICHIERS KML IMPORTÉS</div>";
+  var html="<div style=\"font-size:10px;font-weight:700;color:#888;margin:10px 0 4px;border-top:1px solid #eee;padding-top:8px;display:flex;align-items:center\">"+
+    "KML IMPORTÉS"+
+    "<button onclick=\"clearAllKML()\" style=\"margin-left:auto;background:#ffebee;border:1px solid #ef9a9a;border-radius:3px;padding:2px 7px;cursor:pointer;color:#c62828;font-size:10px;font-weight:700\">🗑 Tout</button>"+
+    "</div>";
   section.innerHTML=html;
   names.forEach(function(name){
     var div=document.createElement("div");
@@ -1402,7 +1412,7 @@ function pjSection(code,label){
     "</div>";
 }
 function openDetailOA(p){
-  var code=c(p.CODE_OBJET),lib=c(p.LIBELLE_LO||p.LIBELLE);
+  var code=c(p.CODE_OBJET),lib=c(p.LIBELLE_LO);
   var title="🏗 "+(code?code+" – ":"")+lib;
   var body=photoHtml(p)+buildDetailTable(p)+spHtml(p)+pjSection(code,code+" "+lib);
   openDetail(title,body);
