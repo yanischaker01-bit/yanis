@@ -148,8 +148,31 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 .pj-del{background:#ffebee;border:none;border-radius:3px;padding:2px 7px;
   cursor:pointer;color:#c62828;font-size:11px}
 .leaflet-control-layers-list label{font-size:12px}
+/* Detail side panel */
+#detail-panel{position:absolute;top:0;right:0;bottom:0;width:340px;max-width:92vw;
+  background:white;z-index:900;transform:translateX(100%);transition:transform .3s;
+  box-shadow:-4px 0 20px rgba(0,0,0,.25);display:flex;flex-direction:column;overflow:hidden}
+#detail-panel.open{transform:translateX(0)}
+#detail-header{background:#1a1a2e;color:white;padding:10px 14px;display:flex;
+  align-items:center;gap:8px;flex-shrink:0}
+#detail-body{flex:1;overflow-y:auto;padding:12px 14px;font-size:12.5px}
+#detail-body table{width:100%;border-collapse:collapse;margin-bottom:6px}
+#detail-body td{padding:3px 4px 3px 0;vertical-align:top;border-bottom:1px solid #f5f5f5;font-size:11.5px}
+#detail-body td:first-child{font-weight:600;color:#888;white-space:nowrap;width:110px;font-size:11px}
+#detail-body img{width:100%;border-radius:6px;margin:8px 0;cursor:zoom-in;box-shadow:0 2px 8px rgba(0,0,0,.2)}
+.detail-section{margin-top:10px;border-top:1px solid #eee;padding-top:8px}
+.detail-section-title{font-size:11px;font-weight:700;color:#666;margin-bottom:6px}
+/* KML choice modal */
+#kml-choice-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;
+  background:rgba(0,0,0,.55);z-index:9500;align-items:center;justify-content:center}
+#kml-choice-modal.open{display:flex}
+.kml-del{background:#ffebee;border:none;border-radius:3px;padding:2px 7px;
+  cursor:pointer;color:#c62828;font-size:11px;margin-left:auto;flex-shrink:0}
 /* ══ Mobile / Téléphone ══════════════════════════════════════════════ */
 @media(max-width:768px){
+  #detail-panel{width:100%;max-width:100%;top:auto;height:65vh;transform:translateY(100%);
+    box-shadow:0 -4px 20px rgba(0,0,0,.2)}
+  #detail-panel.open{transform:translateY(0)}
   #search-wrap{left:44px;width:calc(100vw - 110px);transform:none;top:8px}
   #search-input{font-size:14px;padding:9px 12px}
   #search-res{max-height:160px}
@@ -182,7 +205,7 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 <div id="map"></div>
 <!-- Barre de recherche -->
 <div id="search-wrap">
-  <input id="search-input" type="text" placeholder="🔍  Rechercher PK, OA, OH, Accès…" autocomplete="off"/>
+  <input id="search-input" type="text" placeholder="🔍  PK (ex: 234+500), OA, OH, Accès…" autocomplete="off"/>
   <div id="search-res"></div>
 </div>
 <!-- Panneau table attributaire -->
@@ -225,6 +248,26 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 <div id="load-status" style="display:none;position:absolute;bottom:36px;left:50%;transform:translateX(-50%);
   z-index:802;background:rgba(26,26,46,.9);color:white;padding:5px 16px;border-radius:16px;
   font-size:11.5px;white-space:nowrap;pointer-events:none;letter-spacing:.2px"></div>
+<!-- Detail side panel -->
+<div id="detail-panel">
+  <div id="detail-header">
+    <span id="detail-title" style="flex:1;font-size:12.5px;font-weight:700;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+    <button onclick="closeDetail()" style="background:none;border:none;color:white;font-size:20px;cursor:pointer;line-height:1;flex-shrink:0;padding:0 2px">✕</button>
+  </div>
+  <div id="detail-body"></div>
+</div>
+<!-- KML choice modal -->
+<div id="kml-choice-modal" onclick="if(event.target===this)cancelKML()">
+  <div style="background:white;border-radius:10px;padding:22px;width:340px;max-width:92vw;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+    <h3 style="font-size:14px;margin-bottom:6px;color:#1a1a2e">📎 Importer KML/KMZ</h3>
+    <p id="kml-choice-fname" style="color:#888;font-size:11.5px;margin-bottom:16px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></p>
+    <div style="display:flex;gap:10px">
+      <button onclick="confirmKML(true)" style="flex:1;background:#e8f5e9;border:1px solid #a5d6a7;border-radius:6px;padding:10px;cursor:pointer;font-size:12px;font-weight:700;color:#2e7d32">💾 Stocker</button>
+      <button onclick="confirmKML(false)" style="flex:1;background:#e3f2fd;border:1px solid #90caf9;border-radius:6px;padding:10px;cursor:pointer;font-size:12px;font-weight:700;color:#1565c0">⏱ Temporaire</button>
+    </div>
+    <button onclick="cancelKML()" style="margin-top:10px;width:100%;background:#eee;border:none;border-radius:5px;padding:7px;cursor:pointer;font-size:12px">Annuler</button>
+  </div>
+</div>
 <!-- Lightbox -->
 <div id="lightbox" onclick="this.classList.remove('open')"><img id="lb-img" src="" alt=""/></div>
 <!-- Modal PJ -->
@@ -422,7 +465,7 @@ function _restoreLayerStates(){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521";
+var _cbv="?v=20260522";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -462,6 +505,10 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   }).addTo(map);
   try{map.fitBounds(railLayer.getBounds().pad(.05));}catch(e){}
   if(map.getZoom()<7)map.setZoom(7);
+  try{var _sp=JSON.parse(localStorage.getItem("lgv_map_pos")||"null");
+    if(_sp&&_sp.lat)map.setView([_sp.lat,_sp.lng],_sp.zoom,{animate:false});}catch(e){}
+  map.on("moveend",function(){try{var _c=map.getCenter();
+    localStorage.setItem("lgv_map_pos",JSON.stringify({lat:_c.lat,lng:_c.lng,zoom:map.getZoom()}));}catch(e){}});
 
   // ── Couches PK – 4 niveaux selon zoom ──────────────────────────────────
   function pkMeters(lbl){
@@ -604,9 +651,10 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     style:{color:"#ef6c00",weight:4.5,opacity:.95},
     onEachFeature:function(f,l){
       var p=f.properties;
-      var lbl=c(p.code_objet||p.libelle_ob);
+      var cod=c(p.code_objet),libob=c(p.libelle_ob);
+      var lbl=(cod&&libob)?cod+" – "+libob:(cod||libob);
       l.bindTooltip(lbl,{sticky:true,className:"tip-oh"});
-      l.bindPopup(function(){return popupOH(l.feature.properties);},{maxWidth:310});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOH(l.feature.properties);});
     }
   }).addTo(map);
 
@@ -614,7 +662,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   var overlays={};
   overlays["<span style=\"color:#cc0000;font-weight:700\">━</span> Tracé LGV"]=railLayer;
   overlays["<span style=\"font-size:10px;color:#333\">⬤</span> PK (zoom-adaptatif)"]=pkLayer;
-  overlays["<span style=\"font-size:9px;color:#555\">⬤</span> PK hectométriques (zoom≥12)"]=pkHectoLayer;
+  overlays["<span style=\"font-size:9px;color:#555\">⬤</span> PK hectométriques (zoom≥14)"]=pkHectoLayer;
   overlays["🚧 Accès PTLO / PTLA (zoom≥12)"]=accLayer;
   overlays["🏗 OA – Ouvrages d'Art (<span id=\"cnt-oa\">…</span>)"]=oaCluster;
   overlays["<span style=\"color:#ff8c00\">━</span> OH – Ouvrages Hydrauliques (<span id=\"cnt-oh\">…</span>)"]=ohLayer;
@@ -676,7 +724,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     } else {
       [pk50Layer,pk10Layer,pk1Layer].forEach(layerOff);
     }
-    if(!_pkHectoOff&&z>=12){
+    if(!_pkHectoOff&&z>=14){
       if(!_pkHInited&&_pkHData){
         _pkHInited=true;
         L.geoJSON(_pkHData,{
@@ -695,7 +743,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     mapEl.classList.toggle("lbl-pk50", z>=7);  // grands repères
     mapEl.classList.toggle("lbl-pk10", z>=10); // repères 10 km
     mapEl.classList.toggle("lbl-pk1", z>=12);  // repères 1 km
-    mapEl.classList.toggle("lbl-pkh", z>=12);  // hectométriques (was z>=14)
+    mapEl.classList.toggle("lbl-pkh", z>=14);  // hectométriques
     mapEl.classList.toggle("lbl-n2", z>=8);    // Noms Natura 2000
     mapEl.classList.toggle("lbl-oa", z>=10);   // OA labels (was z>=12)
   }
@@ -710,7 +758,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     var defs=[
       {label:"Tracé LGV",             lsKey:"rail",    layer:railLayer,    color:"#cc0000", type:"line"},
       {label:"PK (zoom-adaptatif)",    lsKey:"pk",      layer:pkLayer,      color:"#333",    type:"dot"},
-      {label:"PK 100m (zoom≥12)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
+      {label:"PK 100m (zoom≥14)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
       {label:"Accès (zoom≥12)"+n1("acces"), lsKey:"acces", layer:accLayer,  emoji:"🚧"},
       {label:"OA – Ouvrages d'Art",    lsKey:"oa",      layer:oaCluster,   emoji:"🏗",     lpId:"lp-oa"},
       {label:"OH – Hydrauliques",      lsKey:"oh",      layer:ohLayer,     color:"#ff8c00", type:"line", lpId:"lp-oh"},
@@ -757,6 +805,11 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       item.insertBefore(chk,item.firstChild);
       body.appendChild(item);
     });
+    // ── Section KML importés ──
+    var kmlDiv=document.createElement("div");
+    kmlDiv.id="kml-layers-section";
+    body.appendChild(kmlDiv);
+    refreshKMLSection();
     // ── Sync depuis le contrôle Leaflet ──
     map.on("overlayadd overlayremove",function(){
       body.querySelectorAll(".lp-item input").forEach(function(cb,i){
@@ -814,9 +867,9 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       onEachFeature:function(f,l){
         var code=c(f.properties.CODE_OBJET);
         var lib=c(f.properties.LIBELLE_LO||f.properties.LIBELLE);
-        var lbl=code||lib;
+        var lbl=(code&&lib)?code+" – "+lib:(code||lib);
         l.bindTooltip(lbl,{permanent:true,direction:"top",className:"tip-oa",offset:[0,-13]});
-        l.bindPopup(function(){return popupOA(l.feature.properties);},{maxWidth:320});
+        l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOA(l.feature.properties);});
       }
     }).addTo(oaCluster);
     var cnt=(oa.features||[]).length;
@@ -861,7 +914,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       onEachFeature:function(f,l){
         var p=f.properties;
         l.bindTooltip(c(p.libelle||p.axe||"PAM"),{sticky:true});
-        l.bindPopup(function(){return popupPAM(l.feature.properties);},{maxWidth:310});
+        l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailPAM(l.feature.properties);});
       }
     }).addTo(pamCluster);
     var cnt=(pam.features||[]).length;
@@ -1015,9 +1068,12 @@ document.getElementById("search-input").addEventListener("input",function(){
   if(q.length<2){res.style.display="none";return;}
   _searchTimeout=setTimeout(function(){
     var ql=q.toLowerCase();
+    var isPkQuery=/^\d{1,3}\+\d{1,3}$/.test(q.trim())||/^pk\s*\d/i.test(q.trim());
     var hits=searchIndex.filter(function(x){
       return x.label.toLowerCase().includes(ql)||x.sub.toLowerCase().includes(ql);
-    }).slice(0,12);
+    });
+    if(isPkQuery){hits.sort(function(a,b){return(a.type==="PK"?0:1)-(b.type==="PK"?0:1);});}
+    hits=hits.slice(0,12);
     if(!hits.length){res.style.display="none";return;}
     res.innerHTML=hits.map(function(h,i){
       return"<div class=\"sr-item\" data-idx=\""+i+"\" onclick=\"goToResult("+i+", this)\">"+
@@ -1167,17 +1223,24 @@ function deletePJ(idx){
 // INJECTION KML / KMZ
 // ═══════════════════════════════════════════════════════════════
 var _kmlLayers={};
+var _kmlPending=null;
+
 function importKML(input){
   var file=input.files[0];if(!file)return;
-  function processKML(kmlStr,fname){
-    var geojson;
-    try{
-      var parser=new DOMParser();
-      var doc=parser.parseFromString(kmlStr,"text/xml");
-      var conv=window.toGeoJSON||window.togeojson;
-      if(conv&&conv.kml){geojson=conv.kml(doc);}
-      else{alert("Bibliothèque toGeoJSON non disponible.");return;}
-    }catch(e){alert("Erreur lecture KML : "+e.message);return;}
+  _kmlPending={file:file};
+  input.value="";
+  document.getElementById("kml-choice-fname").textContent=file.name;
+  document.getElementById("kml-choice-modal").classList.add("open");
+}
+function cancelKML(){
+  document.getElementById("kml-choice-modal").classList.remove("open");
+  _kmlPending=null;
+}
+function confirmKML(store){
+  document.getElementById("kml-choice-modal").classList.remove("open");
+  if(!_kmlPending)return;
+  var file=_kmlPending.file;_kmlPending=null;
+  function addKMLLayer(geojson,fname){
     var lname="📎 "+fname;
     var lyr=L.geoJSON(geojson,{
       pane:"pane-kml",
@@ -1187,29 +1250,42 @@ function importKML(input){
         var p=f.properties;
         l.bindTooltip(c(p.name||""),{sticky:true});
         l.bindPopup("<div class=\"popup-card\"><h3>"+c(p.name||"KML")+"</h3>"+
-          (p.description?"<p style=\"font-size:12px\">"+p.description+"</p>":"")+"</div>",{maxWidth:300});
+          (p.description?"<p style=\"font-size:12px\">"+esc(p.description)+"</p>":"")+"</div>",{maxWidth:300});
       }
     }).addTo(map);
     try{map.fitBounds(lyr.getBounds().pad(.05));}catch(e){}
     _kmlLayers[lname]=lyr;
     if(layerCtrl)layerCtrl.addOverlay(lyr,lname);
+    if(store){
+      try{
+        var stored=JSON.parse(localStorage.getItem("kml_layers")||"[]");
+        stored.push({name:lname,geojson:JSON.stringify(geojson)});
+        localStorage.setItem("kml_layers",JSON.stringify(stored));
+      }catch(e){}
+    }
+    refreshKMLSection();
+  }
+  function processKML(kmlStr,fname){
+    var geojson;
     try{
-      var stored=JSON.parse(localStorage.getItem("kml_layers")||"[]");
-      stored.push({name:lname,geojson:JSON.stringify(geojson)});
-      localStorage.setItem("kml_layers",JSON.stringify(stored));
-    }catch(e){}
-    input.value="";
+      var parser=new DOMParser();
+      var doc=parser.parseFromString(kmlStr,"text/xml");
+      var conv=window.toGeoJSON||window.togeojson;
+      if(conv&&conv.kml){geojson=conv.kml(doc);}
+      else{alert("Bibliothèque toGeoJSON non disponible.");return;}
+    }catch(e){alert("Erreur lecture KML : "+e.message);return;}
+    addKMLLayer(geojson,fname);
   }
   if(file.name.toLowerCase().endsWith(".kmz")){
     var rKmz=new FileReader();
     rKmz.onload=function(ev){
-      if(typeof JSZip==="undefined"){alert("JSZip non chargé – impossible de lire le KMZ.");return;}
+      if(typeof JSZip==="undefined"){alert("JSZip non chargé.");return;}
       JSZip.loadAsync(ev.target.result).then(function(zip){
         var kmlFile=null;
         zip.forEach(function(rpath,zf){if(!kmlFile&&rpath.toLowerCase().endsWith(".kml"))kmlFile=zf;});
-        if(!kmlFile){alert("Aucun fichier .kml trouvé dans ce KMZ.");return;}
+        if(!kmlFile){alert("Aucun fichier .kml dans ce KMZ.");return;}
         kmlFile.async("string").then(function(kmlStr){processKML(kmlStr,file.name);});
-      }).catch(function(e){alert("Erreur lecture KMZ : "+e.message);});
+      }).catch(function(e){alert("Erreur KMZ : "+e.message);});
     };
     rKmz.readAsArrayBuffer(file);
   } else {
@@ -1217,6 +1293,38 @@ function importKML(input){
     reader.onload=function(ev){processKML(ev.target.result,file.name);};
     reader.readAsText(file);
   }
+}
+function removeKMLLayer(name){
+  var lyr=_kmlLayers[name];if(!lyr)return;
+  map.removeLayer(lyr);
+  if(layerCtrl)layerCtrl.removeLayer(lyr);
+  delete _kmlLayers[name];
+  try{
+    var stored=JSON.parse(localStorage.getItem("kml_layers")||"[]");
+    stored=stored.filter(function(s){return s.name!==name;});
+    localStorage.setItem("kml_layers",JSON.stringify(stored));
+  }catch(e){}
+  refreshKMLSection();
+}
+function refreshKMLSection(){
+  var section=document.getElementById("kml-layers-section");
+  if(!section)return;
+  var names=Object.keys(_kmlLayers);
+  if(!names.length){section.innerHTML="";return;}
+  var html="<div style=\"font-size:10px;font-weight:700;color:#888;margin:10px 0 4px;border-top:1px solid #eee;padding-top:8px\">FICHIERS KML IMPORTÉS</div>";
+  section.innerHTML=html;
+  names.forEach(function(name){
+    var div=document.createElement("div");
+    div.className="lp-item";
+    div.innerHTML="<span style=\"font-size:12px;flex-shrink:0\">📎</span>"+
+      "<span style=\"flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\">"+
+      esc(name.replace(/^📎\s*/,""))+"</span>";
+    var btn=document.createElement("button");
+    btn.className="kml-del";btn.textContent="✕";btn.title="Supprimer";
+    (function(n){btn.addEventListener("click",function(){removeKMLLayer(n);});})(name);
+    div.appendChild(btn);
+    section.appendChild(div);
+  });
 }
 function restoreKMLLayers(ctrl){
   try{
@@ -1231,17 +1339,85 @@ function restoreKMLLayers(ctrl){
           onEachFeature:function(f,l){
             var p=f.properties;
             l.bindTooltip(c(p.name||""),{sticky:true});
-            l.bindPopup("<div class=\"popup-card\"><h3>"+c(p.name||"KML")+"</h3>"+(p.description?"<p>"+p.description+"</p>":"")+"</div>");
+            l.bindPopup("<div class=\"popup-card\"><h3>"+c(p.name||"KML")+"</h3>"+(p.description?"<p>"+esc(p.description)+"</p>":"")+"</div>");
           }
         }).addTo(map);
         _kmlLayers[s.name]=lyr;
         if(ctrl)ctrl.addOverlay(lyr,s.name);
       }catch(e){}
     });
+    refreshKMLSection();
   }catch(e){}
 }
-// Bouton pour vider les KML stockés (accessible via console: clearKMLStorage())
-function clearKMLStorage(){localStorage.removeItem("kml_layers");location.reload();}
+
+// ═══════════════════════════════════════════════════════════════
+// PANNEAU DÉTAILS (fenêtre contextuelle)
+// ═══════════════════════════════════════════════════════════════
+function openDetail(title,bodyHtml){
+  document.getElementById("detail-title").innerHTML=title;
+  document.getElementById("detail-body").innerHTML=bodyHtml;
+  document.getElementById("detail-panel").classList.add("open");
+}
+function closeDetail(){document.getElementById("detail-panel").classList.remove("open");}
+
+function buildDetailTable(props,skip){
+  skip=skip||["_ph_b64","_ph_path","_ph_url","_sp_url"];
+  var html="<table>";
+  Object.keys(props).forEach(function(k){
+    if(skip.indexOf(k)>=0)return;
+    var v=c(props[k]);if(!v)return;
+    html+="<tr><td>"+esc(k)+"</td><td>"+esc(v)+"</td></tr>";
+  });
+  return html+"</table>";
+}
+
+function renderPJInline(code){
+  var list=getPJList(code);
+  if(!list.length)return"<p style=\"color:#aaa;font-size:11.5px\">Aucune pièce jointe.</p>";
+  return list.map(function(p,i){
+    return"<div class=\"pj-item\"><a href=\""+p.data+"\" download=\""+esc(p.name)+"\" style=\"color:#0078d4;font-size:12px\">📄 "+esc(p.name)+"</a>"+
+      "<button class=\"pj-del\" onclick=\"deletePJDetail('"+esc(code)+"',"+i+")\">✕</button></div>";
+  }).join("");
+}
+function deletePJDetail(code,idx){
+  var list=getPJList(code);list.splice(idx,1);savePJList(code,list);
+  var el=document.getElementById("dpj-"+code);if(el)el.innerHTML=renderPJInline(code);
+}
+function addPJDetail(code,input){
+  var files=Array.from(input.files);var list=getPJList(code);var toRead=files.length;
+  files.forEach(function(file){
+    var reader=new FileReader();
+    reader.onload=function(e){
+      list.push({name:file.name,data:e.target.result,type:file.type,date:new Date().toISOString()});
+      toRead--;if(!toRead){savePJList(code,list);var el=document.getElementById("dpj-"+code);if(el)el.innerHTML=renderPJInline(code);}
+    };reader.readAsDataURL(file);
+  });input.value="";
+}
+function pjSection(code,label){
+  var safeCode=esc(code);
+  return"<div class=\"detail-section\"><div class=\"detail-section-title\">📎 Pièces jointes</div>"+
+    "<div id=\"dpj-"+safeCode+"\">"+renderPJInline(code)+"</div>"+
+    "<label class=\"btn-pj\" style=\"margin-top:6px;display:inline-block\">➕ Ajouter"+
+    "<input type=\"file\" multiple style=\"display:none\" onchange=\"addPJDetail('"+safeCode+"',this)\"/></label>"+
+    "</div>";
+}
+function openDetailOA(p){
+  var code=c(p.CODE_OBJET),lib=c(p.LIBELLE_LO||p.LIBELLE);
+  var title="🏗 "+(code?code+" – ":"")+lib;
+  var body=photoHtml(p)+buildDetailTable(p)+spHtml(p)+pjSection(code,code+" "+lib);
+  openDetail(title,body);
+}
+function openDetailOH(p){
+  var code=c(p.code_objet),lib=c(p.libelle_ob);
+  var title="💧 "+(code?code+" – ":"")+lib;
+  var body=photoHtml(p)+buildDetailTable(p)+spHtml(p)+pjSection(code,code+" "+lib);
+  openDetail(title,body);
+}
+function openDetailPAM(p){
+  var lib=c(p.libelle||p.axe||"PAM");
+  var body=photoHtml(p)+buildDetailTable(p)+spHtml(p);
+  openDetail("🌱 "+lib,body);
+}
 
 </script>
 </body>
