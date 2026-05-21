@@ -1,0 +1,87 @@
+name: Publish LGV Dashboard
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  schedule:
+    - cron: "15 * * * *"
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run dashboard generation
+        run: |
+          python run_once_dashboard.py || (sleep 20 && python run_once_dashboard.py) || true
+
+      - name: Fetch carte LGV SEA from gh-pages
+        run: |
+          git fetch origin gh-pages
+          mkdir -p site
+          git archive origin/gh-pages | tar -x -C site/
+
+      - name: Add dashboard and snapshot
+        run: |
+          mkdir -p site/dashboard/reports site/reports
+          if [ ! -f reports/lgv_dashboard_latest.html ]; then
+            echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
+          fi
+          if [ ! -f reports/streamlit_snapshot_latest.json ]; then
+            echo "{}" > reports/streamlit_snapshot_latest.json
+          fi
+          cp reports/lgv_dashboard_latest.html site/dashboard/index.html
+          cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
+          cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
+          cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
+
+      - name: Wake Streamlit pluvio app
+        env:
+          STREAMLIT_APP_URL: https://lgvpluviostations.streamlit.app/
+        run: |
+          curl -L --silent --show-error --max-time 120 "$STREAMLIT_APP_URL" > /dev/null || true
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

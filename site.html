@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Suivi du Débroussaillement</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100 text-gray-800">
+
+  <!-- En-tête -->
+  <header class="bg-green-700 text-white p-6 shadow-md">
+    <h1 class="text-3xl font-bold">Suivi des Obligations Légales de Débroussaillement</h1>
+    <p class="mt-2 text-lg">Prévenir les incendies, protéger les territoires</p>
+  </header>
+
+  <!-- Section Intro -->
+  <section class="p-8 flex flex-col md:flex-row items-center gap-6 bg-white">
+    <img src="https://upload.wikimedia.org/wikipedia/commons/5/5e/Forest_fire_prevention_clearing.jpg" alt="Débroussaillement" class="w-full md:w-1/2 rounded shadow-lg"/>
+    <div>
+      <h2 class="text-2xl font-semibold mb-4">Pourquoi débroussailler ?</h2>
+      <p>
+        Le débroussaillement permet de limiter la propagation des feux de forêt en réduisant la masse végétale. C'est une obligation légale dans les zones exposées au risque incendie.
+      </p>
+    </div>
+  </section>
+
+  <!-- Vidéo explicative -->
+  <section class="p-8 bg-gray-50 text-center">
+    <h2 class="text-2xl font-semibold mb-4">Vidéo explicative</h2>
+    <div class="flex justify-center">
+      <iframe class="w-full md:w-2/3 h-64 rounded shadow" src="https://www.youtube.com/embed/6-vs6JslqWE" title="Vidéo débroussaillement" allowfullscreen></iframe>
+    </div>
+  </section>
+
+  <!-- Galerie -->
+  <section class="p-8 bg-white">
+    <h2 class="text-2xl font-semibold mb-6 text-center">Exemples de terrains débroussaillés</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/b/bf/Maquis_corse_d%C3%A9broussaill%C3%A9.jpg/640px-Maquis_corse_d%C3%A9broussaill%C3%A9.jpg" class="rounded shadow" alt="Terrain débroussaillé 1"/>
+      <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/4/4e/D%C3%A9broussaillement.jpg/640px-D%C3%A9broussaillement.jpg" class="rounded shadow" alt="Terrain débroussaillé 2"/>
+      <img src="https://upload.wikimedia.org/wikipedia/commons/7/7a/D%C3%A9broussaillage-M%C3%A9diterran%C3%A9e.jpg" class="rounded shadow" alt="Terrain débroussaillé 3"/>
+    </div>
+  </section>
+
+  <!-- Carte (Géoportail / ArcGIS Online / Leaflet...) -->
+  <section class="p-8 bg-gray-50">
+    <h2 class="text-2xl font-semibold mb-4 text-center">Carte de suivi</h2>
+    <p class="text-center mb-4">Cliquez ci-dessous pour visualiser les zones à débroussailler :</p>
+    <div class="text-center">
+      <a href="https://www.geoportail.gouv.fr/carte" target="_blank" class="bg-green-600 text-white px-6 py-2 rounded hover:bg-green-700 transition">Voir sur Géoportail</a>
+    </div>
+  </section>
+
+  <!-- Contact -->
+  <section class="p-8 bg-white">
+    <h2 class="text-2xl font-semibold mb-4">Contact</h2>
+    <form class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <input type="text" placeholder="Nom" class="p-2 border rounded"/>
+      <input type="email" placeholder="Email" class="p-2 border rounded"/>
+      <textarea placeholder="Votre message..." class="p-2 border rounded md:col-span-2"></textarea>
+      <button type="submit" class="bg-green-600 text-white py-2 rounded hover:bg-green-700 transition md:col-span-2">Envoyer</button>
+    </form>
+  </section>
+
+  <!-- Pied de page -->
+  <footer class="bg-green-700 text-white text-center p-4 mt-8">
+    &copy; 2025 - Suivi du débroussaillement. Tous droits réservés.
+  </footer>
+
+</body>
+</html>
+
+
+

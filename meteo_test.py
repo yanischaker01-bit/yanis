@@ -1,0 +1,4940 @@
+import csv
+import gzip
+import html
+import json
+import logging
+import math
+import numbers
+import os
+import re
+import time
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from io import StringIO
+from typing import Any, Dict, List, Optional, Tuple
+import xml.etree.ElementTree as ET
+
+import pandas as pd
+import requests
+import schedule
+
+try:
+    from shapely.geometry import LineString, MultiLineString, MultiPolygon, Point, Polygon, mapping, shape
+    from shapely.strtree import STRtree
+except Exception:  # pragma: no cover - optional runtime guard
+    LineString = None
+    MultiLineString = None
+    MultiPolygon = None
+    Point = None
+    Polygon = None
+    mapping = None
+    STRtree = None
+    shape = None
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[logging.FileHandler("lgv_monitoring.log"), logging.StreamHandler()],
+)
+
+
+class DataSource(Enum):
+    SYNOP_METEOFRANCE = "synop_meteofrance"
+    OPEN_METEO = "open_meteo"
+    HUBEAU_HYDRO = "hubeau_hydrometrie"
+    VIGICRUES_HYDRO = "vigicrues_hubeau"
+
+
+@dataclass
+class RiverMonitoringPoint:
+    river: str
+    name: str
+    latitude: float
+    longitude: float
+    station_code: Optional[str] = None
+    threshold_m: Optional[float] = None
+    rapid_rise_mph: float = 0.10
+
+
+class LGVSeaMonitor:
+    def __init__(self):
+        self.default_lgv_coordinates_latlon = [
+            (44.8378, -0.5792),
+            (45.7167, 0.3667),
+            (46.3167, 0.4667),
+            (47.3833, 0.6833),
+        ]
+        self.lgv_geometry_candidates = [
+            os.path.join("lgv_monitoring", "assets", "lgv_sea_line.kml"),
+            os.path.join("lgv_monitoring", "assets", "LRS_AXES.kmz"),
+            r"C:\Users\YCHAKER\Downloads\kmz\LRS_AXES.kmz",
+        ]
+        self.lgv_lines_latlon = self._load_lgv_lines(self.lgv_geometry_candidates)
+        if not self.lgv_lines_latlon:
+            self.lgv_lines_latlon = [self.default_lgv_coordinates_latlon]
+        self.weather_corridor_km = max(1.0, min(50.0, float(os.getenv("LGV_WEATHER_CORRIDOR_KM", "15"))))
+        self.alert_thresholds_mm = {
+            "catastrophique_24h": 120.0,
+            "extreme_24h": 80.0,
+            "forte_24h": 50.0,
+            "moderee_24h": 20.0,
+        }
+        self.soil_sample_step_km = 15.0
+        self.soil_max_points = 36
+        self.soil_mvt_radius_m = 3000
+        self.soil_mvt_page_size = 20
+        self.soil_cache_hours = 24
+        self.pedology_max_features = 1200
+        self.piezometer_corridor_km = 5.0
+        self.piezometer_max_stations = 25
+        self.piezometer_history_days = 90
+        self.piezometer_cache_hours = 6
+        self.hydro_network_corridor_km = 15.0
+        self.hydro_network_max_stations = 80
+        self.hydro_network_hours = 120
+        self.hydro_network_page_size = 2000
+        self.hydro_network_max_pages = 6
+        self.hydro_network_scan_multiplier = 2
+        self.hydro_network_cache_hours = 6
+        self.hydro_threshold_cache_hours = 24
+        self.sector_length_km = 5.0
+        self.sector_max_points = 140
+        self.sector_radius_km = 10.0
+        self.lgv_commune_sample_step_km = 0.2
+        self.lgv_commune_dep_discovery_step_km = 4.0
+        self.lgv_commune_dep_discovery_limit = 160
+        self.lgv_commune_capture_buffer_km = 0.35
+        self.lgv_communes_cache_days = 30
+        self.lgv_reference_departements = ["33", "24", "16", "86", "37"]
+        self.ai_model_name = "LGV-SEA-RiskAI-v1"
+        self.ai_model_version = "2026.02"
+        self.pedology_fragility_index: Dict[str, float] = {
+            "Argileux": 0.92,
+            "Alluvial": 0.84,
+            "Limoneux": 0.71,
+            "Calcaire / marneux": 0.67,
+            "Sableux": 0.52,
+            "Rocheux cristallin": 0.38,
+            "Autres lithologies": 0.58,
+            "Pedologie indeterminee": 0.55,
+        }
+
+        self.river_points: List[RiverMonitoringPoint] = [
+            RiverMonitoringPoint("Dordogne", "Dordogne - secteur OA LGV", 44.90, -0.25, None, 3.0, 0.15),
+            RiverMonitoringPoint("Charente", "Charente - secteur Champniers", 45.72, 0.20, None, 2.0, 0.12),
+            RiverMonitoringPoint("Vienne", "Vienne - secteur OA LGV", 46.82, 0.55, None, 2.5, 0.12),
+            RiverMonitoringPoint("Auxance", "Auxance - secteur OA LGV", 46.65, 0.30, None, 1.6, 0.10),
+            RiverMonitoringPoint("Manse", "Manse - secteur OA LGV", 47.15, 0.65, None, 1.4, 0.10),
+        ]
+
+        self.headers = {
+            "User-Agent": "LGV-SEA-Monitor/4.0 (+contact: internal)",
+            "Accept": "application/json",
+            "Accept-Language": "fr-FR,fr;q=0.9",
+        }
+        self.hubeau_base = "https://hubeau.eaufrance.fr/api/v2/hydrometrie"
+        self.hubeau_endpoints = {"observations_tr": "/observations_tr", "stations": "/referentiel/stations"}
+        self.open_meteo_base = "https://api.open-meteo.com/v1/forecast"
+        self.open_meteo_model = "meteofrance_seamless"
+        self.open_meteo_sample_step_km = 3.0
+        self.open_meteo_max_points = 120
+        self.weather_source_mode = str(os.getenv("LGV_WEATHER_SOURCE_MODE", "info_climat")).strip().lower()
+        self.synop_history_days = max(30, min(45, int(os.getenv("LGV_SYNOP_HISTORY_DAYS", "35"))))
+        self.synop_cache_ttl_hours = max(1, min(48, int(os.getenv("LGV_SYNOP_CACHE_TTL_HOURS", "12"))))
+        self.synop_archive_dataset_id = str(os.getenv("LGV_SYNOP_ARCHIVE_DATASET_ID", "686f8595b351c06a3a790867")).strip()
+        self.synop_archive_lookback_days = max(
+            35,
+            min(120, int(os.getenv("LGV_SYNOP_ARCHIVE_LOOKBACK_DAYS", str(max(45, self.synop_history_days + 10))))),
+        )
+        self._synop_archive_urls_by_year: Dict[int, str] = {}
+
+        os.makedirs("data", exist_ok=True)
+        os.makedirs("reports", exist_ok=True)
+        self.synop_cache_dir = os.path.join("data", "synop_cache")
+        os.makedirs(self.synop_cache_dir, exist_ok=True)
+
+        self.session = requests.Session()
+        self.session.headers.update(self.headers)
+        # Ignore broken system proxies by default; opt-in with LGV_REQUESTS_TRUST_ENV=1 if needed.
+        self.session.trust_env = str(os.getenv("LGV_REQUESTS_TRUST_ENV", "0")).strip().lower() in {"1", "true", "yes", "on"}
+
+        self.station_cache_file = os.path.join("data", "river_station_cache.json")
+        self.station_cache = self._load_station_cache()
+        self.soil_cache_file = os.path.join("data", "soil_risk_cache.json")
+        self.piezometer_cache_file = os.path.join("data", "piezometer_cache.json")
+        self.hydro_network_cache_file = os.path.join("data", "hydro_network_cache.json")
+        self.commune_cache_file = os.path.join("data", "commune_cache.json")
+        self.commune_cache = self._load_commune_cache()
+        self.hydro_threshold_cache_file = os.path.join("data", "hydro_threshold_cache.json")
+        self.hydro_threshold_cache = self._load_hydro_threshold_cache()
+        self.lgv_communes_cache_file = os.path.join("data", "lgv_communes_cache.json")
+        self._lithology_index_cache: Optional[Dict[str, Any]] = None
+
+    def _now_utc(self) -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _safe_float(value: Optional[str]) -> Optional[float]:
+        if value is None:
+            return None
+        txt = str(value).strip().replace(",", ".")
+        if not txt or txt.lower() in {"mq", "nan", "none", "///"}:
+            return None
+        try:
+            return float(txt)
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _station_pluvio_class(rain_24h: float, rain_7d: Optional[float], rain_30d: Optional[float]) -> str:
+        r7 = rain_7d if rain_7d is not None else rain_24h
+        r30 = rain_30d if rain_30d is not None else r7
+        if rain_24h >= 120 or r7 >= 180 or r30 >= 300:
+            return "CRITIQUE"
+        if rain_24h >= 80 or r7 >= 120 or r30 >= 220:
+            return "ELEVE"
+        if rain_24h >= 50 or r7 >= 80 or r30 >= 150:
+            return "MODERE"
+        if rain_24h >= 20 or r7 >= 40 or r30 >= 90:
+            return "VIGILANCE"
+        return "NORMAL"
+
+    @staticmethod
+    def _normalize_rain_bundle(
+        rain_instant: Optional[float],
+        rain_12h: Optional[float],
+        rain_24h: Optional[float],
+        rain_7d: Optional[float],
+        rain_30d: Optional[float],
+        rain_month: Optional[float],
+        rain_forecast: Optional[float],
+    ) -> Dict[str, float]:
+        def _to_valid(v: Optional[float]) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                x = float(v)
+            except Exception:
+                return None
+            if not math.isfinite(x):
+                return None
+            if x < 0.0 or x >= 900.0:  # guard common missing/sentinel values
+                return None
+            return x
+
+        r_in = _to_valid(rain_instant)
+        r_12 = _to_valid(rain_12h)
+        r_24 = _to_valid(rain_24h)
+        r_7 = _to_valid(rain_7d)
+        r_30 = _to_valid(rain_30d)
+        r_m = _to_valid(rain_month)
+        r_f = _to_valid(rain_forecast)
+
+        r_in = 0.0 if r_in is None else r_in
+        r_12 = r_in if r_12 is None else r_12
+        r_24 = r_12 if r_24 is None else r_24
+        r_7 = r_24 if r_7 is None else r_7
+        r_30 = r_7 if r_30 is None else r_30
+        r_m = max(r_24, r_30) if r_m is None else max(r_m, r_24)
+        r_f = r_in if r_f is None else r_f
+
+        # Keep cumulative indicators coherent.
+        r_12 = max(r_12, r_in)
+        r_24 = max(r_24, r_12)
+        r_7 = max(r_7, r_24)
+        r_30 = max(r_30, r_7)
+
+        # Plausibility caps; keep conservative fallback behavior.
+        r_in = min(r_in, 250.0)
+        r_12 = min(max(r_12, r_in), 400.0)
+        r_24 = min(max(r_24, r_12), 700.0)
+        r_7 = min(max(r_7, r_24), 2200.0)
+        r_30 = min(max(r_30, r_7), 5000.0)
+        r_m = min(max(r_m, r_24), 5000.0)
+        r_f = min(max(r_f, 0.0), 400.0)
+
+        return {
+            "rain_instant_mm": r_in,
+            "rain_12h_mm": r_12,
+            "rain_24h_mm": r_24,
+            "rain_7d_mm": r_7,
+            "rain_30d_mm": r_30,
+            "rain_month_mm": r_m,
+            "rain_forecast_mm": r_f,
+        }
+
+    @staticmethod
+    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        r = 6371.0
+        p1 = math.radians(lat1)
+        p2 = math.radians(lat2)
+        dlat = math.radians(lat2 - lat1)
+        dlon = math.radians(lon2 - lon1)
+        a = math.sin(dlat / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlon / 2) ** 2
+        return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    @staticmethod
+    def _point_to_segment_distance_km(p_lat: float, p_lon: float, a_lat: float, a_lon: float, b_lat: float, b_lon: float) -> float:
+        mean_lat = math.radians((a_lat + b_lat + p_lat) / 3.0)
+
+        def to_xy(lat: float, lon: float) -> Tuple[float, float]:
+            return lon * 111.320 * math.cos(mean_lat), lat * 110.574
+
+        px, py = to_xy(p_lat, p_lon)
+        ax, ay = to_xy(a_lat, a_lon)
+        bx, by = to_xy(b_lat, b_lon)
+        abx, aby = bx - ax, by - ay
+        apx, apy = px - ax, py - ay
+        ab2 = abx * abx + aby * aby
+        if ab2 == 0:
+            return math.hypot(px - ax, py - ay)
+        t = max(0.0, min(1.0, (apx * abx + apy * aby) / ab2))
+        cx, cy = ax + t * abx, ay + t * aby
+        return math.hypot(px - cx, py - cy)
+
+    def _point_to_lgv_distance_km(self, lat: float, lon: float) -> float:
+        best = float("inf")
+        for pts in self.lgv_lines_latlon:
+            for i in range(len(pts) - 1):
+                a_lat, a_lon = pts[i]
+                b_lat, b_lon = pts[i + 1]
+                best = min(best, self._point_to_segment_distance_km(lat, lon, a_lat, a_lon, b_lat, b_lon))
+        return best
+
+    def _sample_points_along_lgv(self, step_km: float, max_points: int) -> List[Tuple[float, float]]:
+        points: List[Tuple[float, float]] = []
+        for line in self.lgv_lines_latlon:
+            if len(line) < 2:
+                continue
+            for idx in range(len(line) - 1):
+                a_lat, a_lon = line[idx]
+                b_lat, b_lon = line[idx + 1]
+                seg_km = max(self._haversine_km(a_lat, a_lon, b_lat, b_lon), 0.001)
+                count = max(1, int(seg_km / max(step_km, 0.5)))
+                for k in range(count):
+                    t = k / count
+                    lat = a_lat + (b_lat - a_lat) * t
+                    lon = a_lon + (b_lon - a_lon) * t
+                    points.append((lat, lon))
+            points.append(line[-1])
+
+        # Deduplicate lightly by rounded key.
+        dedup = []
+        seen = set()
+        for lat, lon in points:
+            key = (round(lat, 4), round(lon, 4))
+            if key not in seen:
+                seen.add(key)
+                dedup.append((lat, lon))
+        if not dedup:
+            return []
+
+        # Keep a manageable amount of Open-Meteo locations.
+        if len(dedup) > max_points:
+            stride = max(1, len(dedup) // max_points)
+            dedup = dedup[::stride]
+            if dedup[-1] != points[-1]:
+                dedup.append(points[-1])
+        return dedup[:max_points]
+
+    def _representative_lgv_line(self) -> List[Tuple[float, float]]:
+        if not self.lgv_lines_latlon:
+            return list(self.default_lgv_coordinates_latlon)
+        return list(
+            max(
+                self.lgv_lines_latlon,
+                key=lambda line: self._line_length_km(line) if len(line) >= 2 else 0.0,
+            )
+        )
+
+    def _sample_line_with_chainage(
+        self,
+        line: List[Tuple[float, float]],
+        step_km: float,
+    ) -> List[Dict[str, float]]:
+        if len(line) < 2:
+            return []
+
+        vertices: List[Tuple[float, float, float]] = []
+        cumulative = 0.0
+        vertices.append((float(line[0][0]), float(line[0][1]), cumulative))
+        for idx in range(len(line) - 1):
+            a_lat, a_lon = line[idx]
+            b_lat, b_lon = line[idx + 1]
+            cumulative += self._haversine_km(float(a_lat), float(a_lon), float(b_lat), float(b_lon))
+            vertices.append((float(b_lat), float(b_lon), cumulative))
+
+        if cumulative <= 0:
+            return [{"latitude": float(line[0][0]), "longitude": float(line[0][1]), "pk_km": 0.0}]
+
+        targets: List[float] = []
+        step = max(float(step_km), 0.05)
+        cur = 0.0
+        while cur < cumulative:
+            targets.append(round(cur, 6))
+            cur += step
+        targets.append(round(cumulative, 6))
+
+        samples: List[Dict[str, float]] = []
+        seg_idx = 0
+        for target in targets:
+            while seg_idx < len(vertices) - 2 and vertices[seg_idx + 1][2] < target:
+                seg_idx += 1
+
+            lat_a, lon_a, km_a = vertices[seg_idx]
+            lat_b, lon_b, km_b = vertices[seg_idx + 1]
+            denom = max(km_b - km_a, 1e-9)
+            ratio = max(0.0, min(1.0, (target - km_a) / denom))
+            lat = lat_a + (lat_b - lat_a) * ratio
+            lon = lon_a + (lon_b - lon_a) * ratio
+            samples.append(
+                {
+                    "latitude": round(float(lat), 6),
+                    "longitude": round(float(lon), 6),
+                    "pk_km": round(float(target), 3),
+                }
+            )
+        return samples
+
+    def _lgv_lines_fingerprint(self) -> str:
+        chunks: List[str] = []
+        for line in self.lgv_lines_latlon:
+            if not isinstance(line, list):
+                continue
+            chunks.append(str(len(line)))
+            if line:
+                chunks.append(f"{line[0][0]:.5f},{line[0][1]:.5f}")
+                chunks.append(f"{line[-1][0]:.5f},{line[-1][1]:.5f}")
+        return "|".join(chunks)
+
+    def _bbox_from_lgv_lines(self, pad_deg: float = 0.08) -> Tuple[float, float, float, float]:
+        points = [pt for line in self.lgv_lines_latlon for pt in line]
+        if not points:
+            return (-0.8, 44.7, 0.9, 47.5)
+        lats = [lat for lat, _ in points]
+        lons = [lon for _, lon in points]
+        return (
+            min(lons) - pad_deg,
+            min(lats) - pad_deg,
+            max(lons) + pad_deg,
+            max(lats) + pad_deg,
+        )
+
+    def _load_fresh_cache(self, cache_path: str, max_age_hours: int) -> Optional[Dict[str, object]]:
+        if not os.path.exists(cache_path):
+            return None
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return None
+            ts = pd.to_datetime(payload.get("timestamp_utc"), utc=True, errors="coerce")
+            if pd.isna(ts):
+                return None
+            age_h = (self._now_utc() - ts.to_pydatetime()).total_seconds() / 3600.0
+            if age_h > max_age_hours:
+                return None
+            return payload
+        except Exception:
+            return None
+
+    @staticmethod
+    def _pedology_family_from_lithology(descr: str, litho_type: str) -> str:
+        txt = f"{descr} {litho_type}".lower()
+        if any(k in txt for k in ["calcaire", "craie", "dolomie", "marne"]):
+            return "Calcaire / marneux"
+        if "argil" in txt:
+            return "Argileux"
+        if any(k in txt for k in ["sable", "gres"]):
+            return "Sableux"
+        if any(k in txt for k in ["limon", "loess"]):
+            return "Limoneux"
+        if any(k in txt for k in ["alluvion", "alluvial", "grave"]):
+            return "Alluvial"
+        if any(k in txt for k in ["schiste", "gneiss", "granit", "metamorph"]):
+            return "Rocheux cristallin"
+        if txt.strip():
+            return "Autres lithologies"
+        return "Pedologie indeterminee"
+
+    def _parse_brgm_polygon_from_poslist(self, pos_txt: str) -> Optional[object]:
+        if Polygon is None:
+            return None
+        try:
+            vals = [float(x) for x in str(pos_txt).split()]
+        except Exception:
+            return None
+        if len(vals) < 6 or len(vals) % 2 != 0:
+            return None
+
+        coords: List[Tuple[float, float]] = []
+        for i in range(0, len(vals), 2):
+            lat = vals[i]
+            lon = vals[i + 1]
+            coords.append((float(lon), float(lat)))
+
+        if len(coords) < 3:
+            return None
+        try:
+            geom = Polygon(coords)
+            if geom.is_empty:
+                return None
+            if not geom.is_valid:
+                geom = geom.buffer(0)
+            return geom if geom is not None and not geom.is_empty else None
+        except Exception:
+            return None
+
+    def _fetch_brgm_lithology_index(self) -> Dict[str, object]:
+        if self._lithology_index_cache is not None:
+            return self._lithology_index_cache
+        if STRtree is None or Point is None or Polygon is None or MultiPolygon is None:
+            self._lithology_index_cache = {"features": [], "tree": None, "geom_lookup": {}}
+            return self._lithology_index_cache
+
+        min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=0.12)
+        params = {
+            "SERVICE": "WFS",
+            "VERSION": "1.1.0",
+            "REQUEST": "GetFeature",
+            "TYPENAME": "ms:LITHO_1M_SIMPLIFIEE",
+            "SRSNAME": "EPSG:4326",
+            "BBOX": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+            "MAXFEATURES": str(self.pedology_max_features),
+        }
+        try:
+            response = self.session.get(
+                "https://geoservices.brgm.fr/geologie?",
+                params=params,
+                timeout=40,
+            )
+            if response.status_code != 200 or not response.text.strip():
+                self._lithology_index_cache = {"features": [], "tree": None, "geom_lookup": {}}
+                return self._lithology_index_cache
+
+            root = ET.fromstring(response.text)
+            ns = {
+                "ms": "http://mapserver.gis.umn.edu/mapserver",
+                "gml": "http://www.opengis.net/gml",
+            }
+            features: List[Dict[str, object]] = []
+            geometries: List[object] = []
+            for node in root.findall(".//gml:featureMember/ms:LITHO_1M_SIMPLIFIEE", ns):
+                descr = str(node.findtext("ms:DESCR", default="", namespaces=ns) or "").strip()
+                litho_type = str(node.findtext("ms:TYPE", default="", namespaces=ns) or "").strip()
+                code_geol = str(node.findtext("ms:CODE_GEOL", default="", namespaces=ns) or "").strip()
+
+                polys: List[object] = []
+                for pos in node.findall(".//gml:Polygon//gml:exterior/gml:LinearRing/gml:posList", ns):
+                    if pos is None or not str(pos.text or "").strip():
+                        continue
+                    poly = self._parse_brgm_polygon_from_poslist(str(pos.text))
+                    if poly is not None:
+                        polys.append(poly)
+                if not polys:
+                    continue
+
+                try:
+                    geom = polys[0] if len(polys) == 1 else MultiPolygon(polys)
+                except Exception:
+                    continue
+                if geom is None or geom.is_empty:
+                    continue
+
+                pedology_family = self._pedology_family_from_lithology(descr, litho_type)
+                geometries.append(geom)
+                features.append(
+                    {
+                        "geometry": geom,
+                        "descr": descr,
+                        "lithology_type": litho_type,
+                        "code_geol": code_geol,
+                        "pedology_family": pedology_family,
+                    }
+                )
+
+            tree = STRtree(geometries) if geometries else None
+            geom_lookup = {id(g): idx for idx, g in enumerate(geometries)}
+            self._lithology_index_cache = {
+                "features": features,
+                "tree": tree,
+                "geom_lookup": geom_lookup,
+            }
+            return self._lithology_index_cache
+        except Exception:
+            self._lithology_index_cache = {"features": [], "tree": None, "geom_lookup": {}}
+            return self._lithology_index_cache
+
+    def _lookup_pedology_for_point(
+        self,
+        lat: float,
+        lon: float,
+        lithology_index: Dict[str, object],
+    ) -> Dict[str, object]:
+        default = {
+            "pedology_family": "Pedologie indeterminee",
+            "lithology_descr": None,
+            "lithology_type": None,
+            "lithology_code_geol": None,
+        }
+
+        tree = lithology_index.get("tree")
+        features = lithology_index.get("features")
+        geom_lookup = lithology_index.get("geom_lookup")
+        if Point is None or tree is None or not isinstance(features, list):
+            return default
+
+        try:
+            pt = Point(float(lon), float(lat))
+            queried = tree.query(pt)
+        except Exception:
+            return default
+
+        candidates: List[int] = []
+        if isinstance(queried, list):
+            for item in queried:
+                if isinstance(item, numbers.Integral):
+                    candidates.append(int(item))
+                elif isinstance(geom_lookup, dict):
+                    idx = geom_lookup.get(id(item))
+                    if idx is not None:
+                        candidates.append(int(idx))
+        else:
+            try:
+                qlist = list(queried)
+            except Exception:
+                qlist = []
+            for item in qlist:
+                if isinstance(item, numbers.Integral):
+                    candidates.append(int(item))
+                elif isinstance(geom_lookup, dict):
+                    idx = geom_lookup.get(id(item))
+                    if idx is not None:
+                        candidates.append(int(idx))
+
+        best_idx: Optional[int] = None
+        best_dist = float("inf")
+        for idx in candidates:
+            if idx < 0 or idx >= len(features):
+                continue
+            geom = features[idx].get("geometry")
+            if geom is None:
+                continue
+            try:
+                if geom.contains(pt) or geom.touches(pt):
+                    best_idx = idx
+                    best_dist = 0.0
+                    break
+                dist = float(geom.distance(pt))
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx = idx
+            except Exception:
+                continue
+
+        if best_idx is None:
+            return default
+        selected = features[best_idx]
+        return {
+            "pedology_family": selected.get("pedology_family") or "Pedologie indeterminee",
+            "lithology_descr": selected.get("descr"),
+            "lithology_type": selected.get("lithology_type"),
+            "lithology_code_geol": selected.get("code_geol"),
+        }
+
+    def _fetch_rga_for_point(self, lat: float, lon: float) -> Dict[str, object]:
+        try:
+            response = self.session.get(
+                "https://georisques.gouv.fr/api/v1/rga",
+                params={"latlon": f"{lon:.6f},{lat:.6f}"},
+                timeout=20,
+            )
+            if response.status_code != 200 or not response.text.strip():
+                return {}
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return {}
+            return payload
+        except Exception:
+            return {}
+
+    def _fetch_mvt_for_point(self, lat: float, lon: float) -> Dict[str, object]:
+        try:
+            response = self.session.get(
+                "https://georisques.gouv.fr/api/v1/mvt",
+                params={
+                    "latlon": f"{lon:.6f},{lat:.6f}",
+                    "rayon": self.soil_mvt_radius_m,
+                    "page_size": self.soil_mvt_page_size,
+                },
+                timeout=20,
+            )
+            if response.status_code != 200 or not response.text.strip():
+                return {}
+            payload = response.json()
+            if not isinstance(payload, dict):
+                return {}
+            return payload
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _classify_geotechnical_point(rga_code: Optional[int], mvt_count: int) -> Dict[str, object]:
+        if mvt_count >= 4 or (rga_code == 3 and mvt_count >= 2):
+            return {"risk_level": "CRITIQUE", "color": "#7f1d1d", "score": 4}
+        if rga_code == 3 or mvt_count >= 1:
+            return {"risk_level": "ELEVE", "color": "#b91c1c", "score": 3}
+        if rga_code == 2:
+            return {"risk_level": "MODERE", "color": "#d97706", "score": 2}
+        if rga_code == 1:
+            return {"risk_level": "FAIBLE", "color": "#16a34a", "score": 1}
+        return {"risk_level": "INDETERMINE", "color": "#6b7280", "score": 1}
+
+    @staticmethod
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    def _soil_fragility_from_geotech_point(self, point: Dict[str, object]) -> float:
+        pedology = str(point.get("pedology_family") or "Pedologie indeterminee")
+        base_pedology = float(
+            self.pedology_fragility_index.get(
+                pedology,
+                self.pedology_fragility_index.get("Pedologie indeterminee", 0.55),
+            )
+        )
+
+        try:
+            rga_code = int(point.get("rga_code")) if point.get("rga_code") is not None else 0
+        except Exception:
+            rga_code = 0
+        rga_component = {3: 1.0, 2: 0.75, 1: 0.55}.get(int(rga_code), 0.40)
+
+        try:
+            risk_score = float(point.get("risk_score", 1) or 1)
+        except Exception:
+            risk_score = 1.0
+        risk_component = self._clamp01(risk_score / 4.0)
+
+        try:
+            mvt_count = float(point.get("mvt_count", 0) or 0.0)
+        except Exception:
+            mvt_count = 0.0
+        mvt_component = self._clamp01(mvt_count / 5.0)
+
+        soil_txt = f"{point.get('soil_type', '')} {pedology}".lower()
+        fragile_bonus = 0.0
+        if "argile" in soil_txt:
+            fragile_bonus += 0.12
+        if any(token in soil_txt for token in ["alluvial", "alluvion"]):
+            fragile_bonus += 0.08
+        if "limon" in soil_txt:
+            fragile_bonus += 0.04
+
+        fragility = (
+            0.36 * base_pedology
+            + 0.28 * rga_component
+            + 0.18 * risk_component
+            + 0.18 * mvt_component
+            + fragile_bonus
+        )
+        return self._clamp01(fragility)
+
+    def _build_sector_soil_context(
+        self,
+        lat: float,
+        lon: float,
+        near_geo: List[Dict[str, object]],
+        all_geo: List[Dict[str, object]],
+    ) -> Dict[str, object]:
+        selected = list(near_geo)
+        source = "local_geotech"
+        if not selected and all_geo:
+            sorted_all = sorted(
+                all_geo,
+                key=lambda g: self._haversine_km(
+                    lat,
+                    lon,
+                    float(g.get("latitude", lat) or lat),
+                    float(g.get("longitude", lon) or lon),
+                ),
+            )
+            selected = sorted_all[:3]
+            source = "nearest_geotech_fallback"
+
+        if not selected:
+            return {
+                "source": "no_geotech_data",
+                "used_points": 0,
+                "soil_fragility": 0.55,
+                "dominant_pedology": "Pedologie indeterminee",
+                "dominant_soil_type": "Sols indetermines",
+                "has_fragile_soils": False,
+            }
+
+        pedology_counts: Dict[str, int] = {}
+        soil_type_counts: Dict[str, int] = {}
+        fragilities: List[float] = []
+        for point in selected:
+            ped = str(point.get("pedology_family") or "Pedologie indeterminee")
+            pedology_counts[ped] = pedology_counts.get(ped, 0) + 1
+            soil_t = str(point.get("soil_type") or "Sols indetermines")
+            soil_type_counts[soil_t] = soil_type_counts.get(soil_t, 0) + 1
+            fragilities.append(self._soil_fragility_from_geotech_point(point))
+
+        dominant_pedology = max(pedology_counts.items(), key=lambda item: item[1])[0] if pedology_counts else "Pedologie indeterminee"
+        dominant_soil_type = max(soil_type_counts.items(), key=lambda item: item[1])[0] if soil_type_counts else "Sols indetermines"
+
+        mean_fragility = sum(fragilities) / len(fragilities)
+        max_fragility = max(fragilities)
+        fragility = self._clamp01(0.40 * mean_fragility + 0.60 * max_fragility)
+        has_fragile = bool(
+            fragility >= 0.70
+            or ("argile" in dominant_soil_type.lower())
+            or (dominant_pedology in {"Argileux", "Alluvial"})
+        )
+
+        return {
+            "source": source,
+            "used_points": int(len(selected)),
+            "soil_fragility": round(float(fragility), 4),
+            "dominant_pedology": dominant_pedology,
+            "dominant_soil_type": dominant_soil_type,
+            "has_fragile_soils": has_fragile,
+        }
+
+    def _predict_sector_ai_risk(
+        self,
+        max24_mm: float,
+        max7_mm: float,
+        max30_mm: float,
+        maxmonth_mm: float,
+        weather_score: int,
+        geotech_score: int,
+        piezo_score: int,
+        hydro_score: int,
+        soil_context: Dict[str, object],
+    ) -> Dict[str, object]:
+        rain_24h = self._clamp01(max24_mm / 120.0)
+        rain_7d = self._clamp01(max7_mm / 180.0)
+        rain_30d = self._clamp01(max30_mm / 300.0)
+        rain_month = self._clamp01(maxmonth_mm / 240.0)
+        rain_pressure = self._clamp01(0.45 * rain_24h + 0.30 * rain_7d + 0.20 * rain_30d + 0.05 * rain_month)
+
+        soil_fragility = self._clamp01(float(soil_context.get("soil_fragility", 0.55) or 0.55))
+        geotech_pressure = self._clamp01(float(geotech_score) / 4.0)
+        piezo_pressure = self._clamp01(float(piezo_score) / 4.0)
+        hydro_pressure = self._clamp01(float(hydro_score) / 4.0)
+        weather_pressure = self._clamp01(float(weather_score) / 4.0)
+        rain_soil_interaction = self._clamp01(rain_pressure * soil_fragility)
+
+        linear = (
+            -2.20
+            + 2.60 * rain_pressure
+            + 2.30 * soil_fragility
+            + 1.70 * rain_soil_interaction
+            + 0.55 * geotech_pressure
+            + 0.30 * hydro_pressure
+            + 0.22 * piezo_pressure
+            + 0.28 * weather_pressure
+        )
+        probability = 1.0 / (1.0 + math.exp(-linear))
+        probability = self._clamp01(probability)
+        score = round(1.0 + 3.0 * probability, 2)
+
+        if probability >= 0.85:
+            level = "CRITIQUE"
+            color = "#7f1d1d"
+        elif probability >= 0.65:
+            level = "ELEVE"
+            color = "#dc2626"
+        elif probability >= 0.40:
+            level = "MODERE"
+            color = "#ea580c"
+        else:
+            level = "FAIBLE"
+            color = "#16a34a"
+
+        weather_cov = 1.0 if max(max24_mm, max7_mm, max30_mm, maxmonth_mm) > 0.0 else 0.45
+        soil_source = str(soil_context.get("source") or "")
+        if soil_source == "local_geotech":
+            soil_cov = 1.0
+        elif soil_source == "nearest_geotech_fallback":
+            soil_cov = 0.72
+        else:
+            soil_cov = 0.45
+        confidence = self._clamp01(0.58 * weather_cov + 0.42 * soil_cov)
+
+        driver_values = [
+            ("pluie_24h", rain_24h),
+            ("cumul_7j", rain_7d),
+            ("fragilite_sol", soil_fragility),
+            ("interaction_pluie_sol", rain_soil_interaction),
+            ("signal_geotech", geotech_pressure),
+            ("signal_hydro", hydro_pressure),
+            ("signal_nappes", piezo_pressure),
+        ]
+        top_factors = [
+            name for name, value in sorted(driver_values, key=lambda x: x[1], reverse=True)[:3] if value >= 0.20
+        ]
+        if not top_factors:
+            top_factors = ["signal_faible"]
+
+        return {
+            "model_name": self.ai_model_name,
+            "model_version": self.ai_model_version,
+            "risk_level": level,
+            "risk_color": color,
+            "score": score,
+            "probability": round(float(probability), 4),
+            "confidence": round(float(confidence), 4),
+            "rain_pressure": round(float(rain_pressure), 4),
+            "soil_fragility": round(float(soil_fragility), 4),
+            "top_factors": top_factors,
+        }
+
+    def fetch_geotechnical_context(self) -> Dict[str, object]:
+        cached = self._load_fresh_cache(self.soil_cache_file, self.soil_cache_hours)
+        if cached:
+            pts = cached.get("points")
+            if isinstance(pts, list) and pts:
+                sample = pts[0] if isinstance(pts[0], dict) else {}
+                if isinstance(sample, dict) and ("pedology_family" in sample or "lithology_descr" in sample):
+                    return cached
+            elif isinstance(cached.get("summary"), dict) and "pedology_counts" in cached.get("summary", {}):
+                return cached
+
+        sampled = self._sample_points_along_lgv(self.soil_sample_step_km, self.soil_max_points)
+        lithology_index = self._fetch_brgm_lithology_index()
+        points: List[Dict[str, object]] = []
+
+        for idx, (lat, lon) in enumerate(sampled, start=1):
+            rga = self._fetch_rga_for_point(lat, lon)
+            mvt = self._fetch_mvt_for_point(lat, lon)
+            pedology = self._lookup_pedology_for_point(lat, lon, lithology_index)
+
+            code_raw = rga.get("codeExposition")
+            try:
+                rga_code = int(str(code_raw)) if code_raw is not None else None
+            except Exception:
+                rga_code = None
+            rga_label = str(rga.get("exposition") or "Indetermine")
+
+            mvt_count = 0
+            mvt_data = []
+            if isinstance(mvt, dict):
+                try:
+                    mvt_count = int(mvt.get("results") or 0)
+                except Exception:
+                    mvt_count = 0
+                if isinstance(mvt.get("data"), list):
+                    mvt_data = mvt.get("data") or []
+            strong_count = sum(1 for item in mvt_data if str(item.get("fiabilite", "")).lower().startswith("fort"))
+            top_types = []
+            for item in mvt_data[:3]:
+                t = item.get("type")
+                if t:
+                    top_types.append(str(t))
+
+            cls = self._classify_geotechnical_point(rga_code, mvt_count)
+            soil_type = "Sols non argileux dominants"
+            if rga_code == 3:
+                soil_type = "Argiles a forte exposition retrait-gonflement"
+            elif rga_code == 2:
+                soil_type = "Argiles a exposition moyenne retrait-gonflement"
+            elif rga_code == 1:
+                soil_type = "Argiles a faible exposition retrait-gonflement"
+
+            points.append(
+                {
+                    "point_id": idx,
+                    "latitude": round(float(lat), 6),
+                    "longitude": round(float(lon), 6),
+                    "rga_code": rga_code,
+                    "rga_label": rga_label,
+                    "soil_type": soil_type,
+                    "pedology_family": pedology.get("pedology_family"),
+                    "lithology_descr": pedology.get("lithology_descr"),
+                    "lithology_type": pedology.get("lithology_type"),
+                    "lithology_code_geol": pedology.get("lithology_code_geol"),
+                    "mvt_count": int(mvt_count),
+                    "mvt_strong_count": int(strong_count),
+                    "mvt_top_types": top_types,
+                    "risk_level": cls["risk_level"],
+                    "risk_color": cls["color"],
+                    "risk_score": cls["score"],
+                }
+            )
+
+        critical_points = sum(1 for p in points if p["risk_level"] == "CRITIQUE")
+        high_points = sum(1 for p in points if p["risk_level"] == "ELEVE")
+        moderate_points = sum(1 for p in points if p["risk_level"] == "MODERE")
+        low_points = sum(1 for p in points if p["risk_level"] == "FAIBLE")
+        unknown_points = sum(1 for p in points if p["risk_level"] == "INDETERMINE")
+        pedology_counts: Dict[str, int] = {}
+        for p in points:
+            fam = str(p.get("pedology_family") or "Pedologie indeterminee")
+            pedology_counts[fam] = pedology_counts.get(fam, 0) + 1
+
+        alerts = []
+        hot = [p for p in points if p["risk_level"] in {"CRITIQUE", "ELEVE"}]
+        hot = sorted(hot, key=lambda x: (x["risk_score"], x["mvt_count"], x.get("rga_code") or 0), reverse=True)
+        for p in hot[:8]:
+            alerts.append(
+                {
+                    "type": "GEOTECH",
+                    "level": "ELEVE" if p["risk_level"] == "ELEVE" else "CRITIQUE",
+                    "message": (
+                        f"PK echantillon #{p['point_id']}: {p['soil_type']} | "
+                        f"RGA={p['rga_label']} | MVT proches={p['mvt_count']} | Pedologie={p.get('pedology_family')}"
+                    ),
+                }
+            )
+
+        payload = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "sample_step_km": self.soil_sample_step_km,
+            "sample_count": len(points),
+            "source": "georisques_api_v1_rga_mvt + brgm_wfs_litho_1m",
+            "summary": {
+                "critical_points": critical_points,
+                "high_points": high_points,
+                "moderate_points": moderate_points,
+                "low_points": low_points,
+                "unknown_points": unknown_points,
+                "pedology_counts": pedology_counts,
+            },
+            "alerts": alerts,
+            "points": points,
+        }
+        self._save_json(payload, self.soil_cache_file)
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(payload, os.path.join("data", f"soil_risk_{ts}.json"))
+        return payload
+
+    def _fetch_piezometer_chronicles(self, code_bss: str, days: int) -> pd.DataFrame:
+        start = (self._now_utc() - timedelta(days=days)).strftime("%Y-%m-%d")
+        response = self.session.get(
+            "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/chroniques",
+            params={"code_bss": code_bss, "date_debut_mesure": start, "sort": "desc", "size": 12},
+            timeout=25,
+        )
+        if response.status_code not in {200, 206}:
+            return pd.DataFrame()
+        payload = response.json()
+        rows = []
+        for item in payload.get("data", []):
+            dt = pd.to_datetime(item.get("date_mesure"), utc=True, errors="coerce")
+            depth = self._safe_float(item.get("profondeur_nappe"))
+            level = self._safe_float(item.get("niveau_nappe_eau"))
+            if pd.isna(dt):
+                continue
+            if depth is None and level is None:
+                continue
+            rows.append(
+                {
+                    "date_mesure": dt,
+                    "depth_m": depth,
+                    "level_mngf": level,
+                    "qualification": item.get("qualification"),
+                    "statut": item.get("statut"),
+                }
+            )
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows).sort_values("date_mesure", ascending=False)
+        return df
+
+    @staticmethod
+    def _classify_piezometer_risk(depth_m: Optional[float], trend_depth_mpd: Optional[float]) -> Dict[str, object]:
+        if depth_m is None:
+            risk = "INDETERMINE"
+            color = "#6b7280"
+        elif depth_m <= 1.0:
+            risk = "TRES_ELEVE"
+            color = "#dc2626"
+        elif depth_m <= 2.0:
+            risk = "ELEVE"
+            color = "#ea580c"
+        elif depth_m <= 3.0:
+            risk = "MODERE"
+            color = "#eab308"
+        else:
+            risk = "FAIBLE"
+            color = "#2563eb"
+
+        alerts = []
+        if depth_m is not None and depth_m <= 1.5:
+            alerts.append(f"Nappe tres proche du sol ({depth_m:.2f} m)")
+        if trend_depth_mpd is not None and trend_depth_mpd <= -0.12:
+            alerts.append(f"Remontee rapide de la nappe ({trend_depth_mpd:.2f} m/j)")
+            if risk == "FAIBLE":
+                risk, color = "MODERE", "#eab308"
+            elif risk == "MODERE":
+                risk, color = "ELEVE", "#ea580c"
+        return {"risk_level": risk, "color": color, "alert_reasons": alerts}
+
+    def fetch_piezometers_near_lgv(self) -> Dict[str, object]:
+        cached = self._load_fresh_cache(self.piezometer_cache_file, self.piezometer_cache_hours)
+        if cached:
+            return cached
+
+        min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=0.08)
+        bbox = f"{min_lon},{min_lat},{max_lon},{max_lat}"
+        stations_raw: List[Dict[str, object]] = []
+        page = 1
+        while page <= 4:
+            response = self.session.get(
+                "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/stations",
+                params={"bbox": bbox, "page": page, "size": 2000},
+                timeout=25,
+            )
+            if response.status_code not in {200, 206}:
+                break
+            payload = response.json()
+            rows = payload.get("data", [])
+            if not rows:
+                break
+            stations_raw.extend(rows)
+            if not payload.get("next"):
+                break
+            page += 1
+
+        candidates = []
+        for item in stations_raw:
+            code_bss = item.get("code_bss")
+            lat = self._safe_float(item.get("y"))
+            lon = self._safe_float(item.get("x"))
+            if not code_bss or lat is None or lon is None:
+                continue
+            dist = self._point_to_lgv_distance_km(float(lat), float(lon))
+            if dist > self.piezometer_corridor_km:
+                continue
+            candidates.append(
+                {
+                    "code_bss": str(code_bss),
+                    "name": str(item.get("libelle_pe") or code_bss),
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "distance_to_lgv_km": round(float(dist), 3),
+                }
+            )
+
+        candidates = sorted(candidates, key=lambda x: x["distance_to_lgv_km"])[: self.piezometer_max_stations]
+        stations = []
+        alerts = []
+        for item in candidates:
+            obs = self._fetch_piezometer_chronicles(item["code_bss"], self.piezometer_history_days)
+            if obs.empty:
+                continue
+
+            latest = obs.iloc[0]
+            oldest = obs.iloc[-1]
+            latest_depth = latest.get("depth_m")
+            latest_level = latest.get("level_mngf")
+            dt_days = max((latest["date_mesure"] - oldest["date_mesure"]).total_seconds() / 86400.0, 0.0)
+
+            trend_depth_mpd: Optional[float] = None
+            if dt_days > 0 and pd.notna(latest_depth) and pd.notna(oldest.get("depth_m")):
+                trend_depth_mpd = float(latest_depth - oldest.get("depth_m")) / dt_days
+
+            cls = self._classify_piezometer_risk(latest_depth, trend_depth_mpd)
+            station = {
+                **item,
+                "last_date_utc": latest["date_mesure"].isoformat(),
+                "depth_m": None if pd.isna(latest_depth) else round(float(latest_depth), 3),
+                "level_mngf": None if pd.isna(latest_level) else round(float(latest_level), 3),
+                "trend_depth_mpd": None if trend_depth_mpd is None else round(float(trend_depth_mpd), 3),
+                "risk_level": cls["risk_level"],
+                "risk_color": cls["color"],
+                "alert_reasons": cls["alert_reasons"],
+                "n_obs": int(len(obs)),
+                "source": "hubeau_niveaux_nappes",
+            }
+            stations.append(station)
+            if station["alert_reasons"]:
+                alerts.append(
+                    {
+                        "type": "NAPPE",
+                        "level": "ELEVE" if station["risk_level"] in {"ELEVE", "TRES_ELEVE"} else "MODERE",
+                        "message": f"{station['code_bss']} ({station['name']}): " + " | ".join(station["alert_reasons"]),
+                    }
+                )
+
+        summary = {
+            "stations_in_corridor": int(len(candidates)),
+            "stations_with_data": int(len(stations)),
+            "very_high_risk": int(sum(1 for s in stations if s["risk_level"] == "TRES_ELEVE")),
+            "high_risk": int(sum(1 for s in stations if s["risk_level"] == "ELEVE")),
+            "moderate_risk": int(sum(1 for s in stations if s["risk_level"] == "MODERE")),
+            "rapid_rise_alerts": int(sum(1 for s in stations if s["trend_depth_mpd"] is not None and s["trend_depth_mpd"] <= -0.12)),
+        }
+
+        payload = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "corridor_km": self.piezometer_corridor_km,
+            "max_stations": self.piezometer_max_stations,
+            "source": "hubeau_niveaux_nappes",
+            "summary": summary,
+            "alerts": alerts[:10],
+            "stations": stations,
+        }
+        self._save_json(payload, self.piezometer_cache_file)
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(payload, os.path.join("data", f"piezometers_{ts}.json"))
+        return payload
+
+    def _save_json(self, obj: Dict, path: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+
+    def _load_station_cache(self) -> Dict[str, Dict[str, object]]:
+        if not os.path.exists(self.station_cache_file):
+            return {}
+        try:
+            with open(self.station_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_station_cache(self) -> None:
+        self._save_json(self.station_cache, self.station_cache_file)
+
+    def _load_commune_cache(self) -> Dict[str, Dict[str, object]]:
+        if not os.path.exists(self.commune_cache_file):
+            return {}
+        try:
+            with open(self.commune_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_commune_cache(self) -> None:
+        self._save_json(self.commune_cache, self.commune_cache_file)
+
+    def _load_hydro_threshold_cache(self) -> Dict[str, Dict[str, object]]:
+        if not os.path.exists(self.hydro_threshold_cache_file):
+            return {}
+        try:
+            with open(self.hydro_threshold_cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_hydro_threshold_cache(self) -> None:
+        self._save_json(self.hydro_threshold_cache, self.hydro_threshold_cache_file)
+
+    def _fetch_hydroportal_thresholds(self, station_code: str) -> Dict[str, object]:
+        code = str(station_code or "").replace(" ", "")
+        if not code:
+            return {}
+
+        cached = self.hydro_threshold_cache.get(code)
+        if isinstance(cached, dict):
+            ts = pd.to_datetime(cached.get("fetched_at_utc"), utc=True, errors="coerce")
+            if not pd.isna(ts):
+                age_h = (self._now_utc() - ts.to_pydatetime()).total_seconds() / 3600.0
+                if age_h <= self.hydro_threshold_cache_hours:
+                    return cached
+
+        url = f"https://hydro.eaufrance.fr/stationhydro/{code}/seuils"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        try:
+            response = self.session.get(url, headers=headers, timeout=25)
+            if response.status_code != 200 or not response.text.strip():
+                return {}
+
+            html_txt = response.text
+            if "Aucun seuil sur cette entité" in html_txt:
+                payload = {
+                    "fetched_at_utc": self._now_utc().isoformat(),
+                    "station_code": code,
+                    "source_url": url,
+                    "threshold_values_m": [],
+                    "watch_threshold_m": None,
+                    "emergency_threshold_m": None,
+                    "has_thresholds": False,
+                }
+                self.hydro_threshold_cache[code] = payload
+                self._save_hydro_threshold_cache()
+                return payload
+
+            source_unit_h = "mm"
+            user_unit_h = "m"
+            cfg_match = re.search(r'data-config="([^"]+)"', html_txt)
+            if cfg_match:
+                try:
+                    cfg_obj = json.loads(html.unescape(cfg_match.group(1)))
+                    source_unit_h = str(cfg_obj.get("sourceUnitH") or source_unit_h).strip().lower()
+                    user_unit_h = str(cfg_obj.get("userUnitH") or user_unit_h).strip().lower()
+                except Exception:
+                    pass
+
+            factor_to_m = 1.0
+            if source_unit_h == "mm":
+                factor_to_m = 1.0 / 1000.0
+            elif source_unit_h == "cm":
+                factor_to_m = 1.0 / 100.0
+            elif source_unit_h in {"m", "meter", "metre"}:
+                factor_to_m = 1.0
+            elif source_unit_h in {"dm"}:
+                factor_to_m = 1.0 / 10.0
+
+            if user_unit_h == "m":
+                pass
+
+            values_m: List[float] = []
+            raw_matches = re.findall(r'data-threshold-values="([^"]+)"', html_txt)
+            if not raw_matches:
+                raw_matches = re.findall(r'data-thresholds-values="([^"]+)"', html_txt)
+            for raw in raw_matches:
+                try:
+                    decoded = html.unescape(raw)
+                    arr = json.loads(decoded)
+                except Exception:
+                    continue
+                if not isinstance(arr, list):
+                    continue
+                for item in arr:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("deactivationDate"):
+                        continue
+                    val = self._safe_float(item.get("value"))
+                    if val is None:
+                        continue
+                    values_m.append(round(float(val) * factor_to_m, 4))
+
+            uniq_values = sorted({float(v) for v in values_m if v is not None})
+            payload = {
+                "fetched_at_utc": self._now_utc().isoformat(),
+                "station_code": code,
+                "source_url": url,
+                "threshold_values_m": uniq_values,
+                "watch_threshold_m": min(uniq_values) if uniq_values else None,
+                "emergency_threshold_m": max(uniq_values) if uniq_values else None,
+                "has_thresholds": bool(uniq_values),
+                "source_unit_h": source_unit_h,
+                "user_unit_h": user_unit_h,
+            }
+            self.hydro_threshold_cache[code] = payload
+            self._save_hydro_threshold_cache()
+            return payload
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _commune_cache_key(lat: float, lon: float) -> str:
+        return f"{round(float(lat), 4)},{round(float(lon), 4)}"
+
+    def _resolve_commune_for_point(self, lat: float, lon: float) -> Dict[str, object]:
+        key = self._commune_cache_key(lat, lon)
+        cached = self.commune_cache.get(key)
+        if isinstance(cached, dict) and cached.get("commune_name"):
+            return cached
+
+        info: Dict[str, object] = {
+            "commune_name": "Inconnue",
+            "commune_code": None,
+            "departement_code": None,
+            "departement_name": None,
+        }
+        try:
+            response = self.session.get(
+                "https://geo.api.gouv.fr/communes",
+                params={
+                    "lat": f"{lat:.6f}",
+                    "lon": f"{lon:.6f}",
+                    "fields": "nom,code,departement",
+                    "format": "json",
+                    "geometry": "centre",
+                },
+                timeout=15,
+            )
+            if response.status_code == 200 and response.text.strip():
+                payload = response.json()
+                if isinstance(payload, list) and payload:
+                    first = payload[0] if isinstance(payload[0], dict) else {}
+                    dep = first.get("departement") if isinstance(first.get("departement"), dict) else {}
+                    info = {
+                        "commune_name": first.get("nom") or "Inconnue",
+                        "commune_code": first.get("code"),
+                        "departement_code": dep.get("code"),
+                        "departement_name": dep.get("nom"),
+                    }
+        except Exception:
+            pass
+
+        self.commune_cache[key] = info
+        self._save_commune_cache()
+        return info
+
+    def _enrich_weather_with_communes(self, weather_df: pd.DataFrame) -> pd.DataFrame:
+        if not isinstance(weather_df, pd.DataFrame) or weather_df.empty:
+            return weather_df
+        out = weather_df.copy()
+        out["station_commune_name"] = None
+        out["station_commune_code"] = None
+        out["station_departement_code"] = None
+        out["station_departement_name"] = None
+
+        for idx, row in out.iterrows():
+            lat = self._safe_float(row.get("latitude"))
+            lon = self._safe_float(row.get("longitude"))
+            if lat is None or lon is None:
+                continue
+            info = self._resolve_commune_for_point(float(lat), float(lon))
+            out.at[idx, "station_commune_name"] = info.get("commune_name")
+            out.at[idx, "station_commune_code"] = info.get("commune_code")
+            out.at[idx, "station_departement_code"] = info.get("departement_code")
+            out.at[idx, "station_departement_name"] = info.get("departement_name")
+        return out
+
+    def _load_communes_department_features(self, dep_code: str) -> List[Dict[str, object]]:
+        dep = str(dep_code).strip()
+        if not dep:
+            return []
+        cache_file = os.path.join("data", f"communes_dep_{dep}.json")
+        cached = self._load_fresh_cache(cache_file, self.lgv_communes_cache_days * 24)
+        if cached and isinstance(cached.get("features"), list):
+            return cached.get("features", [])
+
+        try:
+            response = self.session.get(
+                f"https://geo.api.gouv.fr/departements/{dep}/communes",
+                params={
+                    "fields": "nom,code,departement",
+                    "format": "geojson",
+                    "geometry": "contour",
+                },
+                timeout=40,
+            )
+            if response.status_code != 200 or not response.text.strip():
+                return []
+            payload = response.json()
+            features = payload.get("features", []) if isinstance(payload, dict) else []
+            if not isinstance(features, list):
+                return []
+            wrapped = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "departement_code": dep,
+                "features": features,
+            }
+            self._save_json(wrapped, cache_file)
+            return features
+        except Exception:
+            return []
+
+    def _discover_lgv_departements(self, lines: List[List[Tuple[float, float]]]) -> List[str]:
+        deps: List[str] = []
+        seen = set()
+        for dep in self.lgv_reference_departements:
+            dep_txt = str(dep).strip()
+            if dep_txt and dep_txt not in seen:
+                seen.add(dep_txt)
+                deps.append(dep_txt)
+
+        step_km = max(float(self.lgv_commune_dep_discovery_step_km), self.lgv_commune_sample_step_km, 0.2)
+        raw_samples: List[Dict[str, float]] = []
+        for line in lines:
+            if not isinstance(line, list) or len(line) < 2:
+                continue
+            raw_samples.extend(self._sample_line_with_chainage(line, step_km))
+
+        if len(raw_samples) > self.lgv_commune_dep_discovery_limit:
+            stride = max(1, len(raw_samples) // self.lgv_commune_dep_discovery_limit)
+            sampled = raw_samples[::stride]
+            if sampled[-1] != raw_samples[-1]:
+                sampled.append(raw_samples[-1])
+            raw_samples = sampled
+
+        for sample in raw_samples:
+            lat = self._safe_float(sample.get("latitude"))
+            lon = self._safe_float(sample.get("longitude"))
+            if lat is None or lon is None:
+                continue
+            info = self._resolve_commune_for_point(float(lat), float(lon))
+            dep_txt = str(info.get("departement_code") or "").strip()
+            if dep_txt and dep_txt not in seen:
+                seen.add(dep_txt)
+                deps.append(dep_txt)
+
+        return deps
+
+    def _build_lgv_communes_catalog(self) -> Dict[str, object]:
+        required_catalog_version = 5
+        cached = self._load_fresh_cache(self.lgv_communes_cache_file, self.lgv_communes_cache_days * 24)
+        current_fingerprint = self._lgv_lines_fingerprint()
+        if isinstance(cached, dict) and str(cached.get("lgv_fingerprint") or "") == current_fingerprint:
+            summary = cached.get("summary") if isinstance(cached.get("summary"), dict) else {}
+            has_geojson = False
+            geo = cached.get("communes_geojson")
+            if isinstance(geo, dict) and isinstance(geo.get("features"), list) and len(geo.get("features", [])) > 0:
+                has_geojson = True
+            cached_version = int(cached.get("catalog_version", 1) or 1)
+            if int(summary.get("commune_count", 0) or 0) > 0 and has_geojson and cached_version >= required_catalog_version:
+                return cached
+
+        if STRtree is None or Point is None or shape is None:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "shapely_non_disponible"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        lines_for_catalog = [list(line) for line in self.lgv_lines_latlon if isinstance(line, list) and len(line) >= 2]
+        if not lines_for_catalog:
+            line = self._representative_lgv_line()
+            if len(line) >= 2:
+                lines_for_catalog = [line]
+
+        if not lines_for_catalog:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "ligne_lgv_vide"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        line = max(lines_for_catalog, key=lambda coords: self._line_length_km(coords))
+        samples = self._sample_line_with_chainage(line, self.lgv_commune_sample_step_km)
+        if not samples:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "ligne_lgv_vide"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        departements_catalog = self._discover_lgv_departements(lines_for_catalog)
+
+        entries: List[Dict[str, object]] = []
+        geometries: List[object] = []
+        for dep in departements_catalog:
+            for feat in self._load_communes_department_features(dep):
+                if not isinstance(feat, dict):
+                    continue
+                props = feat.get("properties") if isinstance(feat.get("properties"), dict) else {}
+                geom_raw = feat.get("geometry")
+                if not isinstance(geom_raw, dict):
+                    continue
+                try:
+                    geom = shape(geom_raw)
+                except Exception:
+                    continue
+                if geom is None or geom.is_empty:
+                    continue
+                if not geom.is_valid:
+                    try:
+                        geom = geom.buffer(0)
+                    except Exception:
+                        continue
+                if geom is None or geom.is_empty:
+                    continue
+
+                dep_meta = props.get("departement") if isinstance(props.get("departement"), dict) else {}
+                try:
+                    centroid = geom.centroid
+                    c_lat = float(centroid.y)
+                    c_lon = float(centroid.x)
+                except Exception:
+                    c_lat = None
+                    c_lon = None
+
+                entries.append(
+                    {
+                        "geometry": geom,
+                        "geometry_geojson": geom_raw if isinstance(geom_raw, dict) else None,
+                        "commune_name": str(props.get("nom") or "Inconnue"),
+                        "commune_code": str(props.get("code") or ""),
+                        "departement_code": str(dep_meta.get("code") or dep),
+                        "departement_name": str(dep_meta.get("nom") or ""),
+                        "centroid_latitude": c_lat,
+                        "centroid_longitude": c_lon,
+                    }
+                )
+                geometries.append(geom)
+
+        if not geometries:
+            payload = {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "catalog_version": required_catalog_version,
+                "lgv_fingerprint": current_fingerprint,
+                "sample_step_km": self.lgv_commune_sample_step_km,
+                "source": "geo_api_gouv_communes",
+                "summary": {"error": "contours_communes_indisponibles"},
+                "communes": [],
+            }
+            self._save_json(payload, self.lgv_communes_cache_file)
+            return payload
+
+        tree = STRtree(geometries)
+        geom_lookup = {id(g): idx for idx, g in enumerate(geometries)}
+        seen: Dict[str, Dict[str, object]] = {}
+        traversal_order: List[str] = []
+
+        for sample in samples:
+            lat = float(sample.get("latitude"))
+            lon = float(sample.get("longitude"))
+            pk = float(sample.get("pk_km"))
+            pt = Point(lon, lat)
+            queried = tree.query(pt)
+            candidates: List[int] = []
+            if isinstance(queried, list):
+                for item in queried:
+                    if isinstance(item, numbers.Integral):
+                        candidates.append(int(item))
+                    else:
+                        idx = geom_lookup.get(id(item))
+                        if idx is not None:
+                            candidates.append(int(idx))
+            else:
+                try:
+                    for item in list(queried):
+                        if isinstance(item, numbers.Integral):
+                            candidates.append(int(item))
+                        else:
+                            idx = geom_lookup.get(id(item))
+                            if idx is not None:
+                                candidates.append(int(idx))
+                except Exception:
+                    candidates = []
+
+            selected_idx: Optional[int] = None
+            for idx in candidates:
+                if idx < 0 or idx >= len(entries):
+                    continue
+                geom = entries[idx].get("geometry")
+                if geom is None:
+                    continue
+                try:
+                    if geom.contains(pt) or geom.touches(pt):
+                        selected_idx = idx
+                        break
+                except Exception:
+                    continue
+            if selected_idx is None:
+                continue
+
+            meta = entries[selected_idx]
+            code = str(meta.get("commune_code") or "")
+            if not code:
+                continue
+            if code not in seen:
+                seen[code] = {
+                    "commune_name": meta.get("commune_name"),
+                    "commune_code": code,
+                    "departement_code": meta.get("departement_code"),
+                    "departement_name": meta.get("departement_name"),
+                    "pk_start_km": pk,
+                    "pk_end_km": pk,
+                    "sample_count": 0,
+                    "centroid_latitude": meta.get("centroid_latitude"),
+                    "centroid_longitude": meta.get("centroid_longitude"),
+                    "geometry_geojson": meta.get("geometry_geojson"),
+                }
+                traversal_order.append(code)
+
+            row = seen[code]
+            row["pk_start_km"] = round(min(float(row["pk_start_km"]), pk), 3)
+            row["pk_end_km"] = round(max(float(row["pk_end_km"]), pk), 3)
+            row["sample_count"] = int(row.get("sample_count", 0)) + 1
+
+        line_geom = None
+        line_capture_source = None
+        line_capture_geom = None
+        if LineString is not None and line and len(line) >= 2:
+            try:
+                line_geom = LineString([(float(lon), float(lat)) for lat, lon in line])
+            except Exception:
+                line_geom = None
+            try:
+                capture_lines = []
+                for line_coords in lines_for_catalog:
+                    if not isinstance(line_coords, list) or len(line_coords) < 2:
+                        continue
+                    capture_lines.append(LineString([(float(lon), float(lat)) for lat, lon in line_coords]))
+                if capture_lines:
+                    if len(capture_lines) == 1 or MultiLineString is None:
+                        line_capture_source = capture_lines[0]
+                    else:
+                        line_capture_source = MultiLineString([list(seg.coords) for seg in capture_lines])
+            except Exception:
+                line_capture_source = line_geom
+
+        if line_capture_source is None:
+            line_capture_source = line_geom
+
+        if line_capture_source is not None:
+            try:
+                buffer_deg = max(float(self.lgv_commune_capture_buffer_km), 0.0) / 111.0
+            except Exception:
+                buffer_deg = 0.0
+            if buffer_deg > 0:
+                try:
+                    line_capture_geom = line_capture_source.buffer(buffer_deg)
+                except Exception:
+                    line_capture_geom = line_capture_source
+            else:
+                line_capture_geom = line_capture_source
+
+        if line_geom is not None and line_capture_geom is not None:
+            for meta in entries:
+                code = str(meta.get("commune_code") or "")
+                if not code:
+                    continue
+                geom = meta.get("geometry")
+                if geom is None:
+                    continue
+                try:
+                    if not geom.intersects(line_capture_geom):
+                        continue
+                    intersection = geom.intersection(line_capture_geom)
+                except Exception:
+                    continue
+                if intersection is None or intersection.is_empty:
+                    continue
+
+                projected_km = self._project_geometry_on_line_km(line_geom, intersection)
+                if not projected_km:
+                    try:
+                        projected_km = self._project_geometry_on_line_km(line_geom, geom.centroid)
+                    except Exception:
+                        projected_km = []
+                if not projected_km:
+                    continue
+
+                pk_start = round(min(projected_km), 3)
+                pk_end = round(max(projected_km), 3)
+                sample_estimate = max(1, int(len(projected_km)))
+
+                if code not in seen:
+                    seen[code] = {
+                        "commune_name": meta.get("commune_name"),
+                        "commune_code": code,
+                        "departement_code": meta.get("departement_code"),
+                        "departement_name": meta.get("departement_name"),
+                        "pk_start_km": pk_start,
+                        "pk_end_km": pk_end,
+                        "sample_count": sample_estimate,
+                        "centroid_latitude": meta.get("centroid_latitude"),
+                        "centroid_longitude": meta.get("centroid_longitude"),
+                        "geometry_geojson": meta.get("geometry_geojson"),
+                    }
+                else:
+                    row = seen[code]
+                    row["pk_start_km"] = round(min(float(row.get("pk_start_km", pk_start)), pk_start), 3)
+                    row["pk_end_km"] = round(max(float(row.get("pk_end_km", pk_end)), pk_end), 3)
+                    row["sample_count"] = int(row.get("sample_count", 0)) + sample_estimate
+
+        communes_rows = sorted(seen.values(), key=lambda r: (float(r.get("pk_start_km", 0.0)), str(r.get("commune_name", ""))))
+        for idx, row in enumerate(communes_rows, start=1):
+            pk_start = float(row.get("pk_start_km") or 0.0)
+            pk_end = float(row.get("pk_end_km") or pk_start)
+            row["traversed_km"] = round(max(pk_end - pk_start, 0.0), 3)
+            row["order_on_line"] = idx
+
+        commune_features: List[Dict[str, object]] = []
+        for row in communes_rows:
+            geom_raw = row.get("geometry_geojson")
+            if not isinstance(geom_raw, dict):
+                continue
+            feature_props = {
+                "commune_name": row.get("commune_name"),
+                "commune_code": row.get("commune_code"),
+                "departement_code": row.get("departement_code"),
+                "departement_name": row.get("departement_name"),
+                "pk_start_km": row.get("pk_start_km"),
+                "pk_end_km": row.get("pk_end_km"),
+                "traversed_km": row.get("traversed_km"),
+                "order_on_line": row.get("order_on_line"),
+                "sample_count": row.get("sample_count"),
+            }
+            commune_features.append(
+                {
+                    "type": "Feature",
+                    "properties": feature_props,
+                    "geometry": geom_raw,
+                }
+            )
+        for row in communes_rows:
+            row.pop("geometry_geojson", None)
+
+        dep_counts: Dict[str, int] = {}
+        for row in communes_rows:
+            dep = str(row.get("departement_code") or "NA")
+            dep_counts[dep] = dep_counts.get(dep, 0) + 1
+
+        total_length = float(samples[-1]["pk_km"]) if samples else 0.0
+        payload = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "catalog_version": required_catalog_version,
+            "lgv_fingerprint": current_fingerprint,
+            "sample_step_km": self.lgv_commune_sample_step_km,
+            "source": "geo_api_gouv_communes",
+            "summary": {
+                "line_length_km": round(total_length, 3),
+                "commune_count": int(len(communes_rows)),
+                "departement_count": int(len(dep_counts)),
+                "departement_distribution": dep_counts,
+                "communes_geojson_count": int(len(commune_features)),
+                "departement_catalog_ref_count": int(len(departements_catalog)),
+                "capture_buffer_km": float(self.lgv_commune_capture_buffer_km),
+            },
+            "communes": communes_rows,
+            "communes_geojson": {
+                "type": "FeatureCollection",
+                "features": commune_features,
+            },
+            "departements_ref": self.lgv_reference_departements,
+            "departements_catalog": departements_catalog,
+        }
+        self._save_json(payload, self.lgv_communes_cache_file)
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(payload, os.path.join("data", f"lgv_communes_{ts}.json"))
+        return payload
+
+    @staticmethod
+    def _downsample_coords(coords: List[Tuple[float, float]], max_points: int = 3500) -> List[Tuple[float, float]]:
+        if len(coords) <= max_points:
+            return coords
+        step = max(1, len(coords) // max_points)
+        sampled = coords[::step]
+        if sampled[-1] != coords[-1]:
+            sampled.append(coords[-1])
+        return sampled
+
+    def _line_length_km(self, coords: List[Tuple[float, float]]) -> float:
+        if len(coords) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(len(coords) - 1):
+            total += self._haversine_km(coords[i][0], coords[i][1], coords[i + 1][0], coords[i + 1][1])
+        return total
+
+    def _collect_geometry_xy_coords(self, geom_obj: object, max_points: int = 5000) -> List[Tuple[float, float]]:
+        coords: List[Tuple[float, float]] = []
+
+        def _walk(g: object) -> None:
+            nonlocal coords
+            if g is None or len(coords) >= max_points:
+                return
+            try:
+                if getattr(g, "is_empty", False):
+                    return
+            except Exception:
+                pass
+
+            if hasattr(g, "geoms"):
+                try:
+                    for sub in list(g.geoms):
+                        _walk(sub)
+                        if len(coords) >= max_points:
+                            return
+                    return
+                except Exception:
+                    pass
+
+            gtype = str(getattr(g, "geom_type", "")).upper()
+            if gtype == "POLYGON":
+                try:
+                    _walk(g.exterior)
+                    for ring in list(g.interiors):
+                        _walk(ring)
+                    return
+                except Exception:
+                    return
+
+            try:
+                seq = list(g.coords)
+            except Exception:
+                return
+
+            for xy in seq:
+                if len(xy) >= 2:
+                    coords.append((float(xy[0]), float(xy[1])))
+                if len(coords) >= max_points:
+                    return
+
+        _walk(geom_obj)
+        return coords
+
+    def _project_geometry_on_line_km(self, line_geom: object, geom_obj: object) -> List[float]:
+        if line_geom is None or Point is None:
+            return []
+        projections: List[float] = []
+        for x, y in self._collect_geometry_xy_coords(geom_obj):
+            try:
+                km = float(line_geom.project(Point(float(x), float(y)))) / 1000.0
+                projections.append(round(km, 3))
+            except Exception:
+                continue
+        return projections
+
+    def _extract_lgv_lines_from_kml_root(self, root: ET.Element) -> List[List[Tuple[float, float]]]:
+        ns = {"k": "http://www.opengis.net/kml/2.2"}
+        extracted: List[Tuple[str, List[Tuple[float, float]], float]] = []
+
+        for pm in root.findall(".//k:Placemark", ns):
+            name = (pm.findtext("k:name", default="", namespaces=ns) or "").strip().upper()
+            coord_text = pm.findtext(".//k:LineString/k:coordinates", default="", namespaces=ns)
+            if not coord_text:
+                continue
+            coords = []
+            for token in coord_text.replace("\n", " ").split():
+                parts = token.split(",")
+                if len(parts) < 2:
+                    continue
+                try:
+                    lon = float(parts[0])
+                    lat = float(parts[1])
+                except ValueError:
+                    continue
+                coords.append((lat, lon))
+            if len(coords) < 2:
+                continue
+            extracted.append((name, coords, self._line_length_km(coords)))
+
+        if not extracted:
+            return []
+
+        lgv_named = [coords for name, coords, _ in extracted if name.startswith("LGV")]
+        if lgv_named:
+            return [self._downsample_coords(coords) for coords in lgv_named]
+
+        # Fallback: keep the two longest axes when no explicit LGV naming exists.
+        extracted.sort(key=lambda x: x[2], reverse=True)
+        longest = [coords for _, coords, length in extracted if length >= 50.0][:2]
+        return [self._downsample_coords(coords) for coords in longest]
+
+    def _load_lgv_lines_from_kml(self, kml_path: str) -> List[List[Tuple[float, float]]]:
+        if not os.path.exists(kml_path):
+            return []
+        try:
+            with open(kml_path, "rb") as f:
+                root = ET.fromstring(f.read())
+            lines = self._extract_lgv_lines_from_kml_root(root)
+            if lines:
+                logging.info("Trace LGV chargee depuis KML: %s (%s ligne(s))", kml_path, len(lines))
+            return lines
+        except Exception as exc:
+            logging.warning("Lecture KML impossible (%s): %s", kml_path, exc)
+            return []
+
+    def _load_lgv_lines_from_kmz(self, kmz_path: str) -> List[List[Tuple[float, float]]]:
+        if not os.path.exists(kmz_path):
+            return []
+        try:
+            with zipfile.ZipFile(kmz_path) as zf:
+                kml_name = "doc.kml" if "doc.kml" in zf.namelist() else zf.namelist()[0]
+                root = ET.fromstring(zf.read(kml_name))
+            lines = self._extract_lgv_lines_from_kml_root(root)
+            if lines:
+                logging.info("Trace LGV chargee depuis KMZ: %s (%s ligne(s))", kmz_path, len(lines))
+            return lines
+        except Exception as exc:
+            logging.warning("Lecture KMZ impossible (%s): %s", kmz_path, exc)
+            return []
+
+    def _load_lgv_lines(self, candidates: List[str]) -> List[List[Tuple[float, float]]]:
+        for path in candidates:
+            path = os.path.abspath(path)
+            if path.lower().endswith(".kml"):
+                lines = self._load_lgv_lines_from_kml(path)
+            elif path.lower().endswith(".kmz"):
+                lines = self._load_lgv_lines_from_kmz(path)
+            else:
+                continue
+            if lines:
+                return lines
+        return []
+
+    def _synop_url_for_date(self, day: datetime) -> str:
+        return "https://donneespubliques.meteofrance.fr/donnees_libres/Txt/Synop/" + f"synop.{day.strftime('%Y%m%d')}.csv"
+
+    @staticmethod
+    def _row_get(row: Dict[str, str], keys: List[str]) -> Optional[str]:
+        for key in keys:
+            if key in row and row[key] not in (None, ""):
+                return row[key]
+        return None
+
+    @staticmethod
+    def _clean_synop_rain_value(value: Optional[float]) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            x = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(x):
+            return None
+        if x < 0.0 or x >= 900.0:
+            return None
+        return x
+
+    def _parse_synop_obs_datetime(self, raw: Optional[str]) -> Optional[datetime]:
+        if raw is None:
+            return None
+        txt = str(raw).strip()
+        if not txt:
+            return None
+        dt = pd.to_datetime(txt, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+        if pd.isna(dt):
+            dt = pd.to_datetime(txt, errors="coerce", utc=True)
+        if pd.isna(dt):
+            return None
+        return dt.to_pydatetime()
+
+    def _synop_daily_rain_candidate(self, row: Dict[str, str]) -> Optional[float]:
+        rr1 = self._clean_synop_rain_value(self._safe_float(row.get("rr1")))
+        rr6 = self._clean_synop_rain_value(self._safe_float(row.get("rr6")))
+        rr3 = self._clean_synop_rain_value(self._safe_float(row.get("rr3")))
+        rr12 = self._clean_synop_rain_value(self._safe_float(row.get("rr12")))
+        rr24 = self._clean_synop_rain_value(self._safe_float(row.get("rr24")))
+        rr = self._clean_synop_rain_value(self._safe_float(row.get("rr")))
+        generic = self._clean_synop_rain_value(self._safe_float(row.get("precipitation")))
+        candidates = [v for v in [rr24, rr12, rr6, rr3, rr1, rr, generic] if v is not None]
+        if not candidates:
+            return None
+        return float(max(candidates))
+
+    @staticmethod
+    def _looks_like_synop_csv(text: Optional[str]) -> bool:
+        if text is None:
+            return False
+        sample = str(text or "").strip()
+        if not sample:
+            return False
+        head = sample[:1200].lower()
+        if "<!doctype" in head or "<html" in head or "donnee_indisponible" in head:
+            return False
+        return (";" in head) and (
+            ("numer_sta" in head)
+            or ("geo_id_wmo" in head)
+            or ("lat;lon;" in head)
+        )
+
+    def _synop_archive_url_for_year(self, year: int) -> str:
+        y = int(year)
+        if y in self._synop_archive_urls_by_year:
+            return self._synop_archive_urls_by_year[y]
+
+        api_url = f"https://www.data.gouv.fr/api/1/datasets/{self.synop_archive_dataset_id}/"
+        try:
+            resp = self.session.get(api_url, timeout=30)
+            if resp.status_code == 200:
+                payload = resp.json()
+                for resource in payload.get("resources", []):
+                    if not isinstance(resource, dict):
+                        continue
+                    title = str(resource.get("title") or "").strip().lower()
+                    url = str(resource.get("url") or "").strip()
+                    if not title or not url:
+                        continue
+                    match = re.search(r"synop[_\\-\\s]?(\\d{4})", title)
+                    if not match:
+                        continue
+                    try:
+                        ry = int(match.group(1))
+                    except Exception:
+                        continue
+                    self._synop_archive_urls_by_year[ry] = url
+        except Exception as exc:
+            logging.warning("Resolution URL archive SYNOP impossible (data.gouv): %s", exc)
+
+        if y in self._synop_archive_urls_by_year:
+            return self._synop_archive_urls_by_year[y]
+
+        fallback_url = f"https://object.files.data.gouv.fr/meteofrance/data/synchro_ftp/OBS/SYNOP/synop_{y}.csv.gz"
+        self._synop_archive_urls_by_year[y] = fallback_url
+        return fallback_url
+
+    def _download_synop_archive_gz(self, year: int) -> Tuple[Optional[str], str]:
+        y = int(year)
+        url = self._synop_archive_url_for_year(y)
+        cache_path = os.path.join(self.synop_cache_dir, f"synop_{y}.csv.gz")
+
+        if os.path.exists(cache_path):
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(cache_path), tz=timezone.utc)
+                age_h = (self._now_utc() - mtime).total_seconds() / 3600.0
+                if age_h <= float(self.synop_cache_ttl_hours):
+                    return cache_path, url
+            except Exception:
+                pass
+
+        try:
+            resp = self.session.get(url, timeout=120)
+            if resp.status_code == 200 and resp.content[:2] == b"\x1f\x8b":
+                with open(cache_path, "wb") as f:
+                    f.write(resp.content)
+                return cache_path, url
+            logging.warning("Archive SYNOP inattendue (%s): HTTP %s", url, resp.status_code)
+        except Exception as exc:
+            logging.warning("Telechargement archive SYNOP impossible (%s): %s", url, exc)
+
+        if os.path.exists(cache_path):
+            return cache_path, url
+        return None, url
+
+    def _load_synop_archive_history(self, ref_day: datetime, history_days: int) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str]]:
+        lookback_days = max(int(history_days), int(self.synop_archive_lookback_days))
+        floor_dt = (ref_day - timedelta(days=lookback_days)).replace(hour=0, minute=0, second=0, microsecond=0)
+        years = sorted({int(ref_day.year), int(floor_dt.year)})
+
+        all_records: List[Dict[str, object]] = []
+        hist_frames: List[pd.DataFrame] = []
+        source_urls: List[str] = []
+
+        for year in years:
+            gz_path, src_url = self._download_synop_archive_gz(year)
+            if src_url:
+                source_urls.append(src_url)
+            if not gz_path:
+                continue
+
+            try:
+                preview = pd.read_csv(gz_path, sep=";", nrows=1, dtype=str, compression="gzip")
+                available_cols = set(preview.columns.tolist())
+                wanted_cols = [
+                    "numer_sta",
+                    "geo_id_wmo",
+                    "station",
+                    "id",
+                    "ID",
+                    "lat",
+                    "latitude",
+                    "Latitude",
+                    "LAT",
+                    "lon",
+                    "longitude",
+                    "Longitude",
+                    "LON",
+                    "date",
+                    "Date",
+                    "validity_time",
+                    "reference_time",
+                    "rr1",
+                    "rr3",
+                    "rr6",
+                    "rr12",
+                    "rr24",
+                    "rr",
+                    "precipitation",
+                ]
+                usecols = [c for c in wanted_cols if c in available_cols]
+                if not usecols:
+                    continue
+
+                raw = pd.read_csv(
+                    gz_path,
+                    sep=";",
+                    dtype=str,
+                    usecols=usecols,
+                    compression="gzip",
+                    low_memory=False,
+                )
+                if raw.empty:
+                    continue
+
+                def _coalesce_text(frame: pd.DataFrame, cols: List[str]) -> pd.Series:
+                    out = pd.Series("", index=frame.index, dtype="string")
+                    for c in cols:
+                        if c not in frame.columns:
+                            continue
+                        cur = frame[c].astype("string").fillna("").str.strip()
+                        out = out.where(out.str.len() > 0, cur)
+                    return out
+
+                sid = _coalesce_text(raw, ["numer_sta", "geo_id_wmo", "station", "id", "ID"])
+                obs_raw = _coalesce_text(raw, ["date", "Date", "validity_time", "reference_time"])
+                lat_raw = _coalesce_text(raw, ["lat", "latitude", "Latitude", "LAT"])
+                lon_raw = _coalesce_text(raw, ["lon", "longitude", "Longitude", "LON"])
+
+                obs_dt = pd.to_datetime(obs_raw, format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+                obs_fallback = pd.to_datetime(obs_raw, errors="coerce", utc=True)
+                obs_dt = obs_dt.where(obs_dt.notna(), obs_fallback)
+
+                lat = pd.to_numeric(lat_raw, errors="coerce")
+                lon = pd.to_numeric(lon_raw, errors="coerce")
+                lat = lat.where(~(lat.abs().gt(90.0) & lat.abs().le(9000.0)), lat / 100.0)
+                lon = lon.where(~(lon.abs().gt(180.0) & lon.abs().le(18000.0)), lon / 100.0)
+
+                recent_mask = obs_dt.notna() & (obs_dt >= pd.Timestamp(floor_dt))
+                if not recent_mask.any():
+                    continue
+
+                rr_cols = [c for c in ["rr24", "rr12", "rr6", "rr3", "rr1", "rr", "precipitation"] if c in raw.columns]
+                rain_daily = pd.Series(float("nan"), index=raw.index, dtype="float64")
+                if rr_cols:
+                    rr_num = raw[rr_cols].apply(pd.to_numeric, errors="coerce")
+                    rr_num = rr_num.where((rr_num >= 0.0) & (rr_num < 900.0))
+                    rain_daily = rr_num.max(axis=1, skipna=True)
+
+                recent = pd.DataFrame(
+                    {
+                        "station_id": sid,
+                        "date_obs_raw": obs_raw,
+                        "obs_dt": obs_dt,
+                        "lat": lat,
+                        "lon": lon,
+                        "rr1": pd.to_numeric(raw.get("rr1"), errors="coerce"),
+                        "rr3": pd.to_numeric(raw.get("rr3"), errors="coerce"),
+                        "rr6": pd.to_numeric(raw.get("rr6"), errors="coerce"),
+                        "rr12": pd.to_numeric(raw.get("rr12"), errors="coerce"),
+                        "rr24": pd.to_numeric(raw.get("rr24"), errors="coerce"),
+                        "rr": pd.to_numeric(raw.get("rr"), errors="coerce"),
+                        "precipitation": pd.to_numeric(raw.get("precipitation"), errors="coerce"),
+                        "rain_day_mm": rain_daily,
+                    }
+                )
+                recent = recent[recent_mask].copy()
+                recent = recent[(recent["station_id"].astype(str).str.len() > 0) & recent["lat"].notna() & recent["lon"].notna()]
+                if recent.empty:
+                    continue
+
+                hist_df = recent[["station_id", "obs_dt", "rain_day_mm"]].copy()
+                hist_df = hist_df.dropna(subset=["obs_dt", "rain_day_mm"])
+                if not hist_df.empty:
+                    hist_df["day"] = pd.to_datetime(hist_df["obs_dt"], errors="coerce").dt.floor("D")
+                    hist_df = hist_df.dropna(subset=["day"])
+                    if not hist_df.empty:
+                        hist_df = (
+                            hist_df.groupby(["station_id", "day"], as_index=False)["rain_day_mm"]
+                            .max()
+                            .rename(columns={"rain_day_mm": "rain_day_mm"})
+                        )
+                        hist_frames.append(hist_df[["station_id", "day", "rain_day_mm"]].copy())
+
+                latest = recent.sort_values("obs_dt").drop_duplicates(subset=["station_id"], keep="last")
+                if latest.empty:
+                    continue
+
+                for row in latest.itertuples(index=False):
+                    try:
+                        lat_v = float(row.lat)
+                        lon_v = float(row.lon)
+                    except Exception:
+                        continue
+                    if not (math.isfinite(lat_v) and math.isfinite(lon_v)):
+                        continue
+                    rr1 = self._safe_float(row.rr1)
+                    rr3 = self._safe_float(row.rr3)
+                    rr6 = self._safe_float(row.rr6)
+                    rr12 = self._safe_float(row.rr12)
+                    rr24 = self._safe_float(row.rr24)
+                    rr = self._safe_float(row.rr)
+                    generic_rain = self._safe_float(row.precipitation)
+
+                    rain_pack = self._normalize_rain_bundle(
+                        rain_instant=rr1 if rr1 is not None else (rr if rr is not None else (rr3 if rr3 is not None else generic_rain)),
+                        rain_12h=rr12,
+                        rain_24h=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_7d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_30d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_month=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+                        rain_forecast=rr1 if rr1 is not None else (rr if rr is not None else rr3),
+                    )
+
+                    all_records.append(
+                        {
+                            "station_id": str(row.station_id),
+                            "date_obs_raw": str(row.date_obs_raw),
+                            "latitude": round(lat_v, 6),
+                            "longitude": round(lon_v, 6),
+                            "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(lat_v, lon_v)), 3),
+                            "precipitation_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                            "rain_24h_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                            "rain_7d_mm": round(float(rain_pack["rain_7d_mm"]), 3),
+                            "rain_30d_mm": round(float(rain_pack["rain_30d_mm"]), 3),
+                            "rain_month_mm": round(float(rain_pack["rain_month_mm"]), 3),
+                            "rain_12h_mm": round(float(rain_pack["rain_12h_mm"]), 3),
+                            "rain_instant_mm": round(float(rain_pack["rain_instant_mm"]), 3),
+                            "rain_forecast_mm": round(float(rain_pack["rain_forecast_mm"]), 3),
+                            "rain_class": self._station_pluvio_class(
+                                float(rain_pack["rain_24h_mm"]),
+                                float(rain_pack["rain_7d_mm"]),
+                                float(rain_pack["rain_30d_mm"]),
+                            ),
+                            "source": DataSource.SYNOP_METEOFRANCE.value,
+                        }
+                    )
+            except Exception as exc:
+                logging.warning("Lecture archive SYNOP impossible (%s): %s", gz_path, exc)
+
+        all_df = pd.DataFrame(all_records)
+        if not all_df.empty:
+            all_df["date"] = pd.to_datetime(all_df.get("date_obs_raw"), errors="coerce", utc=True)
+            all_df = all_df.dropna(subset=["date"]).sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+            all_df = all_df.sort_values("distance_to_lgv_km")
+
+        if hist_frames:
+            daily_hist = pd.concat(hist_frames, ignore_index=True)
+            daily_hist = daily_hist.sort_values("day").drop_duplicates(subset=["station_id", "day"], keep="last")
+            daily_hist["day"] = pd.to_datetime(daily_hist["day"], errors="coerce")
+            daily_hist["rain_day_mm"] = pd.to_numeric(daily_hist["rain_day_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+            daily_hist = daily_hist.dropna(subset=["station_id", "day"]).sort_values(["station_id", "day"])
+        else:
+            daily_hist = pd.DataFrame(columns=["station_id", "day", "rain_day_mm"])
+
+        source_label = ", ".join(sorted(set(source_urls))) if source_urls else None
+        return all_df, daily_hist, source_label
+
+    def _load_synop_csv_text(self, day: datetime) -> Tuple[Optional[str], str]:
+        url = self._synop_url_for_date(day)
+        cache_path = os.path.join(self.synop_cache_dir, f"synop.{day.strftime('%Y%m%d')}.csv")
+
+        def _read_cache() -> Optional[str]:
+            if not os.path.exists(cache_path):
+                return None
+            for enc in ("utf-8", "latin-1"):
+                try:
+                    with open(cache_path, "r", encoding=enc, errors="ignore") as f:
+                        txt = f.read()
+                    if txt and txt.strip() and self._looks_like_synop_csv(txt):
+                        return txt
+                except Exception:
+                    continue
+            return None
+
+        cached_text = _read_cache()
+        if cached_text is not None:
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(cache_path), tz=timezone.utc)
+                age_h = (self._now_utc() - mtime).total_seconds() / 3600.0
+                if age_h <= float(self.synop_cache_ttl_hours):
+                    return cached_text, url
+            except Exception:
+                pass
+
+        try:
+            response = self.session.get(url, timeout=30)
+            if response.status_code == 200 and response.text.strip() and self._looks_like_synop_csv(response.text):
+                try:
+                    with open(cache_path, "w", encoding="utf-8", errors="ignore") as f:
+                        f.write(response.text)
+                except Exception:
+                    pass
+                return response.text, url
+            if response.status_code == 200 and response.text.strip():
+                logging.warning("SYNOP journalier indisponible (%s): reponse non CSV", url)
+        except Exception as exc:
+            logging.warning("Chargement SYNOP impossible (%s): %s", url, exc)
+
+        if cached_text is not None:
+            return cached_text, url
+        return None, url
+
+    def _build_synop_station_daily_history(self, ref_day: datetime, history_days: int) -> pd.DataFrame:
+        station_day_rain: Dict[Tuple[str, str], float] = {}
+        for offset in range(max(1, int(history_days))):
+            day = ref_day - timedelta(days=offset)
+            text, _ = self._load_synop_csv_text(day)
+            if not text:
+                continue
+            try:
+                reader = csv.DictReader(StringIO(text), delimiter=";")
+            except Exception:
+                continue
+            for row in reader:
+                station_id = self._row_get(row, ["numer_sta", "geo_id_wmo", "station", "id", "ID"])
+                if not station_id:
+                    continue
+                rain_day = self._synop_daily_rain_candidate(row)
+                if rain_day is None:
+                    continue
+                dt_obs = self._parse_synop_obs_datetime(self._row_get(row, ["date", "Date", "validity_time", "reference_time"]))
+                day_iso = (dt_obs.date().isoformat() if dt_obs is not None else day.date().isoformat())
+                key = (str(station_id), day_iso)
+                prev = station_day_rain.get(key)
+                if prev is None or rain_day > prev:
+                    station_day_rain[key] = float(rain_day)
+
+        if not station_day_rain:
+            return pd.DataFrame(columns=["station_id", "day", "rain_day_mm"])
+        out = pd.DataFrame(
+            [
+                {"station_id": sid, "day": day_iso, "rain_day_mm": mm}
+                for (sid, day_iso), mm in station_day_rain.items()
+            ]
+        )
+        out["day"] = pd.to_datetime(out["day"], errors="coerce")
+        out["rain_day_mm"] = pd.to_numeric(out["rain_day_mm"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        out = out.dropna(subset=["station_id", "day"]).sort_values(["station_id", "day"])
+        return out
+
+    def _extract_synop_record(self, row: Dict[str, str]) -> Optional[Dict[str, object]]:
+        station_id = self._row_get(row, ["numer_sta", "geo_id_wmo", "station", "id", "ID"])
+        date_obs_raw = self._row_get(row, ["date", "Date", "validity_time", "reference_time"])
+        lat = self._safe_float(self._row_get(row, ["lat", "latitude", "Latitude", "LAT"]))
+        lon = self._safe_float(self._row_get(row, ["lon", "longitude", "Longitude", "LON"]))
+
+        if lat is None or lon is None:
+            values = list(row.values())
+            if len(values) > 11:
+                lat = self._safe_float(values[10])
+                lon = self._safe_float(values[11])
+        if lat is None or lon is None:
+            return None
+        if abs(lat) > 90 and abs(lat) <= 9000:
+            lat = lat / 100.0
+        if abs(lon) > 180 and abs(lon) <= 18000:
+            lon = lon / 100.0
+
+        rr1 = self._safe_float(row.get("rr1"))
+        rr6 = self._safe_float(row.get("rr6"))
+        rr3 = self._safe_float(row.get("rr3"))
+        rr12 = self._safe_float(row.get("rr12"))
+        rr24 = self._safe_float(row.get("rr24"))
+        rr = self._safe_float(row.get("rr"))
+        generic_rain = self._safe_float(row.get("precipitation"))
+
+        rain_pack = self._normalize_rain_bundle(
+            rain_instant=rr1 if rr1 is not None else (rr if rr is not None else (rr3 if rr3 is not None else generic_rain)),
+            rain_12h=rr12,
+            rain_24h=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_7d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_30d=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_month=rr24 if rr24 is not None else (rr12 if rr12 is not None else (rr6 if rr6 is not None else rr)),
+            rain_forecast=rr1 if rr1 is not None else (rr if rr is not None else rr3),
+        )
+        rain_class = self._station_pluvio_class(
+            float(rain_pack["rain_24h_mm"]),
+            float(rain_pack["rain_7d_mm"]),
+            float(rain_pack["rain_30d_mm"]),
+        )
+
+        return {
+            "station_id": station_id or "unknown",
+            "date_obs_raw": date_obs_raw,
+            "latitude": round(float(lat), 6),
+            "longitude": round(float(lon), 6),
+            "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(lat, lon)), 3),
+            # precipitation_mm is normalized as observed 24h rain for cross-source consistency.
+            "precipitation_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+            "rain_24h_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+            "rain_7d_mm": round(float(rain_pack["rain_7d_mm"]), 3),
+            "rain_30d_mm": round(float(rain_pack["rain_30d_mm"]), 3),
+            "rain_month_mm": round(float(rain_pack["rain_month_mm"]), 3),
+            "rain_12h_mm": round(float(rain_pack["rain_12h_mm"]), 3),
+            "rain_instant_mm": round(float(rain_pack["rain_instant_mm"]), 3),
+            "rain_forecast_mm": round(float(rain_pack["rain_forecast_mm"]), 3),
+            "rain_class": rain_class,
+            "source": DataSource.SYNOP_METEOFRANCE.value,
+        }
+
+    def fetch_pluviometry_synop(self) -> Dict[str, object]:
+        logging.info("Pluviometrie: recuperation SYNOP Meteo-France.")
+        candidates = [self._now_utc(), self._now_utc() - timedelta(days=1)]
+        last_error = None
+        all_df = pd.DataFrame()
+        daily_hist = pd.DataFrame(columns=["station_id", "day", "rain_day_mm"])
+        source_url: Optional[str] = None
+        archive_used = False
+
+        for day in candidates:
+            url = self._synop_url_for_date(day)
+            try:
+                text, source_url_candidate = self._load_synop_csv_text(day)
+                if not text:
+                    logging.warning("SYNOP non disponible: %s", url)
+                    continue
+
+                reader = csv.DictReader(StringIO(text), delimiter=";")
+                rows = [rec for rec in (self._extract_synop_record(row) for row in reader) if rec]
+                if not rows:
+                    continue
+
+                all_df = pd.DataFrame(rows)
+                if all_df.empty:
+                    continue
+                daily_hist = self._build_synop_station_daily_history(day, history_days=self.synop_history_days)
+                source_url = source_url_candidate
+                break
+            except Exception as exc:
+                last_error = exc
+                logging.warning("Erreur SYNOP (%s): %s", url, exc)
+
+        if all_df.empty:
+            try:
+                archive_day = self._now_utc()
+                archive_df, archive_hist, archive_source = self._load_synop_archive_history(
+                    archive_day,
+                    history_days=self.synop_history_days,
+                )
+                if not archive_df.empty:
+                    all_df = archive_df.copy()
+                    daily_hist = archive_hist.copy()
+                    source_url = archive_source
+                    archive_used = True
+                    logging.info("SYNOP archive data.gouv utilise: %s station(s)", len(all_df))
+            except Exception as exc:
+                last_error = exc
+                logging.warning("Fallback archive SYNOP impossible: %s", exc)
+
+        if all_df.empty:
+            logging.error("Pluviometrie indisponible. Derniere erreur: %s", last_error)
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "SYNOP indisponible", "source_url": source_url, "summary_path": None}
+
+        all_df["date"] = pd.to_datetime(all_df.get("date_obs_raw"), format="%Y%m%d%H%M%S", errors="coerce", utc=True)
+        fallback_mask = all_df["date"].isna()
+        if fallback_mask.any():
+            all_df.loc[fallback_mask, "date"] = pd.to_datetime(
+                all_df.loc[fallback_mask, "date_obs_raw"],
+                errors="coerce",
+                utc=True,
+            )
+        all_df = all_df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
+        if all_df.empty:
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "SYNOP parse vide", "source_url": source_url, "summary_path": None}
+
+        # Keep one freshest record per station and coerce numeric rain fields.
+        all_df = all_df.sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+        for col in [
+            "precipitation_mm",
+            "rain_24h_mm",
+            "rain_7d_mm",
+            "rain_30d_mm",
+            "rain_month_mm",
+            "rain_12h_mm",
+            "rain_instant_mm",
+            "rain_forecast_mm",
+            "distance_to_lgv_km",
+        ]:
+            all_df[col] = pd.to_numeric(all_df.get(col), errors="coerce")
+        for col in [
+            "precipitation_mm",
+            "rain_24h_mm",
+            "rain_7d_mm",
+            "rain_30d_mm",
+            "rain_month_mm",
+            "rain_12h_mm",
+            "rain_instant_mm",
+            "rain_forecast_mm",
+        ]:
+            all_df[col] = all_df[col].fillna(0.0).clip(lower=0.0)
+
+        # Enrich SYNOP with daily history-based cumulative rainfall per station.
+        if not daily_hist.empty:
+            ref_day = pd.Timestamp(self._now_utc()).tz_convert("UTC").normalize()
+            lower_7 = ref_day - pd.Timedelta(days=6)
+            lower_30 = ref_day - pd.Timedelta(days=29)
+            month_start = pd.Timestamp(year=ref_day.year, month=ref_day.month, day=1, tz="UTC")
+            daily_hist["day"] = pd.to_datetime(daily_hist["day"], errors="coerce", utc=True)
+            daily_hist = daily_hist.dropna(subset=["day"])
+            daily_hist = daily_hist[daily_hist["day"] <= ref_day]
+            if not daily_hist.empty:
+                rain_7_map: Dict[str, float] = {}
+                rain_30_map: Dict[str, float] = {}
+                rain_month_map: Dict[str, float] = {}
+                for station_id, grp in daily_hist.groupby("station_id"):
+                    sid = str(station_id)
+                    grp_rain = pd.to_numeric(grp["rain_day_mm"], errors="coerce").fillna(0.0)
+                    grp_day = pd.to_datetime(grp["day"], errors="coerce")
+                    rain_7_map[sid] = float(grp_rain[grp_day >= lower_7].sum())
+                    rain_30_map[sid] = float(grp_rain[grp_day >= lower_30].sum())
+                    rain_month_map[sid] = float(grp_rain[grp_day >= month_start].sum())
+
+                sid_series = all_df["station_id"].astype(str)
+                all_df["rain_7d_mm"] = sid_series.map(rain_7_map).fillna(all_df["rain_7d_mm"])
+                all_df["rain_30d_mm"] = sid_series.map(rain_30_map).fillna(all_df["rain_30d_mm"])
+                all_df["rain_month_mm"] = sid_series.map(rain_month_map).fillna(all_df["rain_month_mm"])
+
+        all_df["rain_7d_mm"] = all_df[["rain_7d_mm", "rain_24h_mm"]].max(axis=1)
+        all_df["rain_30d_mm"] = all_df[["rain_30d_mm", "rain_7d_mm"]].max(axis=1)
+        all_df["rain_month_mm"] = all_df[["rain_month_mm", "rain_24h_mm"]].max(axis=1)
+        all_df["rain_class"] = [
+            self._station_pluvio_class(float(r24), float(r7), float(r30))
+            for r24, r7, r30 in zip(
+                pd.to_numeric(all_df["rain_24h_mm"], errors="coerce").fillna(0.0).tolist(),
+                pd.to_numeric(all_df["rain_7d_mm"], errors="coerce").fillna(0.0).tolist(),
+                pd.to_numeric(all_df["rain_30d_mm"], errors="coerce").fillna(0.0).tolist(),
+            )
+        ]
+
+        selected_df = all_df[all_df["distance_to_lgv_km"] <= self.weather_corridor_km].copy()
+        notice_parts: List[str] = []
+        if archive_used:
+            notice_parts.append("SYNOP via archive data.gouv (source officielle Meteo-France).")
+        if selected_df.empty:
+            top_n = min(10, max(1, int(len(all_df))))
+            selected_df = all_df.nsmallest(top_n, "distance_to_lgv_km").copy()
+            selected_df["selection_mode"] = "nearest_fallback_topn"
+            nearest = selected_df.iloc[0]
+            notice_parts.append(
+                f"Aucune station meteo <= {self.weather_corridor_km:.1f} km de la LGV. "
+                f"Fallback: top {top_n} stations les plus proches (plus proche: {nearest['station_id']} "
+                f"a {nearest['distance_to_lgv_km']:.2f} km)."
+            )
+            logging.warning(notice_parts[-1])
+        else:
+            selected_df["selection_mode"] = "within_lgv_corridor"
+        selected_df["rain_calc_method"] = "synop_daily_history_aggregate"
+        notice = " | ".join([x for x in notice_parts if x]) if notice_parts else None
+
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        all_path = os.path.join("data", f"synop_all_stations_{ts}.csv")
+        selected_path = os.path.join("data", f"synop_selected_lgv_{ts}.csv")
+        all_df.to_csv(all_path, index=False)
+        selected_df.to_csv(selected_path, index=False)
+        summary_path = os.path.join("data", f"weather_summary_{ts}.json")
+        self._save_json(
+            {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "source_url": source_url,
+                "corridor_km": self.weather_corridor_km,
+                "all_station_count": int(len(all_df)),
+                "selected_station_count": int(len(selected_df)),
+                "history_days_used": int(self.synop_history_days),
+                "notice": notice,
+                "all_csv": all_path,
+                "selected_csv": selected_path,
+            },
+            summary_path,
+        )
+        return {
+            "all": all_df,
+            "selected": selected_df,
+            "notice": notice,
+            "source_url": source_url,
+            "summary_path": summary_path,
+        }
+
+    def _fetch_open_meteo_batch(self, batch_points: List[Tuple[float, float]]) -> List[Dict[str, object]]:
+        if not batch_points:
+            return []
+        lats = ",".join(f"{lat:.5f}" for lat, _ in batch_points)
+        lons = ",".join(f"{lon:.5f}" for _, lon in batch_points)
+        params = {
+            "latitude": lats,
+            "longitude": lons,
+            "hourly": "precipitation",
+            "past_days": 35,
+            "forecast_days": 1,
+            "timezone": "UTC",
+            "models": self.open_meteo_model,
+        }
+        response = self.session.get(self.open_meteo_base, params=params, timeout=45)
+        used_model = self.open_meteo_model
+        if response.status_code != 200:
+            # Model can be unavailable for some coordinates/time windows: fallback to default Open-Meteo model.
+            fallback_params = dict(params)
+            fallback_params.pop("models", None)
+            response = self.session.get(self.open_meteo_base, params=fallback_params, timeout=45)
+            used_model = "open_meteo_default"
+        if response.status_code != 200:
+            raise RuntimeError(f"Open-Meteo HTTP {response.status_code}")
+
+        payload = response.json()
+        entries = payload if isinstance(payload, list) else [payload]
+        rows: List[Dict[str, object]] = []
+
+        now_utc = self._now_utc()
+        for idx, entry in enumerate(entries):
+            lat = self._safe_float(str(entry.get("latitude")))
+            lon = self._safe_float(str(entry.get("longitude")))
+            if lat is None or lon is None:
+                continue
+
+            hourly = entry.get("hourly", {}) or {}
+            times = hourly.get("time", []) or []
+            precs = hourly.get("precipitation", []) or []
+            points: List[Tuple[datetime, float, str]] = []
+            for t, p in zip(times, precs):
+                p_val = self._safe_float(p)
+                if p_val is None:
+                    continue
+                dt = pd.to_datetime(t, utc=True, errors="coerce")
+                if pd.isna(dt):
+                    continue
+                points.append((dt.to_pydatetime(), float(p_val), str(t)))
+
+            past = [x for x in points if x[0] <= now_utc]
+            future = [x for x in points if x[0] > now_utc]
+            past.sort(key=lambda x: x[0])
+            future.sort(key=lambda x: x[0])
+
+            if past:
+                dt_obs, rain_instant, dt_str = past[-1]
+            else:
+                dt_obs, rain_instant, dt_str = now_utc, 0.0, now_utc.strftime("%Y-%m-%dT%H:%M")
+
+            lower_12h = now_utc - timedelta(hours=12)
+            lower_24h = now_utc - timedelta(hours=24)
+            lower_7d = now_utc - timedelta(days=7)
+            lower_30d = now_utc - timedelta(days=30)
+            month_start = datetime(now_utc.year, now_utc.month, 1, tzinfo=timezone.utc)
+            rain_12h = sum(v for dt, v, _ in past if dt > lower_12h)
+            rain_24h = sum(v for dt, v, _ in past if dt > lower_24h)
+            rain_7d = sum(v for dt, v, _ in past if dt > lower_7d)
+            rain_30d = sum(v for dt, v, _ in past if dt > lower_30d)
+            rain_month = sum(v for dt, v, _ in past if dt >= month_start)
+            rain_forecast = future[0][1] if future else rain_instant
+            rain_pack = self._normalize_rain_bundle(
+                rain_instant=rain_instant,
+                rain_12h=rain_12h,
+                rain_24h=rain_24h,
+                rain_7d=rain_7d,
+                rain_30d=rain_30d,
+                rain_month=rain_month,
+                rain_forecast=rain_forecast,
+            )
+            rain_class = self._station_pluvio_class(
+                float(rain_pack["rain_24h_mm"]),
+                float(rain_pack["rain_7d_mm"]),
+                float(rain_pack["rain_30d_mm"]),
+            )
+
+            rows.append(
+                {
+                    "station_id": f"openmeteo_{idx + 1}",
+                    "date_obs_raw": dt_str,
+                    "latitude": round(float(lat), 6),
+                    "longitude": round(float(lon), 6),
+                    "distance_to_lgv_km": round(float(self._point_to_lgv_distance_km(float(lat), float(lon))), 3),
+                    # precipitation_mm is normalized as observed 24h rain for cross-source consistency.
+                    "precipitation_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                    "rain_24h_mm": round(float(rain_pack["rain_24h_mm"]), 3),
+                    "rain_7d_mm": round(float(rain_pack["rain_7d_mm"]), 3),
+                    "rain_30d_mm": round(float(rain_pack["rain_30d_mm"]), 3),
+                    "rain_month_mm": round(float(rain_pack["rain_month_mm"]), 3),
+                    "rain_12h_mm": round(float(rain_pack["rain_12h_mm"]), 3),
+                    "rain_instant_mm": round(float(rain_pack["rain_instant_mm"]), 3),
+                    "rain_forecast_mm": round(float(rain_pack["rain_forecast_mm"]), 3),
+                    "rain_class": rain_class,
+                    "source": DataSource.OPEN_METEO.value,
+                    "selection_mode": "open_meteo_grid",
+                    "meteo_model": used_model,
+                }
+            )
+        return rows
+
+    def fetch_pluviometry_open_meteo(self) -> Dict[str, object]:
+        logging.info("Pluviometrie: recuperation Open-Meteo sur grille LGV.")
+        sampled = self._sample_points_along_lgv(self.open_meteo_sample_step_km, self.open_meteo_max_points)
+        if not sampled:
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "Open-Meteo: echantillonnage LGV vide", "source_url": self.open_meteo_base}
+
+        rows: List[Dict[str, object]] = []
+        # Keep URL length reasonable.
+        batch_size = 20
+        try:
+            for i in range(0, len(sampled), batch_size):
+                rows.extend(self._fetch_open_meteo_batch(sampled[i : i + batch_size]))
+        except Exception as exc:
+            logging.warning("Open-Meteo indisponible: %s", exc)
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": f"Open-Meteo indisponible: {exc}", "source_url": self.open_meteo_base}
+
+        if not rows:
+            empty = pd.DataFrame()
+            return {"all": empty, "selected": empty, "notice": "Open-Meteo: aucune donnee retournee", "source_url": self.open_meteo_base}
+
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date_obs_raw"], errors="coerce", utc=True)
+        df = df.dropna(subset=["date"]).sort_values("distance_to_lgv_km")
+        if not df.empty:
+            df = df.sort_values("date").drop_duplicates(subset=["station_id"], keep="last")
+            for col in [
+                "precipitation_mm",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "rain_12h_mm",
+                "rain_instant_mm",
+                "rain_forecast_mm",
+                "distance_to_lgv_km",
+            ]:
+                df[col] = pd.to_numeric(df.get(col), errors="coerce")
+            for col in [
+                "precipitation_mm",
+                "rain_24h_mm",
+                "rain_7d_mm",
+                "rain_30d_mm",
+                "rain_month_mm",
+                "rain_12h_mm",
+                "rain_instant_mm",
+                "rain_forecast_mm",
+            ]:
+                df[col] = df[col].fillna(0.0).clip(lower=0.0)
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join("data", f"open_meteo_lgv_grid_{ts}.csv")
+        df.to_csv(csv_path, index=False)
+        return {
+            "all": df.copy(),
+            "selected": df.copy(),
+            "notice": f"Open-Meteo grille LGV ({self.open_meteo_model}): {len(df)} points.",
+            "source_url": self.open_meteo_base,
+            "summary_path": csv_path,
+        }
+
+    def fetch_pluviometry_combined(self) -> Dict[str, object]:
+        mode = str(getattr(self, "weather_source_mode", "info_climat") or "info_climat").lower()
+        synop = self.fetch_pluviometry_synop()
+        synop_all = synop.get("all") if isinstance(synop.get("all"), pd.DataFrame) else pd.DataFrame()
+        synop_selected = synop.get("selected") if isinstance(synop.get("selected"), pd.DataFrame) else pd.DataFrame()
+        open_meteo = {"all": pd.DataFrame(), "selected": pd.DataFrame(), "notice": "Open-Meteo non sollicite", "source_url": None}
+        open_selected = pd.DataFrame()
+
+        if mode in {"info_climat", "infoclimat", "synop_only", "synop"}:
+            if not synop_selected.empty:
+                selected_df = synop_selected.copy()
+                selected_df["selection_mode"] = "info_climat_primary_synop"
+                all_df = synop_all.copy()
+                mode_notice = "Mode InfoClimat: SYNOP prioritaire (meme base que InfoClimat)."
+            else:
+                open_meteo = self.fetch_pluviometry_open_meteo()
+                open_all = open_meteo.get("all") if isinstance(open_meteo.get("all"), pd.DataFrame) else pd.DataFrame()
+                open_selected = open_meteo.get("selected") if isinstance(open_meteo.get("selected"), pd.DataFrame) else pd.DataFrame()
+                if not open_selected.empty:
+                    selected_df = open_selected.copy()
+                    selected_df["selection_mode"] = "info_climat_fallback_open_meteo"
+                    frames_all = [df for df in [synop_all, open_all] if isinstance(df, pd.DataFrame) and not df.empty]
+                    all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
+                    mode_notice = "Mode InfoClimat: fallback Open-Meteo uniquement car SYNOP indisponible."
+                else:
+                    selected_df = pd.DataFrame()
+                    all_df = synop_all.copy()
+                    mode_notice = "Mode InfoClimat: aucune source meteo disponible."
+        else:
+            open_meteo = self.fetch_pluviometry_open_meteo()
+            open_all = open_meteo.get("all") if isinstance(open_meteo.get("all"), pd.DataFrame) else pd.DataFrame()
+            open_selected = open_meteo.get("selected") if isinstance(open_meteo.get("selected"), pd.DataFrame) else pd.DataFrame()
+            frames_all = [df for df in [synop_all, open_all] if isinstance(df, pd.DataFrame) and not df.empty]
+            all_df = pd.concat(frames_all, ignore_index=True) if frames_all else pd.DataFrame()
+            frames_sel = [df for df in [synop_selected, open_selected] if isinstance(df, pd.DataFrame) and not df.empty]
+            selected_df = pd.concat(frames_sel, ignore_index=True) if frames_sel else pd.DataFrame()
+            mode_notice = f"Mode meteo '{mode}': fusion SYNOP + Open-Meteo."
+
+        notices = [n for n in [synop.get("notice"), open_meteo.get("notice")] if n]
+        notices.append(mode_notice)
+        notice = " | ".join([n for n in notices if n]) if notices else None
+
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        combined_csv = os.path.join("data", f"weather_combined_{ts}.csv")
+        if not selected_df.empty:
+            selected_df.to_csv(combined_csv, index=False)
+
+        summary_path = os.path.join("data", f"weather_summary_combined_{ts}.json")
+        self._save_json(
+            {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "synop_source": synop.get("source_url"),
+                "open_meteo_source": open_meteo.get("source_url"),
+                "selected_station_count": int(len(selected_df)) if not selected_df.empty else 0,
+                "weather_source_mode": mode,
+                "notice": notice,
+                "combined_csv": combined_csv if not selected_df.empty else None,
+            },
+            summary_path,
+        )
+        return {
+            "all": all_df,
+            "selected": selected_df,
+            "notice": notice,
+            "source_url": {"synop": synop.get("source_url"), "open_meteo": open_meteo.get("source_url")},
+            "summary_path": summary_path,
+        }
+
+    def _discover_station_for_river(self, rp: RiverMonitoringPoint) -> Optional[Dict[str, object]]:
+        pad = 0.65
+        min_lon, min_lat = rp.longitude - pad, rp.latitude - pad
+        max_lon, max_lat = rp.longitude + pad, rp.latitude + pad
+        url = f"{self.hubeau_base}{self.hubeau_endpoints['stations']}"
+        params = {"size": 1200, "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}"}
+
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f"Hub'Eau stations HTTP {response.status_code}")
+
+        items = response.json().get("data", [])
+        if not items:
+            return None
+
+        river_name = rp.river.lower()
+        ranked: List[Tuple[int, float, Dict[str, object]]] = []
+
+        for st in items:
+            code = st.get("code_station") or st.get("code_entite") or st.get("code_site")
+            lat = st.get("latitude_station") or st.get("latitude")
+            lon = st.get("longitude_station") or st.get("longitude")
+            name = st.get("libelle_station") or st.get("libelle") or st.get("nom_station") or ""
+            if not code or lat is None or lon is None:
+                continue
+            try:
+                lat_f, lon_f = float(lat), float(lon)
+            except Exception:
+                continue
+
+            dist_ref_km = self._haversine_km(rp.latitude, rp.longitude, lat_f, lon_f)
+            priority = 0 if river_name in str(name).lower() else 1
+            ranked.append(
+                (
+                    priority,
+                    dist_ref_km,
+                    {
+                        "station_code": code,
+                        "station_name": name,
+                        "station_latitude": lat_f,
+                        "station_longitude": lon_f,
+                        "distance_to_river_ref_km": round(dist_ref_km, 2),
+                        "auto_selected": True,
+                        "match_type": "name+distance" if priority == 0 else "distance_only",
+                    },
+                )
+            )
+
+        if not ranked:
+            return None
+        ranked.sort(key=lambda x: (x[0], x[1]))
+        return ranked[0][2]
+
+    def _discover_station_by_name(self, rp: RiverMonitoringPoint, keyword: str) -> Optional[Dict[str, object]]:
+        pad = 1.0
+        min_lon, min_lat = rp.longitude - pad, rp.latitude - pad
+        max_lon, max_lat = rp.longitude + pad, rp.latitude + pad
+        url = f"{self.hubeau_base}{self.hubeau_endpoints['stations']}"
+        params = {"size": 2000, "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}"}
+
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code != 200:
+            return None
+
+        key = keyword.lower()
+        hits: List[Tuple[float, Dict[str, object]]] = []
+        for st in response.json().get("data", []):
+            code = st.get("code_station") or st.get("code_entite") or st.get("code_site")
+            lat = st.get("latitude_station") or st.get("latitude")
+            lon = st.get("longitude_station") or st.get("longitude")
+            name = st.get("libelle_station") or st.get("libelle") or st.get("nom_station") or ""
+            if not code or lat is None or lon is None:
+                continue
+            if key not in str(name).lower():
+                continue
+            try:
+                lat_f, lon_f = float(lat), float(lon)
+            except Exception:
+                continue
+            dist_ref_km = self._haversine_km(rp.latitude, rp.longitude, lat_f, lon_f)
+            hits.append(
+                (
+                    dist_ref_km,
+                    {
+                        "station_code": code,
+                        "station_name": name,
+                        "station_latitude": lat_f,
+                        "station_longitude": lon_f,
+                        "distance_to_river_ref_km": round(dist_ref_km, 2),
+                        "auto_selected": True,
+                        "match_type": f"name:{keyword}",
+                    },
+                )
+            )
+
+        if not hits:
+            return None
+        hits.sort(key=lambda x: x[0])
+        return hits[0][1]
+
+    def _resolve_station_for_river(self, rp: RiverMonitoringPoint) -> Optional[Dict[str, object]]:
+        if rp.station_code:
+            return {
+                "station_code": rp.station_code,
+                "station_name": "manual_config",
+                "station_latitude": None,
+                "station_longitude": None,
+                "distance_to_river_ref_km": None,
+                "auto_selected": False,
+                "match_type": "manual",
+            }
+
+        cached = self.station_cache.get(rp.river)
+        if cached and cached.get("station_code"):
+            cached["auto_selected"] = True
+            cached.setdefault("match_type", "cached")
+            return cached
+
+        # User requirement: Charente uses Champniers measurement point when available.
+        if rp.river.lower() == "charente":
+            champniers = self._discover_station_by_name(rp, "champniers")
+            if champniers:
+                self.station_cache[rp.river] = champniers
+                self._save_station_cache()
+                return champniers
+
+        discovered = self._discover_station_for_river(rp)
+        if discovered:
+            self.station_cache[rp.river] = discovered
+            self._save_station_cache()
+        return discovered
+
+    def fetch_hydrometry_for_station(self, station_code: str, hours: int = 24) -> pd.DataFrame:
+        url = f"{self.hubeau_base}{self.hubeau_endpoints['observations_tr']}"
+        now = self._now_utc()
+        start = now - timedelta(hours=hours)
+
+        params = {
+            "code_entite": station_code,
+            "grandeur_hydro": "H",
+            "size": 500,
+            "sort": "desc",
+            "date_debut_obs": start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "date_fin_obs": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+
+        response = self.session.get(url, params=params, timeout=30)
+        if response.status_code not in (200, 206):
+            raise RuntimeError(f"Hub'Eau observations_tr HTTP {response.status_code}")
+
+        rows = []
+        for item in response.json().get("data", []):
+            date_obs = item.get("date_obs")
+            result = item.get("resultat_obs")
+            if date_obs is None or result is None:
+                continue
+            try:
+                rows.append(
+                    {
+                        "date_obs": pd.to_datetime(date_obs, utc=True, errors="coerce"),
+                        "level_m": float(result) / 1000.0,
+                        "status": item.get("statut_observation"),
+                    }
+                )
+            except Exception:
+                continue
+
+        df = pd.DataFrame(rows).dropna(subset=["date_obs"])
+        if df.empty:
+            return df
+        return df.sort_values("date_obs", ascending=False).reset_index(drop=True)
+
+    def fetch_all_river_levels(self) -> Dict[str, Dict[str, object]]:
+        logging.info("Hydrometrie: recuperation niveaux de cours d'eau.")
+        out: Dict[str, Dict[str, object]] = {}
+
+        for rp in self.river_points:
+            try:
+                station_meta = self._resolve_station_for_river(rp)
+                if not station_meta:
+                    out[rp.river] = {
+                        "configured": False,
+                        "river": rp.river,
+                        "name": rp.name,
+                        "message": "Aucune station Hub'Eau resolue pour cette riviere.",
+                        "source": DataSource.VIGICRUES_HYDRO.value,
+                    }
+                    continue
+
+                station_code = str(station_meta["station_code"])
+                obs_df = self.fetch_hydrometry_for_station(station_code=station_code, hours=24)
+                threshold_pack = self._fetch_hydroportal_thresholds(station_code)
+                hydro_emergency = self._safe_float(threshold_pack.get("emergency_threshold_m"))
+                hydro_watch = self._safe_float(threshold_pack.get("watch_threshold_m"))
+                configured_threshold = rp.threshold_m
+                threshold_m = configured_threshold if configured_threshold is not None else hydro_watch
+                if threshold_m is None:
+                    threshold_m = hydro_emergency
+                if configured_threshold is not None and hydro_emergency is not None:
+                    emergency_threshold_m = max(float(configured_threshold), float(hydro_emergency))
+                else:
+                    emergency_threshold_m = hydro_emergency if hydro_emergency is not None else configured_threshold
+
+                if obs_df.empty:
+                    out[rp.river] = {
+                        "configured": True,
+                        "river": rp.river,
+                        "name": rp.name,
+                        "station_code": station_code,
+                        "station_name": station_meta.get("station_name"),
+                        "auto_selected": bool(station_meta.get("auto_selected", False)),
+                        "match_type": station_meta.get("match_type"),
+                        "message": "Aucune observation disponible sur les 24h.",
+                        "threshold_m": threshold_m,
+                        "emergency_threshold_m": emergency_threshold_m,
+                        "threshold_source": threshold_pack.get("source_url"),
+                        "source": DataSource.VIGICRUES_HYDRO.value,
+                    }
+                    continue
+
+                latest = obs_df.iloc[0]
+                oldest = obs_df.iloc[-1]
+                dt_h = (latest["date_obs"] - oldest["date_obs"]).total_seconds() / 3600.0
+                trend_mph = (latest["level_m"] - oldest["level_m"]) / dt_h if dt_h > 0 else 0.0
+
+                out[rp.river] = {
+                    "configured": True,
+                    "river": rp.river,
+                    "name": rp.name,
+                    "station_code": station_code,
+                    "station_name": station_meta.get("station_name"),
+                    "station_latitude": station_meta.get("station_latitude"),
+                    "station_longitude": station_meta.get("station_longitude"),
+                    "distance_to_river_ref_km": station_meta.get("distance_to_river_ref_km"),
+                    "auto_selected": bool(station_meta.get("auto_selected", False)),
+                    "match_type": station_meta.get("match_type"),
+                    "last_level_m": round(float(latest["level_m"]), 3),
+                    "trend_mph": round(float(trend_mph), 3),
+                    "n_obs": int(len(obs_df)),
+                    "threshold_m": threshold_m,
+                    "emergency_threshold_m": emergency_threshold_m,
+                    "threshold_values_m": threshold_pack.get("threshold_values_m", []),
+                    "threshold_source": threshold_pack.get("source_url"),
+                    "rapid_rise_mph": rp.rapid_rise_mph,
+                    "observations": obs_df.head(24).to_dict(orient="records"),
+                    "source": DataSource.VIGICRUES_HYDRO.value,
+                }
+
+            except Exception as exc:
+                out[rp.river] = {
+                    "configured": bool(rp.station_code),
+                    "river": rp.river,
+                    "name": rp.name,
+                    "station_code": rp.station_code,
+                    "error": str(exc),
+                    "source": DataSource.VIGICRUES_HYDRO.value,
+                }
+
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(out, os.path.join("data", f"river_levels_{ts}.json"))
+        return out
+
+    @staticmethod
+    def _classify_hydro_network_risk(
+        trend_mph: Optional[float],
+        level_m: Optional[float] = None,
+        emergency_threshold_m: Optional[float] = None,
+    ) -> Dict[str, object]:
+        ratio = None
+        if level_m is not None and emergency_threshold_m is not None and emergency_threshold_m > 0:
+            ratio = float(level_m) / float(emergency_threshold_m)
+
+        if ratio is not None and ratio >= 1.0:
+            return {
+                "risk_level": "CRITIQUE",
+                "color": "#7f1d1d",
+                "score": 4,
+                "reason": "seuil_urgence_depasse",
+                "threshold_ratio": round(ratio, 3),
+            }
+        if ratio is not None and ratio >= 0.9:
+            return {
+                "risk_level": "ELEVE",
+                "color": "#dc2626",
+                "score": 3,
+                "reason": "proche_seuil_urgence",
+                "threshold_ratio": round(ratio, 3),
+            }
+
+        if trend_mph is None:
+            return {
+                "risk_level": "INDETERMINE",
+                "color": "#6b7280",
+                "score": 1,
+                "reason": "trend_indetermine",
+                "threshold_ratio": ratio,
+            }
+        if trend_mph >= 0.12:
+            return {
+                "risk_level": "CRITIQUE",
+                "color": "#7f1d1d",
+                "score": 4,
+                "reason": "montee_rapide_critique",
+                "threshold_ratio": ratio,
+            }
+        if trend_mph >= 0.08:
+            return {
+                "risk_level": "ELEVE",
+                "color": "#dc2626",
+                "score": 3,
+                "reason": "montee_rapide_elevee",
+                "threshold_ratio": ratio,
+            }
+        if trend_mph >= 0.04:
+            return {
+                "risk_level": "MODERE",
+                "color": "#ea580c",
+                "score": 2,
+                "reason": "montee_rapide_moderee",
+                "threshold_ratio": ratio,
+            }
+        return {
+            "risk_level": "FAIBLE",
+            "color": "#16a34a",
+            "score": 1,
+            "reason": "stable",
+            "threshold_ratio": ratio,
+        }
+
+    def fetch_hydro_network_near_lgv(self) -> Dict[str, object]:
+        required_catalog_version = 5
+        cached = self._load_fresh_cache(self.hydro_network_cache_file, self.hydro_network_cache_hours)
+        if cached:
+            cached_version = int(cached.get("catalog_version", 1) or 1)
+            stations_cached = cached.get("stations")
+            if cached_version >= required_catalog_version and isinstance(stations_cached, list) and stations_cached:
+                sample = stations_cached[0] if isinstance(stations_cached[0], dict) else {}
+                if isinstance(sample, dict) and (
+                    "emergency_threshold_m" in sample or "threshold_ratio" in sample
+                ):
+                    return cached
+            elif cached_version >= required_catalog_version and isinstance(stations_cached, list):
+                return cached
+
+        try:
+            pad_deg = max(0.1, (float(self.hydro_network_corridor_km) + 2.0) / 111.0)
+        except Exception:
+            pad_deg = 0.1
+        min_lon, min_lat, max_lon, max_lat = self._bbox_from_lgv_lines(pad_deg=pad_deg)
+
+        rows: List[Dict[str, object]] = []
+        page_size = max(int(self.hydro_network_page_size), 100)
+        max_pages = max(int(self.hydro_network_max_pages), 1)
+        for page in range(1, max_pages + 1):
+            response = self.session.get(
+                f"{self.hubeau_base}{self.hubeau_endpoints['stations']}",
+                params={
+                    "size": page_size,
+                    "page": page,
+                    "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
+                },
+                timeout=30,
+            )
+            if response.status_code != 200:
+                if page == 1:
+                    payload = {
+                        "timestamp_utc": self._now_utc().isoformat(),
+                        "catalog_version": required_catalog_version,
+                        "source": DataSource.HUBEAU_HYDRO.value,
+                        "summary": {"error": f"Hub'Eau stations HTTP {response.status_code}"},
+                        "alerts": [],
+                        "stations": [],
+                    }
+                    self._save_json(payload, self.hydro_network_cache_file)
+                    return payload
+                break
+
+            data_page = response.json().get("data", [])
+            if not isinstance(data_page, list) or not data_page:
+                break
+            rows.extend(data_page)
+            if len(data_page) < page_size:
+                break
+
+        candidates: List[Dict[str, object]] = []
+        seen_codes = set()
+        for st in rows:
+            closed_at = st.get("date_fermeture_station") or st.get("date_desactivation")
+            if closed_at:
+                continue
+            code = st.get("code_station") or st.get("code_entite") or st.get("code_site")
+            lat = self._safe_float(st.get("latitude_station") or st.get("latitude"))
+            lon = self._safe_float(st.get("longitude_station") or st.get("longitude"))
+            if not code or lat is None or lon is None:
+                continue
+            code = str(code)
+            if code in seen_codes:
+                continue
+            dist_km = self._point_to_lgv_distance_km(float(lat), float(lon))
+            if dist_km > self.hydro_network_corridor_km:
+                continue
+            seen_codes.add(code)
+            candidates.append(
+                {
+                    "station_code": code,
+                    "station_name": str(st.get("libelle_station") or st.get("libelle") or code),
+                    "river_name": str(st.get("libelle_cours_eau") or "inconnu"),
+                    "latitude": float(lat),
+                    "longitude": float(lon),
+                    "distance_to_lgv_km": round(float(dist_km), 3),
+                }
+            )
+
+        candidates = sorted(candidates, key=lambda x: x["distance_to_lgv_km"])
+        scan_limit = min(
+            len(candidates),
+            max(1, int(self.hydro_network_max_stations)) * max(1, int(self.hydro_network_scan_multiplier)),
+        )
+        stations: List[Dict[str, object]] = []
+        alerts: List[Dict[str, object]] = []
+        for st in candidates[:scan_limit]:
+            try:
+                obs_df = self.fetch_hydrometry_for_station(st["station_code"], hours=self.hydro_network_hours)
+            except Exception:
+                continue
+            if obs_df.empty:
+                continue
+
+            latest = obs_df.iloc[0]
+            old_idx = min(len(obs_df) - 1, 8)
+            old = obs_df.iloc[old_idx]
+            dt_h = max((latest["date_obs"] - old["date_obs"]).total_seconds() / 3600.0, 0.0)
+            trend_mph = (float(latest["level_m"]) - float(old["level_m"])) / dt_h if dt_h > 0 else None
+            latest_level = round(float(latest["level_m"]), 3)
+            threshold_pack = self._fetch_hydroportal_thresholds(st["station_code"])
+            watch_threshold = self._safe_float(threshold_pack.get("watch_threshold_m"))
+            emergency_threshold = self._safe_float(threshold_pack.get("emergency_threshold_m"))
+            cls = self._classify_hydro_network_risk(
+                trend_mph=trend_mph,
+                level_m=latest_level,
+                emergency_threshold_m=emergency_threshold,
+            )
+            threshold_ratio = cls.get("threshold_ratio")
+            exceeded = (
+                emergency_threshold is not None and latest_level is not None and latest_level >= float(emergency_threshold)
+            )
+            item = {
+                **st,
+                "last_obs_utc": latest["date_obs"].isoformat(),
+                "last_level_m": latest_level,
+                "trend_mph": None if trend_mph is None else round(float(trend_mph), 3),
+                "n_obs": int(len(obs_df)),
+                "watch_threshold_m": watch_threshold,
+                "emergency_threshold_m": emergency_threshold,
+                "threshold_values_m": threshold_pack.get("threshold_values_m", []),
+                "threshold_source": threshold_pack.get("source_url"),
+                "threshold_ratio": None if threshold_ratio is None else round(float(threshold_ratio), 3),
+                "threshold_exceeded": bool(exceeded),
+                "risk_reason": cls.get("reason"),
+                "risk_level": cls["risk_level"],
+                "risk_color": cls["color"],
+                "risk_score": cls["score"],
+                "source": DataSource.HUBEAU_HYDRO.value,
+            }
+            stations.append(item)
+            if len(stations) >= int(self.hydro_network_max_stations):
+                break
+            if item["risk_level"] in {"CRITIQUE", "ELEVE"}:
+                ratio_txt = ""
+                if item.get("threshold_ratio") is not None:
+                    ratio_txt = f" | ratio_seuil={item.get('threshold_ratio')}"
+                thr_txt = ""
+                if item.get("emergency_threshold_m") is not None:
+                    thr_txt = f" | seuil_urgence={item.get('emergency_threshold_m')} m"
+                alerts.append(
+                    {
+                        "type": "HYDRO_RESEAU",
+                        "level": "CRITIQUE" if item["risk_level"] == "CRITIQUE" else "ELEVE",
+                        "message": (
+                            f"{item['station_code']} ({item['river_name']}): "
+                            f"trend={item['trend_mph']} m/h | niveau={item['last_level_m']} m"
+                            f"{thr_txt}{ratio_txt}"
+                        ),
+                    }
+                )
+
+        summary = {
+            "raw_stations_bbox": int(len(rows)),
+            "candidate_stations": int(len(candidates)),
+            "scanned_candidates": int(min(scan_limit, len(candidates))),
+            "stations_with_data": int(len(stations)),
+            "critical_stations": int(sum(1 for s in stations if s["risk_level"] == "CRITIQUE")),
+            "high_stations": int(sum(1 for s in stations if s["risk_level"] == "ELEVE")),
+            "moderate_stations": int(sum(1 for s in stations if s["risk_level"] == "MODERE")),
+            "stations_with_threshold": int(sum(1 for s in stations if s.get("emergency_threshold_m") is not None)),
+            "threshold_exceeded_stations": int(sum(1 for s in stations if bool(s.get("threshold_exceeded")))),
+        }
+        payload = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "catalog_version": required_catalog_version,
+            "source": DataSource.HUBEAU_HYDRO.value,
+            "corridor_km": self.hydro_network_corridor_km,
+            "summary": summary,
+            "alerts": alerts[:12],
+            "stations": stations,
+        }
+        self._save_json(payload, self.hydro_network_cache_file)
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(payload, os.path.join("data", f"hydro_network_{ts}.json"))
+        return payload
+
+    def build_surveillance_sectors(
+        self,
+        weather_df: pd.DataFrame,
+        geotech: Optional[Dict[str, object]],
+        piezometers: Optional[Dict[str, object]],
+        hydro_network: Optional[Dict[str, object]],
+    ) -> Dict[str, object]:
+        centers_with_pk: List[Tuple[float, float, float]] = []
+        line = self._representative_lgv_line()
+        if line and len(line) >= 2:
+            chain_samples = self._sample_line_with_chainage(line, self.sector_length_km)
+            if chain_samples:
+                for item in chain_samples:
+                    lat = self._safe_float(item.get("latitude"))
+                    lon = self._safe_float(item.get("longitude"))
+                    pk_km = self._safe_float(item.get("pk_km"))
+                    if lat is None or lon is None or pk_km is None:
+                        continue
+                    centers_with_pk.append((float(lat), float(lon), float(pk_km)))
+        if not centers_with_pk:
+            fallback_centers = self._sample_points_along_lgv(self.sector_length_km, self.sector_max_points)
+            for idx, (lat, lon) in enumerate(fallback_centers):
+                centers_with_pk.append((float(lat), float(lon), float(idx) * float(self.sector_length_km)))
+        if len(centers_with_pk) > int(self.sector_max_points):
+            stride = max(1, len(centers_with_pk) // int(self.sector_max_points))
+            sampled = centers_with_pk[::stride]
+            if sampled and sampled[-1] != centers_with_pk[-1]:
+                sampled.append(centers_with_pk[-1])
+            centers_with_pk = sampled[: int(self.sector_max_points)]
+        sectors = []
+        alerts = []
+
+        weather_records = weather_df.to_dict(orient="records") if isinstance(weather_df, pd.DataFrame) and not weather_df.empty else []
+        geotech_points = geotech.get("points", []) if isinstance(geotech, dict) and isinstance(geotech.get("points"), list) else []
+        piezo_points = piezometers.get("stations", []) if isinstance(piezometers, dict) and isinstance(piezometers.get("stations"), list) else []
+        hydro_points = hydro_network.get("stations", []) if isinstance(hydro_network, dict) and isinstance(hydro_network.get("stations"), list) else []
+
+        rain_score_map = {"NORMAL": 1, "VIGILANCE": 2, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
+        piezo_score_map = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "TRES_ELEVE": 4}
+        hydro_score_map = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
+        ai_risk_color = {"FAIBLE": "#16a34a", "MODERE": "#ea580c", "ELEVE": "#dc2626", "CRITIQUE": "#7f1d1d"}
+
+        for idx, (lat, lon, pk_km) in enumerate(centers_with_pk, start=1):
+            near_weather = [
+                r for r in weather_records
+                if self._haversine_km(lat, lon, float(r.get("latitude", lat)), float(r.get("longitude", lon))) <= self.sector_radius_km
+            ]
+            near_geo = [
+                g for g in geotech_points
+                if self._haversine_km(lat, lon, float(g.get("latitude", lat)), float(g.get("longitude", lon))) <= self.sector_radius_km
+            ]
+            near_piezo = [
+                p for p in piezo_points
+                if self._haversine_km(lat, lon, float(p.get("latitude", lat)), float(p.get("longitude", lon))) <= self.sector_radius_km
+            ]
+            near_hydro = [
+                h for h in hydro_points
+                if self._haversine_km(lat, lon, float(h.get("latitude", lat)), float(h.get("longitude", lon))) <= self.sector_radius_km
+            ]
+
+            if near_weather:
+                max24 = max(float(r.get("rain_24h_mm", 0.0) or 0.0) for r in near_weather)
+                max7 = max(float(r.get("rain_7d_mm", r.get("rain_24h_mm", 0.0)) or 0.0) for r in near_weather)
+                max30 = max(float(r.get("rain_30d_mm", r.get("rain_24h_mm", 0.0)) or 0.0) for r in near_weather)
+                maxmonth = max(float(r.get("rain_month_mm", r.get("rain_30d_mm", r.get("rain_24h_mm", 0.0))) or 0.0) for r in near_weather)
+                rain_class = self._station_pluvio_class(max24, max7, max30)
+                weather_score = rain_score_map.get(rain_class, 1)
+            else:
+                max24 = max7 = max30 = maxmonth = 0.0
+                rain_class = "INDETERMINE"
+                weather_score = 1
+
+            geotech_score = max((int(g.get("risk_score", 1) or 1) for g in near_geo), default=1)
+            piezo_score = max((piezo_score_map.get(str(p.get("risk_level")), 1) for p in near_piezo), default=1)
+            hydro_score = max((hydro_score_map.get(str(h.get("risk_level")), 1) for h in near_hydro), default=1)
+            soil_context = self._build_sector_soil_context(lat, lon, near_geo, geotech_points)
+            ai_pred = self._predict_sector_ai_risk(
+                max24_mm=max24,
+                max7_mm=max7,
+                max30_mm=max30,
+                maxmonth_mm=maxmonth,
+                weather_score=weather_score,
+                geotech_score=geotech_score,
+                piezo_score=piezo_score,
+                hydro_score=hydro_score,
+                soil_context=soil_context,
+            )
+            ai_level = str(ai_pred.get("risk_level", "INDETERMINE"))
+
+            component_scores = [weather_score, geotech_score, piezo_score, hydro_score]
+            avg_score = sum(component_scores) / len(component_scores)
+            worst = max(component_scores)
+            if avg_score >= 3.2:
+                risk_level = "CRITIQUE"
+                color = "#7f1d1d"
+            elif worst >= 4 or avg_score >= 2.5:
+                risk_level = "ELEVE"
+                color = "#dc2626"
+            elif avg_score >= 1.8:
+                risk_level = "MODERE"
+                color = "#ea580c"
+            else:
+                risk_level = "FAIBLE"
+                color = "#16a34a"
+
+            commune_info = self._resolve_commune_for_point(lat, lon)
+            sector = {
+                "sector_id": f"S{idx:02d}",
+                "latitude": round(float(lat), 6),
+                "longitude": round(float(lon), 6),
+                "pk_km": round(float(pk_km), 3),
+                "radius_km": self.sector_radius_km,
+                "commune_name": commune_info.get("commune_name"),
+                "commune_code": commune_info.get("commune_code"),
+                "departement_code": commune_info.get("departement_code"),
+                "departement_name": commune_info.get("departement_name"),
+                "risk_level": risk_level,
+                "risk_color": color,
+                "score": round(avg_score, 2),
+                "weather_class": rain_class,
+                "weather_max_24h_mm": round(max24, 1),
+                "weather_max_7d_mm": round(max7, 1),
+                "weather_max_30d_mm": round(max30, 1),
+                "weather_max_month_mm": round(maxmonth, 1),
+                "geotech_points": int(len(near_geo)),
+                "piezometers": int(len(near_piezo)),
+                "hydro_stations": int(len(near_hydro)),
+                "ai_model_name": str(ai_pred.get("model_name", self.ai_model_name)),
+                "ai_model_version": str(ai_pred.get("model_version", self.ai_model_version)),
+                "ai_pred_risk_level": ai_level,
+                "ai_pred_risk_color": ai_risk_color.get(ai_level, "#6b7280"),
+                "ai_pred_score": round(float(ai_pred.get("score", 1.0) or 1.0), 2),
+                "ai_pred_probability": round(float(ai_pred.get("probability", 0.0) or 0.0), 4),
+                "ai_confidence": round(float(ai_pred.get("confidence", 0.0) or 0.0), 4),
+                "ai_rain_pressure": round(float(ai_pred.get("rain_pressure", 0.0) or 0.0), 4),
+                "ai_soil_fragility": round(float(ai_pred.get("soil_fragility", 0.0) or 0.0), 4),
+                "ai_dominant_pedology": soil_context.get("dominant_pedology"),
+                "ai_dominant_soil_type": soil_context.get("dominant_soil_type"),
+                "ai_soil_source": soil_context.get("source"),
+                "ai_has_fragile_soils": bool(soil_context.get("has_fragile_soils")),
+                "ai_top_factors": ai_pred.get("top_factors", []),
+                "under_watch": bool(risk_level in {"CRITIQUE", "ELEVE", "MODERE"} or ai_level in {"CRITIQUE", "ELEVE"}),
+            }
+            sectors.append(sector)
+            if sector["risk_level"] in {"CRITIQUE", "ELEVE"}:
+                alerts.append(
+                    {
+                        "type": "SECTEUR",
+                        "level": "CRITIQUE" if sector["risk_level"] == "CRITIQUE" else "ELEVE",
+                        "message": (
+                            f"{sector['sector_id']}: score={sector['score']} | pluie24h={sector['weather_max_24h_mm']} mm "
+                            f"| geotech={sector['geotech_points']} | piezo={sector['piezometers']} | hydro={sector['hydro_stations']} "
+                            f"| ia={sector['ai_pred_risk_level']} ({int(float(sector['ai_pred_probability']) * 100)}%)"
+                        ),
+                    }
+                )
+            if sector["ai_pred_risk_level"] in {"CRITIQUE", "ELEVE"} and sector["risk_level"] not in {"CRITIQUE", "ELEVE"}:
+                alerts.append(
+                    {
+                        "type": "SECTEUR_IA",
+                        "level": "CRITIQUE" if sector["ai_pred_risk_level"] == "CRITIQUE" else "ELEVE",
+                        "message": (
+                            f"{sector['sector_id']}: prediction IA={sector['ai_pred_risk_level']} "
+                            f"({int(float(sector['ai_pred_probability']) * 100)}%) | "
+                            f"sol={sector.get('ai_dominant_pedology')} | pluie24h={sector['weather_max_24h_mm']} mm"
+                        ),
+                    }
+                )
+
+        summary = {
+            "sector_count": int(len(sectors)),
+            "critical": int(sum(1 for s in sectors if s["risk_level"] == "CRITIQUE")),
+            "high": int(sum(1 for s in sectors if s["risk_level"] == "ELEVE")),
+            "moderate": int(sum(1 for s in sectors if s["risk_level"] == "MODERE")),
+            "watch": int(sum(1 for s in sectors if s["under_watch"])),
+            "ai_critical": int(sum(1 for s in sectors if s.get("ai_pred_risk_level") == "CRITIQUE")),
+            "ai_high": int(sum(1 for s in sectors if s.get("ai_pred_risk_level") == "ELEVE")),
+            "ai_moderate": int(sum(1 for s in sectors if s.get("ai_pred_risk_level") == "MODERE")),
+            "ai_mean_probability": round(
+                float(sum(float(s.get("ai_pred_probability", 0.0) or 0.0) for s in sectors) / max(len(sectors), 1)),
+                4,
+            ),
+            "fragile_soil_sectors": int(sum(1 for s in sectors if float(s.get("ai_soil_fragility", 0.0) or 0.0) >= 0.70)),
+        }
+
+        risk_rank = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
+        by_commune: Dict[str, Dict[str, object]] = {}
+        for sec in sectors:
+            name = str(sec.get("commune_name") or "Inconnue")
+            code = sec.get("commune_code")
+            dep_code = sec.get("departement_code")
+            dep_name = sec.get("departement_name")
+            if name not in by_commune:
+                by_commune[name] = {
+                    "commune_name": name,
+                    "commune_code": code,
+                    "departement_code": dep_code,
+                    "departement_name": dep_name,
+                    "sector_count": 0,
+                    "sum_score": 0.0,
+                    "max_score": 0.0,
+                    "critical": 0,
+                    "high": 0,
+                    "moderate": 0,
+                    "watch": 0,
+                    "avg_risk_rank": 0.0,
+                    "ai_sum_probability": 0.0,
+                    "ai_max_probability": 0.0,
+                    "ai_critical": 0,
+                    "ai_high": 0,
+                    "ai_soil_fragility_sum": 0.0,
+                }
+            row = by_commune[name]
+            row["sector_count"] = int(row["sector_count"]) + 1
+            row["sum_score"] = float(row["sum_score"]) + float(sec.get("score", 0.0) or 0.0)
+            row["max_score"] = max(float(row["max_score"]), float(sec.get("score", 0.0) or 0.0))
+            row["critical"] = int(row["critical"]) + (1 if sec.get("risk_level") == "CRITIQUE" else 0)
+            row["high"] = int(row["high"]) + (1 if sec.get("risk_level") == "ELEVE" else 0)
+            row["moderate"] = int(row["moderate"]) + (1 if sec.get("risk_level") == "MODERE" else 0)
+            row["watch"] = int(row["watch"]) + (1 if sec.get("under_watch") else 0)
+            row["avg_risk_rank"] = float(row["avg_risk_rank"]) + float(risk_rank.get(str(sec.get("risk_level")), 1))
+            ai_prob = float(sec.get("ai_pred_probability", 0.0) or 0.0)
+            row["ai_sum_probability"] = float(row["ai_sum_probability"]) + ai_prob
+            row["ai_max_probability"] = max(float(row["ai_max_probability"]), ai_prob)
+            row["ai_critical"] = int(row["ai_critical"]) + (1 if sec.get("ai_pred_risk_level") == "CRITIQUE" else 0)
+            row["ai_high"] = int(row["ai_high"]) + (1 if sec.get("ai_pred_risk_level") == "ELEVE" else 0)
+            row["ai_soil_fragility_sum"] = float(row["ai_soil_fragility_sum"]) + float(sec.get("ai_soil_fragility", 0.0) or 0.0)
+
+        commune_rows: List[Dict[str, object]] = []
+        for _, row in by_commune.items():
+            n = max(int(row["sector_count"]), 1)
+            avg_score = float(row["sum_score"]) / n
+            avg_rank = float(row["avg_risk_rank"]) / n
+            ai_avg_probability = float(row["ai_sum_probability"]) / n
+            ai_max_probability = float(row["ai_max_probability"])
+            ai_soil_fragility = float(row["ai_soil_fragility_sum"]) / n
+            base_note = min(100.0, max(0.0, (avg_score / 4.0) * 100.0 + 8.0 * int(row["critical"]) + 4.0 * int(row["high"])))
+            ai_note = min(100.0, max(0.0, ai_max_probability * 100.0))
+            note = min(100.0, max(0.0, 0.72 * base_note + 0.28 * ai_note))
+            if ai_max_probability >= 0.85 or int(row["ai_critical"]) > 0:
+                ai_commune_level = "CRITIQUE"
+            elif ai_max_probability >= 0.65 or int(row["ai_high"]) > 0:
+                ai_commune_level = "ELEVE"
+            elif ai_max_probability >= 0.40:
+                ai_commune_level = "MODERE"
+            else:
+                ai_commune_level = "FAIBLE"
+            if note >= 80:
+                commune_level = "CRITIQUE"
+            elif note >= 60:
+                commune_level = "ELEVE"
+            elif note >= 40:
+                commune_level = "MODERE"
+            else:
+                commune_level = "FAIBLE"
+            commune_rows.append(
+                {
+                    "commune_name": row["commune_name"],
+                    "commune_code": row["commune_code"],
+                    "departement_code": row["departement_code"],
+                    "departement_name": row["departement_name"],
+                    "sector_count": n,
+                    "avg_sector_score": round(avg_score, 2),
+                    "max_sector_score": round(float(row["max_score"]), 2),
+                    "avg_risk_rank": round(avg_rank, 2),
+                    "critical": int(row["critical"]),
+                    "high": int(row["high"]),
+                    "moderate": int(row["moderate"]),
+                    "watch": int(row["watch"]),
+                    "commune_note": round(note, 1),
+                    "commune_risk_level": commune_level,
+                    "ai_avg_probability": round(ai_avg_probability, 4),
+                    "ai_max_probability": round(ai_max_probability, 4),
+                    "ai_critical": int(row["ai_critical"]),
+                    "ai_high": int(row["ai_high"]),
+                    "ai_avg_soil_fragility": round(ai_soil_fragility, 4),
+                    "ai_commune_risk_level": ai_commune_level,
+                }
+            )
+
+        commune_rows.sort(key=lambda r: (-float(r.get("commune_note", 0.0)), -int(r.get("critical", 0)), str(r.get("commune_name", ""))))
+        payload = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "sector_length_km": self.sector_length_km,
+            "sector_radius_km": self.sector_radius_km,
+            "summary": summary,
+            "commune_summary": commune_rows,
+            "alerts": alerts[:12],
+            "ai_model": {
+                "name": self.ai_model_name,
+                "version": self.ai_model_version,
+                "description": "Modele predictif pluie + fragilite des sols (argiles/pedologie) applique sur chaque secteur LGV.",
+            },
+            "sectors": sectors,
+        }
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(payload, os.path.join("data", f"surveillance_sectors_{ts}.json"))
+        return payload
+
+    def analyze_risks(
+        self,
+        weather_df: pd.DataFrame,
+        weather_notice: Optional[str],
+        rivers: Dict[str, Dict[str, object]],
+        geotech: Optional[Dict[str, object]] = None,
+        piezometers: Optional[Dict[str, object]] = None,
+        hydro_network: Optional[Dict[str, object]] = None,
+        sectors: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        risks: Dict[str, object] = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "risk_level": "FAIBLE",
+            "score": 0.0,
+            "alerts": [],
+            "details": {},
+            "recommendations": [],
+            "weather_selection_notice": weather_notice,
+        }
+        factors: List[int] = []
+
+        if not weather_df.empty:
+            metric_col = "rain_24h_mm" if "rain_24h_mm" in weather_df.columns else "precipitation_mm"
+            max_rain = float(weather_df[metric_col].max())
+            mean_rain = float(weather_df[metric_col].mean())
+            max_7d = float(weather_df.get("rain_7d_mm", weather_df[metric_col]).max())
+            max_30d = float(weather_df.get("rain_30d_mm", weather_df[metric_col]).max())
+            class_counts = weather_df.get("rain_class", pd.Series(dtype=str)).value_counts().to_dict()
+            risks["details"]["weather"] = {
+                "station_count": int(len(weather_df)),
+                "corridor_km": self.weather_corridor_km,
+                "metric": metric_col,
+                "max_mm": round(max_rain, 2),
+                "mean_mm": round(mean_rain, 2),
+                "max_7d_mm": round(max_7d, 2),
+                "max_30d_mm": round(max_30d, 2),
+                "class_counts": class_counts,
+            }
+
+            if max_rain >= self.alert_thresholds_mm["catastrophique_24h"]:
+                factors.append(4)
+                risks["alerts"].append(
+                    {
+                        "type": "PLUIE_CATASTROPHIQUE",
+                        "level": "CRITIQUE",
+                        "message": f"Cumul 24h catastrophique: {max_rain:.1f} mm",
+                    }
+                )
+            elif max_rain >= self.alert_thresholds_mm["extreme_24h"]:
+                factors.append(3)
+                risks["alerts"].append({"type": "PLUIE", "level": "ELEVE", "message": f"Pluie extreme: {max_rain:.1f} mm/24h"})
+            elif max_rain >= self.alert_thresholds_mm["forte_24h"]:
+                factors.append(3)
+                risks["alerts"].append({"type": "PLUIE", "level": "ELEVE", "message": f"Pluie forte: {max_rain:.1f} mm/24h"})
+            elif max_rain >= self.alert_thresholds_mm["moderee_24h"]:
+                factors.append(2)
+                risks["alerts"].append({"type": "PLUIE", "level": "MODERE", "message": f"Pluie notable: {max_rain:.1f} mm/24h"})
+
+            if max_7d >= 120:
+                factors.append(3)
+                risks["alerts"].append({"type": "PLUIE_CUMUL_7J", "level": "ELEVE", "message": f"Cumul 7 jours eleve: {max_7d:.1f} mm"})
+            elif max_7d >= 80:
+                factors.append(2)
+                risks["alerts"].append({"type": "PLUIE_CUMUL_7J", "level": "MODERE", "message": f"Cumul 7 jours notable: {max_7d:.1f} mm"})
+
+            if max_30d >= 220:
+                factors.append(2)
+                risks["alerts"].append({"type": "PLUIE_CUMUL_30J", "level": "ELEVE", "message": f"Cumul 30 jours eleve: {max_30d:.1f} mm"})
+            elif max_30d >= 150:
+                factors.append(1)
+                risks["alerts"].append({"type": "PLUIE_CUMUL_30J", "level": "MODERE", "message": f"Cumul 30 jours notable: {max_30d:.1f} mm"})
+
+            critical_stations = weather_df[weather_df.get("rain_24h_mm", weather_df["precipitation_mm"]) >= self.alert_thresholds_mm["extreme_24h"]]
+            for _, row in critical_stations.head(5).iterrows():
+                risks["alerts"].append(
+                    {
+                        "type": "STATION_CRITIQUE",
+                        "level": "ELEVE",
+                        "message": (
+                            f"Station {row.get('station_id')} ({row.get('source')}): "
+                            f"{row.get('rain_24h_mm', row.get('precipitation_mm'))} mm/24h "
+                            f"a {row.get('distance_to_lgv_km')} km de la LGV"
+                        ),
+                    }
+                )
+
+        if weather_notice:
+            factors.append(1)
+            risks["alerts"].append({"type": "COUVERTURE", "level": "INFO", "message": weather_notice})
+            risks["recommendations"].append("Verifier la couverture meteo locale et la qualite des capteurs.")
+
+        if isinstance(geotech, dict):
+            summary = geotech.get("summary", {}) if isinstance(geotech.get("summary"), dict) else {}
+            risks["details"]["geotech"] = {
+                "sample_count": geotech.get("sample_count", 0),
+                "critical_points": summary.get("critical_points", 0),
+                "high_points": summary.get("high_points", 0),
+                "moderate_points": summary.get("moderate_points", 0),
+                "source": geotech.get("source"),
+            }
+            critical_points = int(summary.get("critical_points", 0) or 0)
+            high_points = int(summary.get("high_points", 0) or 0)
+            if critical_points > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "GEOTECH_CRITIQUE",
+                        "level": "CRITIQUE",
+                        "message": f"{critical_points} points LGV a risque geotechnique critique (argiles/MVT).",
+                    }
+                )
+            elif high_points >= 3:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "GEOTECH_ELEVE",
+                        "level": "ELEVE",
+                        "message": f"{high_points} points LGV a risque geotechnique eleve.",
+                    }
+                )
+            for alert in (geotech.get("alerts") or [])[:5]:
+                if isinstance(alert, dict):
+                    risks["alerts"].append(alert)
+            risks["recommendations"].append(
+                "Prioriser les inspections genie civil sur les secteurs argileux exposes et points MVT."
+            )
+
+        if isinstance(piezometers, dict):
+            summary = piezometers.get("summary", {}) if isinstance(piezometers.get("summary"), dict) else {}
+            risks["details"]["groundwater"] = {
+                "stations_in_corridor": summary.get("stations_in_corridor", 0),
+                "stations_with_data": summary.get("stations_with_data", 0),
+                "very_high_risk": summary.get("very_high_risk", 0),
+                "high_risk": summary.get("high_risk", 0),
+                "rapid_rise_alerts": summary.get("rapid_rise_alerts", 0),
+                "source": piezometers.get("source"),
+            }
+            very_high = int(summary.get("very_high_risk", 0) or 0)
+            high = int(summary.get("high_risk", 0) or 0)
+            rapid = int(summary.get("rapid_rise_alerts", 0) or 0)
+            if very_high > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "NAPPE_TRES_HAUTE",
+                        "level": "CRITIQUE",
+                        "message": f"{very_high} piezometre(s) avec nappe tres proche du sol.",
+                    }
+                )
+            elif high > 0:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "NAPPE_HAUTE",
+                        "level": "ELEVE",
+                        "message": f"{high} piezometre(s) avec niveau de nappe eleve.",
+                    }
+                )
+            if rapid > 0:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "NAPPE_MONTEE_RAPIDE",
+                        "level": "ELEVE",
+                        "message": f"{rapid} piezometre(s) en remontee rapide de nappe.",
+                    }
+                )
+            for alert in (piezometers.get("alerts") or [])[:8]:
+                if isinstance(alert, dict):
+                    risks["alerts"].append(alert)
+            risks["recommendations"].append(
+                "Verifier reseaux de drainage, exutoires et stabilite des talus dans les secteurs a nappe haute."
+            )
+
+        if isinstance(hydro_network, dict):
+            summary = hydro_network.get("summary", {}) if isinstance(hydro_network.get("summary"), dict) else {}
+            risks["details"]["hydro_network"] = {
+                "candidate_stations": summary.get("candidate_stations", 0),
+                "stations_with_data": summary.get("stations_with_data", 0),
+                "critical_stations": summary.get("critical_stations", 0),
+                "high_stations": summary.get("high_stations", 0),
+                "moderate_stations": summary.get("moderate_stations", 0),
+                "stations_with_threshold": summary.get("stations_with_threshold", 0),
+                "threshold_exceeded_stations": summary.get("threshold_exceeded_stations", 0),
+                "source": hydro_network.get("source"),
+            }
+            critical = int(summary.get("critical_stations", 0) or 0)
+            high = int(summary.get("high_stations", 0) or 0)
+            exceeded = int(summary.get("threshold_exceeded_stations", 0) or 0)
+            if critical > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "HYDRO_RESEAU_CRITIQUE",
+                        "level": "CRITIQUE",
+                        "message": f"{critical} station(s) hydro reseau en montee critique.",
+                    }
+                )
+            elif high >= 2:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "HYDRO_RESEAU_ELEVE",
+                        "level": "ELEVE",
+                        "message": f"{high} station(s) hydro reseau en montee elevee.",
+                    }
+                )
+            if exceeded > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "HYDRO_SEUIL_URGENCE",
+                        "level": "CRITIQUE",
+                        "message": f"{exceeded} station(s) hydro reseau avec depassement du seuil d'urgence.",
+                    }
+                )
+            for alert in (hydro_network.get("alerts") or [])[:8]:
+                if isinstance(alert, dict):
+                    risks["alerts"].append(alert)
+            risks["recommendations"].append(
+                "Suivre en continu les stations Vigicrues proches de la plateforme LGV et valider les tendances."
+            )
+
+        if isinstance(sectors, dict):
+            summary = sectors.get("summary", {}) if isinstance(sectors.get("summary"), dict) else {}
+            risks["details"]["sectors"] = {
+                "sector_count": summary.get("sector_count", 0),
+                "critical": summary.get("critical", 0),
+                "high": summary.get("high", 0),
+                "moderate": summary.get("moderate", 0),
+                "watch": summary.get("watch", 0),
+                "ai_critical": summary.get("ai_critical", 0),
+                "ai_high": summary.get("ai_high", 0),
+                "ai_moderate": summary.get("ai_moderate", 0),
+                "ai_mean_probability": summary.get("ai_mean_probability", 0.0),
+                "fragile_soil_sectors": summary.get("fragile_soil_sectors", 0),
+            }
+            critical = int(summary.get("critical", 0) or 0)
+            high = int(summary.get("high", 0) or 0)
+            ai_critical = int(summary.get("ai_critical", 0) or 0)
+            ai_high = int(summary.get("ai_high", 0) or 0)
+            fragile_soils = int(summary.get("fragile_soil_sectors", 0) or 0)
+            if critical > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "SECTEURS_CRITIQUES",
+                        "level": "CRITIQUE",
+                        "message": f"{critical} secteur(s) de surveillance en criticite.",
+                    }
+                )
+            elif high > 0:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "SECTEURS_ELEVES",
+                        "level": "ELEVE",
+                        "message": f"{high} secteur(s) de surveillance en risque eleve.",
+                    }
+                )
+            if ai_critical > 0:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "SECTEURS_IA_CRITIQUES",
+                        "level": "CRITIQUE",
+                        "message": f"{ai_critical} secteur(s) predicts CRITIQUE par le modele IA pluie/sol.",
+                    }
+                )
+            elif ai_high > 0:
+                factors.append(2)
+                risks["alerts"].append(
+                    {
+                        "type": "SECTEURS_IA_ELEVES",
+                        "level": "ELEVE",
+                        "message": f"{ai_high} secteur(s) predicts ELEVE par le modele IA pluie/sol.",
+                    }
+                )
+            if fragile_soils > 0:
+                risks["alerts"].append(
+                    {
+                        "type": "SOLS_FRAGILES",
+                        "level": "MODERE",
+                        "message": f"{fragile_soils} secteur(s) presentent une fragilite pedologique marquee.",
+                    }
+                )
+            for alert in (sectors.get("alerts") or [])[:8]:
+                if isinstance(alert, dict):
+                    risks["alerts"].append(alert)
+            risks["recommendations"].append(
+                "Piloter la surveillance terrain par secteurs (priorite CRITIQUE/ELEVE) sur l'axe 300 km."
+            )
+            risks["recommendations"].append(
+                "Prioriser les inspections apres pluie sur les secteurs IA eleves avec sols argileux/alluviaux."
+            )
+
+        for river, info in rivers.items():
+            if not isinstance(info, dict):
+                continue
+            if not info.get("configured") or info.get("last_level_m") is None:
+                risks["details"][river] = {
+                    "configured": info.get("configured", False),
+                    "message": info.get("message") or info.get("error"),
+                }
+                continue
+
+            last_level = info.get("last_level_m")
+            threshold = info.get("threshold_m")
+            emergency_threshold = info.get("emergency_threshold_m")
+            trend = info.get("trend_mph")
+            rapid = info.get("rapid_rise_mph")
+
+            risks["details"][river] = {
+                "station_code": info.get("station_code"),
+                "station_name": info.get("station_name"),
+                "auto_selected": info.get("auto_selected"),
+                "match_type": info.get("match_type"),
+                "last_level_m": last_level,
+                "trend_mph": trend,
+                "threshold_m": threshold,
+                "emergency_threshold_m": emergency_threshold,
+                "rapid_rise_mph": rapid,
+                "threshold_source": info.get("threshold_source"),
+            }
+
+            alert_threshold = emergency_threshold if emergency_threshold is not None else threshold
+            if alert_threshold is not None and last_level is not None and last_level >= alert_threshold:
+                factors.append(3)
+                risks["alerts"].append(
+                    {
+                        "type": "CRUE",
+                        "level": "CRITIQUE",
+                        "message": f"{river}: {last_level:.2f} m >= seuil urgence {alert_threshold:.2f} m",
+                    }
+                )
+
+            if rapid is not None and trend is not None and trend >= rapid:
+                factors.append(2)
+                risks["alerts"].append({"type": "MONTEE_RAPIDE", "level": "MODERE", "message": f"{river}: {trend:.2f} m/h (seuil {rapid:.2f} m/h)"})
+
+        if factors:
+            score = sum(factors) / len(factors)
+            risks["score"] = round(score, 2)
+            if score >= 2.8:
+                risks["risk_level"] = "ELEVE"
+            elif score >= 1.8:
+                risks["risk_level"] = "MODERE"
+
+        if risks["risk_level"] == "ELEVE":
+            risks["recommendations"].append("Alerter l'astreinte et declencher inspection terrain ciblee genie civil.")
+        elif risks["risk_level"] == "MODERE":
+            risks["recommendations"].append("Surveillance renforcee sur secteurs geotechniques et hydrauliques sensibles.")
+        else:
+            risks["recommendations"].append("Surveillance normale.")
+
+        risks["recommendations"].append("Verifier coherence des mesures (meteo, hydro, piezometres) avant decision travaux.")
+        seen = set()
+        risks["recommendations"] = [r for r in risks["recommendations"] if not (r in seen or seen.add(r))]
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        report_path = os.path.join("reports", f"risk_analysis_{ts}.json")
+        self._save_json(risks, report_path)
+        risks["report_path"] = report_path
+        return risks
+
+    def generate_map(
+        self,
+        weather_df: pd.DataFrame,
+        rivers: Dict[str, Dict[str, object]],
+        risks: Dict[str, object],
+        geotech: Optional[Dict[str, object]] = None,
+        piezometers: Optional[Dict[str, object]] = None,
+        hydro_network: Optional[Dict[str, object]] = None,
+        sectors: Optional[Dict[str, object]] = None,
+    ) -> str:
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        map_path = os.path.join("reports", f"lgv_dashboard_{ts}.html")
+        latest_path = os.path.join("reports", "lgv_dashboard_latest.html")
+
+        lgv_lines = [
+            [{"lat": lat, "lon": lon} for lat, lon in line]
+            for line in self.lgv_lines_latlon
+            if len(line) >= 2
+        ]
+
+        weather_markers = []
+        if not weather_df.empty:
+            for _, row in weather_df.iterrows():
+                mode = str(row.get("selection_mode", "unknown"))
+                source = str(row.get("source", "unknown"))
+                rain24 = float(row.get("rain_24h_mm", row.get("precipitation_mm", 0.0)) or 0.0)
+                rain7 = float(row.get("rain_7d_mm", rain24) or rain24)
+                rain30 = float(row.get("rain_30d_mm", rain7) or rain7)
+                rainmonth = float(row.get("rain_month_mm", rain30) or rain30)
+                rain_class = str(row.get("rain_class") or self._station_pluvio_class(rain24, rain7, rain30))
+                popup = (
+                    f"<b>Station:</b> {html.escape(str(row.get('station_id')))}<br>"
+                    f"<b>Source:</b> {html.escape(source)}<br>"
+                    f"<b>Commune station:</b> {html.escape(str(row.get('station_commune_name', 'n/a')))}<br>"
+                    f"<b>Classe pluvio:</b> {html.escape(rain_class)}<br>"
+                    f"<b>Cumul 24h:</b> {rain24:.1f} mm<br>"
+                    f"<b>Cumul 7j:</b> {rain7:.1f} mm<br>"
+                    f"<b>Cumul 30j:</b> {rain30:.1f} mm<br>"
+                    f"<b>Cumul mois:</b> {rainmonth:.1f} mm<br>"
+                    f"<b>Cumul 12h:</b> {row.get('rain_12h_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Instantane:</b> {row.get('rain_instant_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Prediction:</b> {row.get('rain_forecast_mm', row.get('precipitation_mm'))} mm<br>"
+                    f"<b>Distance LGV:</b> {row.get('distance_to_lgv_km')} km<br>"
+                    f"<b>Selection:</b> {html.escape(mode)}<br>"
+                    f"<b>Date obs:</b> {html.escape(str(row.get('date_obs_raw')))}"
+                )
+                weather_markers.append(
+                    {
+                        "lat": float(row["latitude"]),
+                        "lon": float(row["longitude"]),
+                        "station_id": str(row.get("station_id")),
+                        "source": source,
+                        "selection_mode": mode,
+                        "rain_24h_mm": round(rain24, 2),
+                        "rain_7d_mm": round(rain7, 2),
+                        "rain_30d_mm": round(rain30, 2),
+                        "rain_month_mm": round(rainmonth, 2),
+                        "rain_class": rain_class,
+                        "risk_level": rain_class,
+                        "popup": popup,
+                    }
+                )
+
+        river_markers = []
+        for rp in self.river_points:
+            info = rivers.get(rp.river, {})
+            lat = info.get("station_latitude") if info.get("station_latitude") is not None else rp.latitude
+            lon = info.get("station_longitude") if info.get("station_longitude") is not None else rp.longitude
+            level = info.get("last_level_m")
+            threshold = info.get("threshold_m")
+            emergency_threshold = info.get("emergency_threshold_m")
+            trend = info.get("trend_mph")
+            rapid = info.get("rapid_rise_mph")
+
+            alert_threshold = emergency_threshold if emergency_threshold is not None else threshold
+            threshold_ratio = None
+            if level is not None and alert_threshold is not None and float(alert_threshold) > 0:
+                threshold_ratio = round(float(level) / float(alert_threshold), 3)
+
+            if level is not None and alert_threshold is not None and level >= alert_threshold:
+                color = "#7f1d1d"
+                risk_level = "CRITIQUE"
+            elif level is not None and threshold is not None and level >= threshold:
+                color = "#dc2626"
+                risk_level = "ELEVE"
+            elif trend is not None and rapid is not None and trend >= rapid:
+                color = "#d97706"
+                risk_level = "MODERE"
+            elif info.get("configured"):
+                color = "#16a34a"
+                risk_level = "FAIBLE"
+            else:
+                color = "#6b7280"
+                risk_level = "INDETERMINE"
+
+            popup = (
+                f"<b>Cours d'eau:</b> {html.escape(rp.river)}<br>"
+                f"<b>Source:</b> {html.escape(str(info.get('source', DataSource.VIGICRUES_HYDRO.value)))}<br>"
+                f"<b>Station:</b> {html.escape(str(info.get('station_code', 'n/a')))}<br>"
+                f"<b>Point mesure:</b> {round(float(lat), 5)}, {round(float(lon), 5)}<br>"
+                f"<b>Niveau:</b> {html.escape(str(level))} m<br>"
+                f"<b>Tendance:</b> {html.escape(str(trend))} m/h<br>"
+                f"<b>Seuil vigilance:</b> {html.escape(str(threshold))} m<br>"
+                f"<b>Seuil urgence:</b> {html.escape(str(emergency_threshold))} m<br>"
+                f"<b>Ratio niveau/seuil urgence:</b> {html.escape(str(threshold_ratio))}<br>"
+                f"<b>Auto-station:</b> {html.escape(str(info.get('auto_selected')))}<br>"
+                f"<b>Source seuil:</b> {html.escape(str(info.get('threshold_source')))}<br>"
+                f"<b>Risque:</b> {risk_level}"
+            )
+            river_markers.append({"lat": float(lat), "lon": float(lon), "color": color, "risk_level": risk_level, "popup": popup})
+
+        soil_markers = []
+        geotech_summary = {}
+        if isinstance(geotech, dict):
+            if isinstance(geotech.get("summary"), dict):
+                geotech_summary = geotech.get("summary") or {}
+            for point in geotech.get("points", []) if isinstance(geotech.get("points"), list) else []:
+                popup = (
+                    f"<b>Point LGV:</b> {point.get('point_id')}<br>"
+                    f"<b>Risque geotechnique:</b> {html.escape(str(point.get('risk_level')))}<br>"
+                    f"<b>Sol:</b> {html.escape(str(point.get('soil_type')))}<br>"
+                    f"<b>Pedologie:</b> {html.escape(str(point.get('pedology_family')))}<br>"
+                    f"<b>Lithologie BRGM:</b> {html.escape(str(point.get('lithology_descr')))} ({html.escape(str(point.get('lithology_type')))} )<br>"
+                    f"<b>RGA:</b> {html.escape(str(point.get('rga_label')))}<br>"
+                    f"<b>MVT proches:</b> {html.escape(str(point.get('mvt_count')))}"
+                )
+                soil_markers.append(
+                    {
+                        "lat": float(point["latitude"]),
+                        "lon": float(point["longitude"]),
+                        "risk_level": str(point.get("risk_level", "INDETERMINE")),
+                        "color": str(point.get("risk_color", "#6b7280")),
+                        "popup": popup,
+                    }
+                )
+
+        piezo_markers = []
+        piezo_summary = {}
+        if isinstance(piezometers, dict):
+            if isinstance(piezometers.get("summary"), dict):
+                piezo_summary = piezometers.get("summary") or {}
+            for pz in piezometers.get("stations", []) if isinstance(piezometers.get("stations"), list) else []:
+                reasons = pz.get("alert_reasons") or []
+                reason_txt = " | ".join(reasons) if reasons else "Aucune alerte"
+                popup = (
+                    f"<b>Piezometre:</b> {html.escape(str(pz.get('code_bss')))}<br>"
+                    f"<b>Nom:</b> {html.escape(str(pz.get('name')))}<br>"
+                    f"<b>Risque nappe:</b> {html.escape(str(pz.get('risk_level')))}<br>"
+                    f"<b>Profondeur nappe:</b> {html.escape(str(pz.get('depth_m')))} m<br>"
+                    f"<b>Tendance profondeur:</b> {html.escape(str(pz.get('trend_depth_mpd')))} m/j<br>"
+                    f"<b>Niveau NGF:</b> {html.escape(str(pz.get('level_mngf')))} m<br>"
+                    f"<b>Distance LGV:</b> {html.escape(str(pz.get('distance_to_lgv_km')))} km<br>"
+                    f"<b>Derniere mesure:</b> {html.escape(str(pz.get('last_date_utc')))}<br>"
+                    f"<b>Alerte:</b> {html.escape(reason_txt)}"
+                )
+                piezo_markers.append(
+                    {
+                        "lat": float(pz["latitude"]),
+                        "lon": float(pz["longitude"]),
+                        "risk_level": str(pz.get("risk_level", "INDETERMINE")),
+                        "color": str(pz.get("risk_color", "#6b7280")),
+                        "popup": popup,
+                    }
+                )
+
+        hydro_net_markers = []
+        hydro_summary = {}
+        if isinstance(hydro_network, dict):
+            if isinstance(hydro_network.get("summary"), dict):
+                hydro_summary = hydro_network.get("summary") or {}
+            for st in hydro_network.get("stations", []) if isinstance(hydro_network.get("stations"), list) else []:
+                popup = (
+                    f"<b>Station Vigicrues:</b> {html.escape(str(st.get('station_code')))}<br>"
+                    f"<b>Nom:</b> {html.escape(str(st.get('station_name')))}<br>"
+                    f"<b>Cours d'eau:</b> {html.escape(str(st.get('river_name')))}<br>"
+                    f"<b>Niveau:</b> {html.escape(str(st.get('last_level_m')))} m<br>"
+                    f"<b>Tendance:</b> {html.escape(str(st.get('trend_mph')))} m/h<br>"
+                    f"<b>Seuil urgence:</b> {html.escape(str(st.get('emergency_threshold_m')))} m<br>"
+                    f"<b>Ratio niveau/seuil:</b> {html.escape(str(st.get('threshold_ratio')))}<br>"
+                    f"<b>Distance LGV:</b> {html.escape(str(st.get('distance_to_lgv_km')))} km<br>"
+                    f"<b>Risque:</b> {html.escape(str(st.get('risk_level')))}"
+                )
+                hydro_net_markers.append(
+                    {
+                        "lat": float(st["latitude"]),
+                        "lon": float(st["longitude"]),
+                        "risk_level": str(st.get("risk_level", "INDETERMINE")),
+                        "color": str(st.get("risk_color", "#6b7280")),
+                        "popup": popup,
+                    }
+                )
+
+        sector_markers = []
+        sector_summary = {}
+        if isinstance(sectors, dict):
+            if isinstance(sectors.get("summary"), dict):
+                sector_summary = sectors.get("summary") or {}
+            for sec in sectors.get("sectors", []) if isinstance(sectors.get("sectors"), list) else []:
+                popup = (
+                    f"<b>Secteur:</b> {html.escape(str(sec.get('sector_id')))}<br>"
+                    f"<b>Risque:</b> {html.escape(str(sec.get('risk_level')))}<br>"
+                    f"<b>Prediction IA:</b> {html.escape(str(sec.get('ai_pred_risk_level')))} "
+                    f"({round(float(sec.get('ai_pred_probability', 0.0) or 0.0) * 100, 1)}%)<br>"
+                    f"<b>Score:</b> {html.escape(str(sec.get('score')))}<br>"
+                    f"<b>Pluie 24h:</b> {html.escape(str(sec.get('weather_max_24h_mm')))} mm<br>"
+                    f"<b>Pluie 7j:</b> {html.escape(str(sec.get('weather_max_7d_mm')))} mm<br>"
+                    f"<b>Pluie 30j:</b> {html.escape(str(sec.get('weather_max_30d_mm')))} mm<br>"
+                    f"<b>Sol dominant:</b> {html.escape(str(sec.get('ai_dominant_pedology')))}<br>"
+                    f"<b>Fragilite sol IA:</b> {round(float(sec.get('ai_soil_fragility', 0.0) or 0.0) * 100, 1)}%<br>"
+                    f"<b>Geo/Piezo/Hydro:</b> {sec.get('geotech_points')}/{sec.get('piezometers')}/{sec.get('hydro_stations')}"
+                )
+                sector_markers.append(
+                    {
+                        "lat": float(sec["latitude"]),
+                        "lon": float(sec["longitude"]),
+                        "risk_level": str(sec.get("risk_level", "INDETERMINE")),
+                        "color": str(sec.get("risk_color", "#6b7280")),
+                        "popup": popup,
+                    }
+                )
+
+        geotech_kpi = (
+            f"Pts geotech {len(soil_markers)} | critique={geotech_summary.get('critical_points', 0)} "
+            f"| eleve={geotech_summary.get('high_points', 0)} | modere={geotech_summary.get('moderate_points', 0)} "
+            f"| pedologie={geotech_summary.get('pedology_counts', {})}"
+            if soil_markers
+            else "Contexte geotechnique non disponible"
+        )
+        piezo_kpi = (
+            f"Piezometres={piezo_summary.get('stations_with_data', 0)} | nappe tres haute={piezo_summary.get('very_high_risk', 0)} "
+            f"| nappe haute={piezo_summary.get('high_risk', 0)} | remontee rapide={piezo_summary.get('rapid_rise_alerts', 0)}"
+            if piezo_markers
+            else "Piezometres non disponibles"
+        )
+        hydro_kpi = (
+            f"Stations hydro reseau={hydro_summary.get('stations_with_data', 0)} | critiques={hydro_summary.get('critical_stations', 0)} "
+            f"| elevees={hydro_summary.get('high_stations', 0)} | depassement seuil urgence={hydro_summary.get('threshold_exceeded_stations', 0)}"
+            if hydro_net_markers
+            else "Reseau Vigicrues etendu non disponible"
+        )
+        sector_kpi = (
+            f"Secteurs={sector_summary.get('sector_count', 0)} | critiques={sector_summary.get('critical', 0)} "
+            f"| eleves={sector_summary.get('high', 0)} | sous surveillance={sector_summary.get('watch', 0)}"
+            if sector_markers
+            else "Secteurs de surveillance non disponibles"
+        )
+
+        lgv_json = json.dumps(lgv_lines)
+        weather_json = json.dumps(weather_markers)
+        river_json = json.dumps(river_markers)
+        soil_json = json.dumps(soil_markers)
+        piezo_json = json.dumps(piezo_markers)
+        hydro_json = json.dumps(hydro_net_markers)
+        sector_json = json.dumps(sector_markers)
+        risk_level = html.escape(str(risks.get("risk_level")))
+        score = html.escape(str(risks.get("score")))
+        notice = html.escape(str(risks.get("weather_selection_notice") or "Aucun fallback meteo"))
+        geotech_kpi_html = html.escape(geotech_kpi)
+        piezo_kpi_html = html.escape(piezo_kpi)
+        hydro_kpi_html = html.escape(hydro_kpi)
+        sector_kpi_html = html.escape(sector_kpi)
+
+        html_doc = f"""<!doctype html>
+<html lang=\"fr\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>LGV SEA - Dashboard Hydrometeo</title>
+  <link rel=\"stylesheet\" href=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.css\" />
+  <style>
+    :root {{ --bg:#f4f7f9; --panel:#ffffff; --text:#12212c; --muted:#6b7280; }}
+    body {{ margin:0; font-family:"Segoe UI",Tahoma,sans-serif; background:var(--bg); color:var(--text); }}
+    .wrap {{ display:grid; grid-template-columns:390px 1fr; min-height:100vh; }}
+    .panel {{ padding:16px; background:var(--panel); border-right:1px solid #e5e7eb; overflow-y:auto; max-height:100vh; }}
+    #map {{ width:100%; height:100vh; }}
+    .badge {{ display:inline-block; padding:4px 8px; border-radius:999px; background:#e6fffa; color:#134e4a; font-weight:600; }}
+    .kpi {{ margin:10px 0; padding:12px; background:#f8fafc; border-radius:10px; border:1px solid #e5e7eb; }}
+    .muted {{ color:var(--muted); font-size:13px; }}
+    .dot {{ display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }}
+    .river-pin {{
+      width: 14px;
+      height: 14px;
+      transform: rotate(45deg);
+      border-radius: 2px;
+      border: 1px solid #0f172a;
+      opacity: 0.95;
+    }}
+    .filter-box {{
+      position:absolute;
+      top:10px;
+      left:10px;
+      z-index:1000;
+      background:#ffffff;
+      border:1px solid #d1d5db;
+      border-radius:8px;
+      padding:10px;
+      font-size:12px;
+      min-width:220px;
+      box-shadow:0 2px 8px rgba(0,0,0,0.12);
+    }}
+    .filter-box label {{ display:block; margin-bottom:6px; color:#111827; }}
+    .filter-box select {{ width:100%; margin-top:2px; margin-bottom:8px; }}
+    @media (max-width:900px) {{ .wrap {{ grid-template-columns:1fr; }} .panel {{ border-right:none; border-bottom:1px solid #e5e7eb; max-height:none; }} #map {{ height:70vh; }} }}
+  </style>
+</head>
+<body>
+  <div class=\"wrap\">
+    <aside class=\"panel\">
+      <h2>LGV SEA Monitoring</h2>
+      <div class=\"kpi\"><span class=\"badge\">Risque: {risk_level} (score {score}/4)</span></div>
+      <div class=\"kpi\"><b>Selection meteo</b><br><span class=\"muted\">{notice}</span></div>
+      <div class=\"kpi\"><b>Contexte geotechnique</b><br><span class=\"muted\">{geotech_kpi_html}</span></div>
+      <div class=\"kpi\"><b>Niveaux de nappe</b><br><span class=\"muted\">{piezo_kpi_html}</span></div>
+      <div class=\"kpi\"><b>Reseau Vigicrues etendu</b><br><span class=\"muted\">{hydro_kpi_html}</span></div>
+      <div class=\"kpi\"><b>Secteurs de surveillance</b><br><span class=\"muted\">{sector_kpi_html}</span></div>
+      <div class=\"kpi\"><b>Objectif</b><br><span class=\"muted\">Aider les experts genie civil: pluie, hydro, susceptibilite argiles, mouvements de terrain et piezometrie.</span></div>
+      <div class=\"muted\">
+        <div><span class=\"dot\" style=\"background:#111111\"></span>Pluie catastrophique (>=120 mm/24h)</div>
+        <div><span class=\"dot\" style=\"background:#b91c1c\"></span>Pluie extreme (>=80 mm/24h)</div>
+        <div><span class=\"dot\" style=\"background:#ea580c\"></span>Pluie forte (>=50 mm/24h)</div>
+        <div><span class=\"dot\" style=\"background:#0f766e\"></span>Station meteo <= 1 km</div>
+        <div><span class=\"dot\" style=\"background:#1d4ed8\"></span>Open-Meteo (grille LGV)</div>
+        <div><span class=\"dot\" style=\"background:#16a34a\"></span>Cours d'eau normal</div>
+        <div><span class=\"dot\" style=\"background:#d97706\"></span>Cours d'eau montee rapide</div>
+        <div><span class=\"dot\" style=\"background:#dc2626\"></span>Cours d'eau depassement seuil</div>
+        <div><span class=\"dot\" style=\"background:#7f1d1d\"></span>Geotech critique (argiles + MVT)</div>
+        <div><span class=\"dot\" style=\"background:#b91c1c\"></span>Geotech eleve</div>
+        <div><span class=\"dot\" style=\"background:#dc2626\"></span>Nappe tres haute (sol potentiellement gorge d'eau)</div>
+        <div><span class=\"dot\" style=\"background:#ea580c\"></span>Nappe haute</div>
+        <div><span class=\"dot\" style=\"background:#dc2626\"></span>Secteur surveillance elevee</div>
+        <div><span class=\"dot\" style=\"background:#7f1d1d\"></span>Secteur surveillance critique</div>
+      </div>
+    </aside>
+    <section style=\"position:relative;\">
+      <div class=\"filter-box\">
+        <label>Periode pluie
+          <select id=\"periodSelect\">
+            <option value=\"rain_24h_mm\">24h</option>
+            <option value=\"rain_7d_mm\">7 jours</option>
+            <option value=\"rain_30d_mm\">30 jours</option>
+            <option value=\"rain_month_mm\">Mois courant</option>
+          </select>
+        </label>
+        <label>Source meteo
+          <select id=\"sourceSelect\">
+            <option value=\"ALL\">Toutes</option>
+            <option value=\"synop_meteofrance\">SYNOP</option>
+            <option value=\"open_meteo\">Open-Meteo</option>
+          </select>
+        </label>
+        <label>Niveau risque minimum
+          <select id=\"riskSelect\">
+            <option value=\"ALL\">Tous</option>
+            <option value=\"MODERE\">Modere+</option>
+            <option value=\"ELEVE\">Eleve+</option>
+            <option value=\"CRITIQUE\">Critique</option>
+          </select>
+        </label>
+      </div>
+      <div id=\"map\"></div>
+    </section>
+  </div>
+
+  <script src=\"https://unpkg.com/leaflet@1.9.4/dist/leaflet.js\"></script>
+  <script>
+    const lgvLines = {lgv_json};
+    const weather = {weather_json};
+    const rivers = {river_json};
+    const soils = {soil_json};
+    const piezos = {piezo_json};
+    const hydroNet = {hydro_json};
+    const sectors = {sector_json};
+
+    const map = L.map('map');
+    L.tileLayer('https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom:18, attribution:'&copy; OpenStreetMap contributors' }}).addTo(map);
+
+    const lgvLayer = L.layerGroup().addTo(map);
+    const weatherLayer = L.layerGroup().addTo(map);
+    const riverLayer = L.layerGroup().addTo(map);
+    const soilLayer = L.layerGroup().addTo(map);
+    const piezoLayer = L.layerGroup().addTo(map);
+    const hydroLayer = L.layerGroup().addTo(map);
+    const sectorLayer = L.layerGroup().addTo(map);
+
+    const lineLayers = [];
+    lgvLines.forEach(line => {{
+      const lgvLatLng = line.map(p => [p.lat, p.lon]);
+      const lyr = L.polyline(lgvLatLng, {{ color:'#0b4f6c', weight:3, opacity:0.85 }}).addTo(lgvLayer);
+      lineLayers.push(lyr);
+    }});
+
+    function riskRank(level) {{
+      const key = String(level || '').toUpperCase();
+      const map = {{
+        'INDETERMINE': 0,
+        'NORMAL': 1, 'FAIBLE': 1,
+        'VIGILANCE': 2, 'MODERE': 2,
+        'ELEVE': 3,
+        'TRES_ELEVE': 4, 'CRITIQUE': 4
+      }};
+      return map[key] || 0;
+    }}
+
+    function weatherClass(value, period) {{
+      if (period === 'rain_24h_mm') {{
+        if (value >= 120) return 'CRITIQUE';
+        if (value >= 80) return 'ELEVE';
+        if (value >= 50) return 'MODERE';
+        if (value >= 20) return 'VIGILANCE';
+        return 'NORMAL';
+      }}
+      if (period === 'rain_7d_mm') {{
+        if (value >= 180) return 'CRITIQUE';
+        if (value >= 120) return 'ELEVE';
+        if (value >= 80) return 'MODERE';
+        if (value >= 40) return 'VIGILANCE';
+        return 'NORMAL';
+      }}
+      if (value >= 300) return 'CRITIQUE';
+      if (value >= 220) return 'ELEVE';
+      if (value >= 150) return 'MODERE';
+      if (value >= 90) return 'VIGILANCE';
+      return 'NORMAL';
+    }}
+
+    function weatherColor(cls, src, mode) {{
+      if (cls === 'CRITIQUE') return '#111111';
+      if (cls === 'ELEVE') return '#b91c1c';
+      if (cls === 'MODERE') return '#ea580c';
+      if (src === 'open_meteo') return '#1d4ed8';
+      if (mode === 'within_1km') return '#0f766e';
+      return '#f59e0b';
+    }}
+
+    function passMinRisk(level, minLevel) {{
+      if (minLevel === 'ALL') return true;
+      return riskRank(level) >= riskRank(minLevel);
+    }}
+
+    function renderLayers() {{
+      weatherLayer.clearLayers();
+      riverLayer.clearLayers();
+      soilLayer.clearLayers();
+      piezoLayer.clearLayers();
+      hydroLayer.clearLayers();
+      sectorLayer.clearLayers();
+
+      const period = document.getElementById('periodSelect').value;
+      const source = document.getElementById('sourceSelect').value;
+      const minRisk = document.getElementById('riskSelect').value;
+
+      weather.forEach(s => {{
+        if (source !== 'ALL' && s.source !== source) return;
+        const value = Number(s[period] || 0);
+        const cls = weatherClass(value, period);
+        if (!passMinRisk(cls, minRisk)) return;
+        const color = weatherColor(cls, s.source, s.selection_mode);
+        L.circleMarker([s.lat, s.lon], {{
+          radius: 7, color: color, fillColor: color, fillOpacity: 0.85
+        }}).addTo(weatherLayer).bindPopup(s.popup + `<br><b>Filtre:</b> ${{period}} = ${{value.toFixed(1)}} mm`);
+      }});
+
+      rivers.forEach(r => {{
+        if (!passMinRisk(r.risk_level, minRisk)) return;
+        const icon = L.divIcon({{
+          className: '',
+          html: `<div class="river-pin" style="background:${{r.color}}"></div>`,
+          iconSize: [14, 14],
+          iconAnchor: [7, 7]
+        }});
+        L.marker([r.lat, r.lon], {{ icon }}).addTo(riverLayer).bindPopup(r.popup);
+      }});
+
+      soils.forEach(s => {{
+        if (!passMinRisk(s.risk_level, minRisk)) return;
+        L.circleMarker([s.lat, s.lon], {{
+          radius:6, color:s.color, fillColor:s.color, fillOpacity:0.75
+        }}).addTo(soilLayer).bindPopup(s.popup);
+      }});
+
+      piezos.forEach(p => {{
+        if (!passMinRisk(p.risk_level, minRisk)) return;
+        L.circleMarker([p.lat, p.lon], {{
+          radius:8, color:p.color, fillColor:p.color, fillOpacity:0.85, weight:2
+        }}).addTo(piezoLayer).bindPopup(p.popup);
+      }});
+
+      hydroNet.forEach(h => {{
+        if (!passMinRisk(h.risk_level, minRisk)) return;
+        L.circleMarker([h.lat, h.lon], {{
+          radius:7, color:h.color, fillColor:h.color, fillOpacity:0.8, weight:2
+        }}).addTo(hydroLayer).bindPopup(h.popup);
+      }});
+
+      sectors.forEach(s => {{
+        if (!passMinRisk(s.risk_level, minRisk)) return;
+        L.circleMarker([s.lat, s.lon], {{
+          radius: 9, color: s.color, fillColor: s.color, fillOpacity: 0.28, weight: 2
+        }}).addTo(sectorLayer).bindPopup(s.popup);
+      }});
+    }}
+
+    document.getElementById('periodSelect').addEventListener('change', renderLayers);
+    document.getElementById('sourceSelect').addEventListener('change', renderLayers);
+    document.getElementById('riskSelect').addEventListener('change', renderLayers);
+
+    renderLayers();
+
+    L.control.layers(null, {{
+      "Trace LGV": lgvLayer,
+      "Stations meteo": weatherLayer,
+      "Cours d'eau": riverLayer,
+      "Points geotechniques": soilLayer,
+      "Piezometres": piezoLayer,
+      "Vigicrues reseau": hydroLayer,
+      "Secteurs surveillance": sectorLayer
+    }}, {{ collapsed:false }}).addTo(map);
+
+    const boundsGroup = [];
+    lineLayers.forEach(x => boundsGroup.push(x));
+    if (boundsGroup.length > 0) {{
+      const allBounds = L.featureGroup(boundsGroup).getBounds();
+      map.fitBounds(allBounds.pad(0.10));
+    }} else {{
+      map.setView([46.2, 0.2], 7);
+    }}
+  </script>
+</body>
+</html>
+"""
+
+        with open(map_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        with open(latest_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        return latest_path
+
+    def _save_streamlit_snapshot(
+        self,
+        weather_df: pd.DataFrame,
+        weather_notice: Optional[str],
+        rivers: Dict[str, Dict[str, object]],
+        geotech: Optional[Dict[str, object]],
+        piezometers: Optional[Dict[str, object]],
+        hydro_network: Optional[Dict[str, object]],
+        sectors: Optional[Dict[str, object]],
+        lgv_communes: Optional[Dict[str, object]],
+        risks: Dict[str, object],
+        map_path: str,
+    ) -> str:
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        snapshot_path = os.path.join("reports", f"streamlit_snapshot_{ts}.json")
+        latest_path = os.path.join("reports", "streamlit_snapshot_latest.json")
+
+        weather_records: List[Dict[str, object]] = []
+        if isinstance(weather_df, pd.DataFrame) and not weather_df.empty:
+            weather_records = json.loads(weather_df.to_json(orient="records", date_format="iso"))
+
+        rivers_rows = []
+        for river_name, details in rivers.items():
+            row = {"river": river_name}
+            if isinstance(details, dict):
+                row.update(details)
+            rivers_rows.append(row)
+
+        lgv_lines = [
+            [{"lat": float(lat), "lon": float(lon)} for lat, lon in line]
+            for line in self.lgv_lines_latlon
+            if len(line) >= 2
+        ]
+        line_ref = self._representative_lgv_line()
+        line_length_km = self._line_length_km(line_ref) if line_ref else 0.0
+        metadata = {
+            "line_monitoring": {
+                "line_name": "LGV SEA Bordeaux-Tours",
+                "line_length_km": round(float(line_length_km), 2),
+                "corridor_weather_km": self.weather_corridor_km,
+                "corridor_hydro_km": self.hydro_network_corridor_km,
+                "corridor_piezometer_km": self.piezometer_corridor_km,
+                "weather_source_mode": self.weather_source_mode,
+            },
+            "calculation_methods": {
+                "pluviometrie": (
+                    "Mode 'info_climat': SYNOP Meteo-France prioritaire (open-data officiel), "
+                    "fallback Open-Meteo uniquement si SYNOP indisponible. "
+                    "Cumuls pluie normalises (24h<=7j<=30j), controles de valeurs aberrantes, "
+                    "distance a la LGV par projection segmentaire."
+                ),
+                "hydrometrie": (
+                    "Niveaux Hub'Eau (grandeur H), tendance m/h sur fenetre 48h. "
+                    "Alerte urgence si niveau >= seuil urgence HydroPortail."
+                ),
+                "pedologie_geotechnique": (
+                    "Risque geotechnique = RGA Georisques + mouvements de terrain. "
+                    "Pedologie additionnelle via BRGM LITHO 1M simplifiee (argileux, calcaire, alluvial, etc.)."
+                ),
+                "communes_traversees": (
+                    "Intersection de la trace LGV avec contours communaux Geo API Gouv, "
+                    "avec chainage PK approximatif par echantillonnage de la ligne."
+                ),
+                "score_risque_communal": (
+                    "Score /100 issu des composantes pluie, geotech, nappes, hydro et de la criticite des points LGV."
+                ),
+                "modele_ia_sectoriel": (
+                    "Modele IA LGV-SEA-RiskAI-v1: prediction sectorielle via combinaison non lineaire "
+                    "pluie 24h/7j/30j + fragilite pedologique (argiles, alluvions, RGA, MVT) + signaux hydro/nappes."
+                ),
+            },
+            "update_frequency": {
+                "pipeline_target": "horaire (cron GitHub Actions)",
+                "weather_cycle": "a chaque cycle",
+                "hydro_network_cache_hours": self.hydro_network_cache_hours,
+                "piezometer_cache_hours": self.piezometer_cache_hours,
+                "geotech_cache_hours": self.soil_cache_hours,
+                "hydro_threshold_cache_hours": self.hydro_threshold_cache_hours,
+                "communes_cache_days": self.lgv_communes_cache_days,
+            },
+            "sources": [
+                {
+                    "id": "hubeau_hydrometrie",
+                    "label": "Hub'Eau Hydrometrie (hauteurs d'eau)",
+                    "url": "https://hubeau.eaufrance.fr/api/v2/hydrometrie",
+                    "usage": "niveaux, tendances, stations hydro",
+                },
+                {
+                    "id": "hydroportail_seuils",
+                    "label": "HydroPortail seuils station",
+                    "url": "https://hydro.eaufrance.fr/",
+                    "usage": "seuils vigilance/urgence par station",
+                },
+                {
+                    "id": "hubeau_nappes",
+                    "label": "Hub'Eau Niveaux de nappes",
+                    "url": "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes",
+                    "usage": "piezometrie et tendances de nappes",
+                },
+                {
+                    "id": "infoclimat_reference",
+                    "label": "InfoClimat (reference utilisateur)",
+                    "url": "https://www.infoclimat.fr/",
+                    "usage": "reference visuelle; source primaire pipeline = SYNOP Meteo-France",
+                },
+                {
+                    "id": "georisques_rga_mvt",
+                    "label": "Georisques API RGA + MVT",
+                    "url": "https://www.georisques.gouv.fr/doc-api",
+                    "usage": "susceptibilite argiles et mouvements de terrain",
+                },
+                {
+                    "id": "brgm_lithologie",
+                    "label": "BRGM WFS LITHO_1M_SIMPLIFIEE",
+                    "url": "https://geoservices.brgm.fr/geologie?",
+                    "usage": "classification pedologique (argileux, calcaire, etc.)",
+                },
+                {
+                    "id": "geo_api_communes",
+                    "label": "Geo API Gouv Communes",
+                    "url": "https://geo.api.gouv.fr/",
+                    "usage": "contours communaux et codes INSEE",
+                },
+                {
+                    "id": "meteo_france_synop",
+                    "label": "Meteo-France SYNOP open data",
+                    "url": "https://donneespubliques.meteofrance.fr/",
+                    "usage": "pluviometrie observationnelle",
+                },
+                {
+                    "id": "open_meteo",
+                    "label": "Open-Meteo archive/forecast",
+                    "url": "https://open-meteo.com/",
+                    "usage": "pluie maillee et historique mensuel",
+                },
+            ],
+            "pluviometer_sources_candidates": [
+                {
+                    "label": "Meteo-France API Hub (observations de stations)",
+                    "url": "https://portail-api.meteofrance.fr/",
+                    "notes": "source recommandee pour densifier les pluviometres officiels",
+                },
+                {
+                    "label": "Meteo-France SYNOP",
+                    "url": "https://donneespubliques.meteofrance.fr/",
+                    "notes": "couverture nationale, resolution synoptique",
+                },
+            ],
+        }
+
+        payload: Dict[str, object] = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "risk_level": risks.get("risk_level"),
+            "score": risks.get("score"),
+            "weather_notice": weather_notice,
+            "alerts": risks.get("alerts", []),
+            "recommendations": risks.get("recommendations", []),
+            "details": risks.get("details", {}),
+            "map_path": map_path,
+            "lgv_lines": lgv_lines,
+            "weather": weather_records,
+            "rivers": rivers_rows,
+            "geotech": geotech if isinstance(geotech, dict) else {},
+            "piezometers": piezometers if isinstance(piezometers, dict) else {},
+            "hydro_network": hydro_network if isinstance(hydro_network, dict) else {},
+            "sectors": sectors if isinstance(sectors, dict) else {},
+            "lgv_communes": lgv_communes if isinstance(lgv_communes, dict) else {},
+            "fr_geography": (
+                {
+                    "communes_geojson": lgv_communes.get("communes_geojson"),
+                    "departements_ref": lgv_communes.get("departements_ref"),
+                    "summary": lgv_communes.get("summary"),
+                }
+                if isinstance(lgv_communes, dict)
+                else {}
+            ),
+            "metadata": metadata,
+            "commune_ranking": (
+                sectors.get("commune_summary", [])
+                if isinstance(sectors, dict) and isinstance(sectors.get("commune_summary"), list)
+                else []
+            ),
+        }
+        self._save_json(payload, snapshot_path)
+        self._save_json(payload, latest_path)
+        return latest_path
+
+    def run_cycle(self) -> None:
+        logging.info("=" * 70)
+        logging.info("Cycle LGV SEA monitoring")
+
+        weather_pack = self.fetch_pluviometry_combined()
+        weather_pack["selected"] = self._enrich_weather_with_communes(weather_pack.get("selected", pd.DataFrame()))
+        rivers = self.fetch_all_river_levels()
+        geotech = self.fetch_geotechnical_context()
+        piezometers = self.fetch_piezometers_near_lgv()
+        hydro_network = self.fetch_hydro_network_near_lgv()
+        lgv_communes = self._build_lgv_communes_catalog()
+        sectors = self.build_surveillance_sectors(weather_pack["selected"], geotech, piezometers, hydro_network)
+        risks = self.analyze_risks(
+            weather_pack["selected"],
+            weather_pack.get("notice"),
+            rivers,
+            geotech,
+            piezometers,
+            hydro_network,
+            sectors,
+        )
+        map_path = self.generate_map(weather_pack["selected"], rivers, risks, geotech, piezometers, hydro_network, sectors)
+        streamlit_snapshot_path = self._save_streamlit_snapshot(
+            weather_pack["selected"],
+            weather_pack.get("notice"),
+            rivers,
+            geotech,
+            piezometers,
+            hydro_network,
+            sectors,
+            lgv_communes,
+            risks,
+            map_path,
+        )
+
+        cycle_output = {
+            "timestamp_utc": self._now_utc().isoformat(),
+            "risk_level": risks.get("risk_level"),
+            "score": risks.get("score"),
+            "alerts": risks.get("alerts"),
+            "weather_notice": weather_pack.get("notice"),
+            "geotech_summary": geotech.get("summary") if isinstance(geotech, dict) else None,
+            "piezometer_summary": piezometers.get("summary") if isinstance(piezometers, dict) else None,
+            "hydro_network_summary": hydro_network.get("summary") if isinstance(hydro_network, dict) else None,
+            "lgv_communes_summary": lgv_communes.get("summary") if isinstance(lgv_communes, dict) else None,
+            "sector_summary": sectors.get("summary") if isinstance(sectors, dict) else None,
+            "map_path": map_path,
+            "risk_report_path": risks.get("report_path"),
+            "weather_summary_path": weather_pack.get("summary_path"),
+            "streamlit_snapshot_path": streamlit_snapshot_path,
+        }
+        ts = self._now_utc().strftime("%Y%m%d_%H%M%S")
+        self._save_json(cycle_output, os.path.join("reports", f"cycle_summary_{ts}.json"))
+        self._save_json(
+            {
+                "timestamp_utc": self._now_utc().isoformat(),
+                "risk_level": risks.get("risk_level"),
+                "alerts_count": len(risks.get("alerts", [])),
+                "alerts": risks.get("alerts", []),
+            },
+            os.path.join("reports", f"alerts_{ts}.json"),
+        )
+
+        logging.info("RISK: %s (score %s), alerts=%s", risks["risk_level"], risks["score"], len(risks["alerts"]))
+        logging.info("Carte: %s", map_path)
+        self._print_console(weather_pack["selected"], rivers, risks, map_path)
+
+    def _print_console(self, weather_df: pd.DataFrame, rivers: Dict[str, Dict[str, object]], risks: Dict[str, object], map_path: str) -> None:
+        print("\n" + "=" * 70)
+        print(f"LGV SEA - RISQUE HYDROMETEO: {risks['risk_level']} (score {risks['score']}/4)")
+        print("=" * 70)
+
+        notice = risks.get("weather_selection_notice")
+        if notice:
+            print(f"Notice meteo: {notice}")
+
+        if not weather_df.empty:
+            print(f"Stations meteo affichees: {len(weather_df)}")
+            for _, row in weather_df.head(12).iterrows():
+                print(
+                    "  - station={sid} pluie={rain}mm dist_lgv={dist}km mode={mode}".format(
+                        sid=row.get("station_id"),
+                        rain=row.get("precipitation_mm"),
+                        dist=row.get("distance_to_lgv_km"),
+                        mode=row.get("selection_mode"),
+                    )
+                )
+
+        print("\nRivieres:")
+        for river, info in rivers.items():
+            if info.get("last_level_m") is not None:
+                print(
+                    f"  - {river}: {info['last_level_m']} m | trend {info.get('trend_mph')} m/h "
+                    f"| thr {info.get('threshold_m')} | thr_urgence {info.get('emergency_threshold_m')} "
+                    f"| station {info.get('station_code')}"
+                )
+            else:
+                msg = info.get("message") or info.get("error") or "pas de donnees"
+                print(f"  - {river}: {msg}")
+
+        geotech = risks.get("details", {}).get("geotech", {})
+        if isinstance(geotech, dict) and geotech:
+            print(
+                "\nGeotech: points={n} critique={c} eleve={h} modere={m}".format(
+                    n=geotech.get("sample_count"),
+                    c=geotech.get("critical_points"),
+                    h=geotech.get("high_points"),
+                    m=geotech.get("moderate_points"),
+                )
+            )
+
+        groundwater = risks.get("details", {}).get("groundwater", {})
+        if isinstance(groundwater, dict) and groundwater:
+            print(
+                "Nappes: stations={n} tres_haute={vh} haute={h} remontee_rapide={r}".format(
+                    n=groundwater.get("stations_with_data"),
+                    vh=groundwater.get("very_high_risk"),
+                    h=groundwater.get("high_risk"),
+                    r=groundwater.get("rapid_rise_alerts"),
+                )
+            )
+
+        hydro_network = risks.get("details", {}).get("hydro_network", {})
+        if isinstance(hydro_network, dict) and hydro_network:
+            print(
+                "Hydro reseau: stations={n} critiques={c} elevees={h} moderees={m}".format(
+                    n=hydro_network.get("stations_with_data"),
+                    c=hydro_network.get("critical_stations"),
+                    h=hydro_network.get("high_stations"),
+                    m=hydro_network.get("moderate_stations"),
+                )
+            )
+
+        sector_summary = risks.get("details", {}).get("sectors", {})
+        if isinstance(sector_summary, dict) and sector_summary:
+            print(
+                "Secteurs: total={n} critiques={c} eleves={h} moderes={m} surveillance={w}".format(
+                    n=sector_summary.get("sector_count"),
+                    c=sector_summary.get("critical"),
+                    h=sector_summary.get("high"),
+                    m=sector_summary.get("moderate"),
+                    w=sector_summary.get("watch"),
+                )
+            )
+
+        if risks["alerts"]:
+            print("\nAlertes:")
+            for alert in risks["alerts"]:
+                print(f"  - [{alert.get('level')}] {alert.get('type')}: {alert.get('message')}")
+        else:
+            print("\nAucune alerte active")
+
+        print(f"\nCarte HTML: {map_path}")
+        print("=" * 70 + "\n")
+
+
+def main() -> None:
+    monitor = LGVSeaMonitor()
+    monitor.run_cycle()
+    schedule.every().hour.do(monitor.run_cycle)
+    print("Monitoring actif (cycle horaire). Ctrl+C pour arreter.")
+
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(30)
+    except KeyboardInterrupt:
+        logging.info("Arret demande par l'utilisateur.")
+
+
+if __name__ == "__main__":
+    main()
