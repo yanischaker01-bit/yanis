@@ -3026,13 +3026,31 @@ st.title("LGV SEA - Rapport Streamlit Pro")
 st.caption("Suivi hydrometeo et geotechnique avec classement par commune")
 
 snapshot, snapshot_source = _load_snapshot_payload()
-if not snapshot:
-    st.error("Aucune donnee chargee. Le snapshot n'est pas disponible.")
-    st.info("Verifie que GitHub Pages est actif puis recharge la page.")
+# Snapshot vide ({}) = collecte en cours ou fallback workflow → continuer avec données vides
+if not isinstance(snapshot, dict):
+    st.error("Snapshot invalide. Verifie que GitHub Pages est actif puis recharge la page.")
     if st.button("Reessayer le chargement", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
     st.stop()
+if not snapshot:
+    snapshot = {
+        "timestamp_utc": None,
+        "risk_level": "INDETERMINE",
+        "score": 0,
+        "weather_notice": "Donnees en cours de collecte (prochain cycle automatique dans ~1h)",
+        "alerts": [],
+        "weather": [],
+        "sectors": {},
+        "hydro_network": {},
+        "piezometers": {},
+        "geotech": {},
+        "lgv_communes": {},
+        "fr_geography": {},
+        "metadata": {"line_monitoring": {"sector_length_km": 5.0}},
+        "commune_ranking": [],
+    }
+    st.warning("⏳ Snapshot en cours de génération. Les données seront disponibles au prochain cycle (env. 1h).")
 
 weather_df = _safe_df(snapshot.get("weather"))
 sectors_df = _safe_df((snapshot.get("sectors") or {}).get("sectors"))
