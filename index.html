@@ -673,7 +673,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   var oldLayer=L.geoJSON(old,{
     pane:"pane-old",
     renderer:_svgRenderer,
-    style:{color:"#0d47a1",weight:3,fillColor:"#4f83ff",fillOpacity:.16,dashArray:"10 4"},
+    style:{color:"transparent",weight:0,fillColor:"#4f83ff",fillOpacity:.22},
     onEachFeature:function(f,l){
       var p=f.properties;
       l.bindTooltip("Zone OLD "+(c(p.CODE)||""),{sticky:true});
