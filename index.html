@@ -16,8 +16,11 @@
 <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
-#map{position:absolute;top:0;bottom:0;width:100%;z-index:1}
+body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e;overscroll-behavior:none}
+button,a,[onclick]{touch-action:manipulation}
+#map{position:absolute;top:0;bottom:0;left:0;right:0;z-index:1}
+#layers-panel{will-change:transform}
+#tbl-panel{will-change:height}
 #loader{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
   background:white;padding:24px 36px;border-radius:12px;
   box-shadow:0 4px 24px rgba(0,0,0,.35);z-index:9999;text-align:center;
@@ -100,12 +103,6 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
   width:34px;height:34px;cursor:pointer;font-size:18px;
   box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center}
 #locate-btn:hover{background:#f0f7ff}
-/* Bouton vue initiale */
-#home-btn{position:absolute;top:84px;right:10px;z-index:800;
-  background:white;border:none;border-radius:6px;
-  width:34px;height:34px;cursor:pointer;font-size:16px;
-  box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center}
-#home-btn:hover{background:#fff8e1}
 /* Barre de recherche */
 #search-wrap{position:absolute;top:10px;left:50%;transform:translateX(-50%);
   z-index:1000;width:320px;max-width:90vw}
@@ -162,8 +159,11 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
   cursor:pointer;color:#c62828;font-size:11px}
 .leaflet-control-layers-list label{font-size:12px}
 /* Detail side panel */
+#dp-backdrop{display:none;position:fixed;inset:0;z-index:899;background:transparent;cursor:pointer}
+#dp-backdrop.open{display:block}
 #detail-panel{position:absolute;top:0;right:0;bottom:0;width:340px;max-width:92vw;
-  background:white;z-index:900;transform:translateX(100%);transition:transform .3s;
+  background:white;z-index:900;transform:translateX(100%);
+  transition:transform .3s cubic-bezier(.4,0,.2,1);will-change:transform;
   box-shadow:-4px 0 20px rgba(0,0,0,.25);display:flex;flex-direction:column;overflow:hidden}
 #detail-panel.open{transform:translateX(0)}
 #detail-header{background:#1a1a2e;color:white;padding:10px 14px;display:flex;
@@ -214,9 +214,10 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
   cursor:pointer;color:#c62828;font-size:11px;margin-left:auto;flex-shrink:0}
 /* ══ Mobile / Téléphone ══════════════════════════════════════════════ */
 @media(max-width:768px){
-  #detail-panel{width:100%;max-width:100%;top:auto;height:65vh;transform:translateY(100%);
-    box-shadow:0 -4px 20px rgba(0,0,0,.2)}
+  #detail-panel{width:100%;max-width:100%;top:auto;height:70vh;transform:translateY(100%);
+    box-shadow:0 -4px 20px rgba(0,0,0,.2);transition:transform .25s cubic-bezier(.4,0,.2,1)}
   #detail-panel.open{transform:translateY(0)}
+  #dp-backdrop.open{background:rgba(0,0,0,.25)}
   #search-wrap{left:44px;width:calc(100vw - 110px);transform:none;top:8px}
   #search-input{font-size:14px;padding:9px 12px}
   #search-res{max-height:160px}
@@ -225,7 +226,6 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
   .lp-item{padding:9px 4px;font-size:13.5px}
   .lp-item input[type=checkbox]{width:18px;height:18px}
   #locate-btn{width:40px;height:40px;right:8px;top:8px;font-size:20px}
-  #home-btn{width:40px;height:40px;top:96px;right:8px;font-size:18px}
   .fab{width:50px;height:50px;font-size:22px}
   #fab-bar{bottom:28px;right:8px;gap:8px}
   #tbl-panel.open{height:52vh}
@@ -283,10 +283,9 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 </div>
 <!-- Bouton localiser -->
 <button id="locate-btn" title="Me localiser" onclick="locateMe()">📍</button>
-<!-- Bouton vue initiale -->
-<button id="home-btn" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
 <!-- Boutons flottants -->
 <div id="fab-bar">
+  <button class="fab fab-white" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
   <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
   <button class="fab fab-white" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
   <input type="file" id="kml-input" accept=".kml,.kmz" style="display:none" onchange="importKML(this)"/>
@@ -295,6 +294,8 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 <div id="load-status" style="display:none;position:absolute;bottom:36px;left:50%;transform:translateX(-50%);
   z-index:802;background:rgba(26,26,46,.9);color:white;padding:5px 16px;border-radius:16px;
   font-size:11.5px;white-space:nowrap;pointer-events:none;letter-spacing:.2px"></div>
+<!-- Backdrop fermeture panneau détail -->
+<div id="dp-backdrop" onclick="closeDetail()"></div>
 <!-- Detail side panel -->
 <div id="detail-panel">
   <div id="detail-header">
@@ -528,7 +529,7 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521b";
+var _cbv="?v=20260521c";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -818,10 +819,6 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     mapEl.classList.toggle("lbl-oa", z>=10);
     mapEl.classList.toggle("lbl-oh", z>=15);
   }
-  map.on("click",function(){
-    if(_detailJustOpened){_detailJustOpened=false;return;}
-    closeDetail();
-  });
   map.on("zoomend",updateVisibility);
   updateVisibility();
 
@@ -1444,14 +1441,16 @@ function restoreKMLLayers(ctrl){
 // ═══════════════════════════════════════════════════════════════
 // PANNEAU DÉTAILS – style ArcGIS
 // ═══════════════════════════════════════════════════════════════
-var _detailJustOpened=false;
 function openDetail(title,bodyHtml){
-  _detailJustOpened=true;
   document.getElementById("detail-title").innerHTML=title;
   document.getElementById("detail-body").innerHTML=bodyHtml;
   document.getElementById("detail-panel").classList.add("open");
+  document.getElementById("dp-backdrop").classList.add("open");
 }
-function closeDetail(){document.getElementById("detail-panel").classList.remove("open");}
+function closeDetail(){
+  document.getElementById("detail-panel").classList.remove("open");
+  document.getElementById("dp-backdrop").classList.remove("open");
+}
 
 // ── Briques HTML du panneau ─────────────────────────────────────────────────
 function dpHero(badge,title,sub,color){
