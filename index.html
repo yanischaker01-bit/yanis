@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Carte LGV SEA</title>
 <link rel="manifest" href="manifest.json">
 <meta name="theme-color" content="#cc0000">
@@ -100,6 +100,12 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
   width:34px;height:34px;cursor:pointer;font-size:18px;
   box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center}
 #locate-btn:hover{background:#f0f7ff}
+/* Bouton vue initiale */
+#home-btn{position:absolute;top:84px;right:10px;z-index:800;
+  background:white;border:none;border-radius:6px;
+  width:34px;height:34px;cursor:pointer;font-size:16px;
+  box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center}
+#home-btn:hover{background:#fff8e1}
 /* Barre de recherche */
 #search-wrap{position:absolute;top:10px;left:50%;transform:translateX(-50%);
   z-index:1000;width:320px;max-width:90vw}
@@ -219,6 +225,7 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
   .lp-item{padding:9px 4px;font-size:13.5px}
   .lp-item input[type=checkbox]{width:18px;height:18px}
   #locate-btn{width:40px;height:40px;right:8px;top:8px;font-size:20px}
+  #home-btn{width:40px;height:40px;top:96px;right:8px;font-size:18px}
   .fab{width:50px;height:50px;font-size:22px}
   #fab-bar{bottom:28px;right:8px;gap:8px}
   #tbl-panel.open{height:52vh}
@@ -276,6 +283,8 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 </div>
 <!-- Bouton localiser -->
 <button id="locate-btn" title="Me localiser" onclick="locateMe()">📍</button>
+<!-- Bouton vue initiale -->
+<button id="home-btn" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
 <!-- Boutons flottants -->
 <div id="fab-bar">
   <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
@@ -339,10 +348,13 @@ var map=L.map("map",{zoomControl:false,preferCanvas:true}).setView([46.3,-0.2],8
   map.createPane(p).style.zIndex=400+i*5;
 });
 var _locMarker=null;
+var HOME_CENTER=[46.3,-0.2],HOME_ZOOM=8;
+function resetView(){map.setView(HOME_CENTER,HOME_ZOOM,{animate:true});}
 function locateMe(){
   map.locate({setView:true,maxZoom:16,timeout:10000,enableHighAccuracy:true});
 }
 window.locateMe=locateMe;
+window.resetView=resetView;
 window.toggleLayersPanel=function(){
   var panel=document.getElementById("layers-panel");
   if(panel)panel.classList.toggle("open");
@@ -516,7 +528,7 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521a";
+var _cbv="?v=20260521b";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
