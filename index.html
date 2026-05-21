@@ -365,7 +365,7 @@ button,a,[onclick]{touch-action:manipulation}
 // ═══════════════════════════════════════════════════════════════
 
 // ─── PANES (z-order) ───
-var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21,tap:false}).setView([46.3,-0.2],8);
+var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21}).setView([46.3,-0.2],8);
 // SVG renderer pour couches polygones interactives (clic fiable sur Firefox/mobile)
 var _svgRenderer=L.svg();
 ["pane-bois","pane-old","pane-eco","pane-mc","pane-n2","pane-oh",
@@ -565,7 +565,7 @@ function addMarkersChunked(feats,opts,cluster,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var APP_VER="v9";
+var APP_VER="v10";
 function loadJSON(name){
   return fetch("data/"+name+".geojson")
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -602,6 +602,8 @@ var _oaProm=loadJSONSafe("oa");
 var _ohProm=loadJSONSafe("oh");
 var _pamProm=loadJSONSafe("pam");
 var _boisProm=loadJSONSafe("bois");
+// pk_hecto pré-chargé pour l'index de recherche — rendu différé au zoom≥16
+var _pkHProm=loadJSONSafe("pk_hecto");
 var railLayer;
 
 _railProm.then(function(rail){
@@ -678,6 +680,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // PK 100m : chargement différé au premier zoom≥16 (1 Mo non bloquant)
   var pkHectoLayer=L.layerGroup();
   addPKtoIndex(pk);
+  // Alimenter l'index de recherche pk_hecto dès que disponible (sans attendre zoom≥16)
+  _pkHProm.then(function(d){if(d){_pkHData=d;addPKHectoToIndex(d);}});
 
   // ── Accès ──────────────────────────────────────────────────────────────
   var accLayer=L.geoJSON(acces,{
@@ -880,7 +884,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
             }).addTo(pkHectoLayer);
             layerOn(pkHectoLayer);
           } else {
-            loadJSONSafe("pk_hecto").then(function(data){
+            _pkHProm.then(function(data){
               _pkHData=data;addPKHectoToIndex(data);
               if(!_pkHectoOff)updateVisibility();
             });
@@ -1714,7 +1718,7 @@ function updateNetBadge(){
   if(b)b.textContent=APP_VER+(navigator.onLine?' 🟢':' 🔴');
   var ob=document.getElementById('offline-btn');
   if(ob){
-    var cached=localStorage.getItem('lgv_cached_v9');
+    var cached=localStorage.getItem('lgv_cached_v10');
     ob.dataset.state=!navigator.onLine?(cached?'ready':'offline'):(cached?'ready':'');
   }
 }
@@ -1742,7 +1746,7 @@ async function warmOfflineCache(){
                .catch(function(){done++;});
     }));
   }
-  try{localStorage.setItem('lgv_cached_v9','1');}catch(e){}
+  try{localStorage.setItem('lgv_cached_v10','1');}catch(e){}
   if(btn){btn.textContent='✅';btn.title='Carte disponible hors-ligne ✓';}
   showNetToast('✅ Carte disponible hors-ligne');
   setTimeout(function(){if(btn){btn.textContent='📶';btn.disabled=false;}updateNetBadge();},2500);
