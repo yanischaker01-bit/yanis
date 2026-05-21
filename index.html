@@ -365,7 +365,7 @@ button,a,[onclick]{touch-action:manipulation}
 // ═══════════════════════════════════════════════════════════════
 
 // ─── PANES (z-order) ───
-var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21}).setView([46.3,-0.2],8);
+var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21,tap:false}).setView([46.3,-0.2],8);
 // SVG renderer pour couches polygones interactives (clic fiable sur Firefox/mobile)
 var _svgRenderer=L.svg();
 ["pane-bois","pane-old","pane-eco","pane-mc","pane-n2","pane-oh",
@@ -551,6 +551,18 @@ function addChunked(addFn,items,batchSize,onDone){
   }
   if(items.length)requestAnimationFrame(step);else if(onDone)onDone();
 }
+// ─── addLayers() batch API pour MarkerCluster (bien plus rapide que addLayer() individuel) ───
+function addMarkersChunked(feats,opts,cluster,batchSize,onDone){
+  var i=0;batchSize=batchSize||50;
+  function step(){
+    var end=Math.min(i+batchSize,feats.length),batch=[];
+    while(i<end){L.geoJSON(feats[i],opts).eachLayer(function(l){batch.push(l);});i++;}
+    if(batch.length)cluster.addLayers(batch);
+    if(i<feats.length)requestAnimationFrame(step);
+    else if(onDone)onDone();
+  }
+  if(feats.length)requestAnimationFrame(step);else if(onDone)onDone();
+}
 
 // ─── CHARGEMENT ───
 var APP_VER="v9";
@@ -585,6 +597,11 @@ var _railProm=loadJSONSafe("rail");
 // Couches Phase 1 + oa_poly en parallèle (pk_hecto différé au zoom≥16 — 1 Mo économisé)
 var _oaPolyProm=loadJSONSafe("oa_poly");
 var _restProm=Promise.all(["pk","acces","old","mc","n2","eco"].map(loadJSONSafe));
+// Phase 2 pré-chargées dès le démarrage — données disponibles avant la fin de Phase 1
+var _oaProm=loadJSONSafe("oa");
+var _ohProm=loadJSONSafe("oh");
+var _pamProm=loadJSONSafe("pam");
+var _boisProm=loadJSONSafe("bois");
 var railLayer;
 
 _railProm.then(function(rail){
@@ -602,8 +619,14 @@ _railProm.then(function(rail){
   if(map.getZoom()<7)map.setZoom(7);
   try{var _sp=JSON.parse(localStorage.getItem("lgv_map_pos")||"null");
     if(_sp&&_sp.lat)map.setView([_sp.lat,_sp.lng],_sp.zoom,{animate:false});}catch(e){}
-  map.on("moveend",function(){try{var _c=map.getCenter();
-    localStorage.setItem("lgv_map_pos",JSON.stringify({lat:_c.lat,lng:_c.lng,zoom:map.getZoom()}));}catch(e){}});
+  var _savePosTimer=null;
+  map.on("moveend",function(){
+    clearTimeout(_savePosTimer);
+    _savePosTimer=setTimeout(function(){
+      try{var _c=map.getCenter();
+        localStorage.setItem("lgv_map_pos",JSON.stringify({lat:_c.lat,lng:_c.lng,zoom:map.getZoom()}));}catch(e){}
+    },500);
+  });
 });
 
 Promise.all([_railProm,_restProm]).then(function(results){
@@ -1009,11 +1032,11 @@ Promise.all([_railProm,_restProm]).then(function(results){
     }
   }).addTo(map);
   _oaPolyProm.then(function(ap){
-    addChunked(function(f){oaPolyLayer.addData(f);},(ap.features||[]),40);
+    addChunked(function(f){oaPolyLayer.addData(f);},(ap.features||[]),80);
   });
   if(layerCtrl)layerCtrl.addOverlay(oaPolyLayer,"<span style=\"color:#00bcd4\">▬</span> OA – Emprises");
 
-  loadJSON("oa").then(function(oa){
+  _oaProm.then(function(oa){
     var oaFeats=oa.features||[];
     var oaOpts={pane:"pane-oa",
       pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🏗",22),pane:"pane-oa"})},
@@ -1023,7 +1046,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
         l.bindTooltip(lbl,{permanent:true,direction:"top",className:"tip-oa",offset:[0,-13]});
         l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOA(l.feature.properties);});
       }};
-    addChunked(function(f){L.geoJSON(f,oaOpts).addTo(oaCluster);},oaFeats,30,function(){
+    addMarkersChunked(oaFeats,oaOpts,oaCluster,50,function(){
       var cnt=oaFeats.length;
       var el=document.getElementById("cnt-oa");if(el)el.textContent=cnt;
       _updateLpCount("oa",cnt);
@@ -1039,9 +1062,9 @@ Promise.all([_railProm,_restProm]).then(function(results){
     refreshTableIfOpen();console.error("OA erreur:",e);
   });
 
-  loadJSON("oh").then(function(oh){
+  _ohProm.then(function(oh){
     var ohFeats=oh.features||[];
-    addChunked(function(f){ohLayer.addData(f);},ohFeats,60,function(){
+    addChunked(function(f){ohLayer.addData(f);},ohFeats,100,function(){
       var cnt=ohFeats.length;
       var el=document.getElementById("cnt-oh");if(el)el.textContent=cnt;
       _updateLpCount("oh",cnt);
@@ -1057,7 +1080,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
     refreshTableIfOpen();console.error("OH erreur:",e);
   });
 
-  loadJSON("pam").then(function(pam){
+  _pamProm.then(function(pam){
     var pamFeats=pam.features||[];
     var pamOpts={pane:"pane-oa",
       pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🌱",20),pane:"pane-oa"})},
@@ -1066,7 +1089,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
         l.bindTooltip(c(p.libelle||p.axe||"PAM"),{sticky:true});
         l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailPAM(l.feature.properties);});
       }};
-    addChunked(function(f){L.geoJSON(f,pamOpts).addTo(pamCluster);},pamFeats,30,function(){
+    addMarkersChunked(pamFeats,pamOpts,pamCluster,50,function(){
       var cnt=pamFeats.length;
       var el=document.getElementById("cnt-pam");if(el)el.textContent=cnt;
       _updateLpCount("pam",cnt);
@@ -1085,9 +1108,9 @@ Promise.all([_railProm,_restProm]).then(function(results){
   });
 
   // ── Boisements (Phase 2 – 2,3 Mo, canvas) ────────────────────────────────
-  loadJSONSafe("bois").then(function(boisData){
+  _boisProm.then(function(boisData){
     var boisFeats=boisData.features||[];
-    addChunked(function(f){boisLayer.addData(f);},boisFeats,100,function(){
+    addChunked(function(f){boisLayer.addData(f);},boisFeats,150,function(){
       var bcnt=boisFeats.length;
       layerData.bois=boisFeats.map(function(f){return{props:f.properties,geom:f.geometry};});
       _loading.bois=false;
@@ -1712,10 +1735,12 @@ async function warmOfflineCache(){
   ];
   if(btn){btn.textContent='⏳';btn.disabled=true;btn.dataset.state='';}
   var done=0,total=files.length;
-  for(var i=0;i<files.length;i++){
-    try{await fetch(files[i]);}catch(e){}  // SW intercepts et cache automatiquement
-    done++;
-    if(btn)btn.title='Cache: '+done+'/'+total;
+  // Fetches parallèles par lots de 4 (SW intercepte et met en cache chaque réponse)
+  for(var i=0;i<files.length;i+=4){
+    await Promise.all(files.slice(i,i+4).map(function(f){
+      return fetch(f).then(function(){done++;if(btn)btn.title='Cache: '+done+'/'+total;})
+               .catch(function(){done++;});
+    }));
   }
   try{localStorage.setItem('lgv_cached_v9','1');}catch(e){}
   if(btn){btn.textContent='✅';btn.title='Carte disponible hors-ligne ✓';}
