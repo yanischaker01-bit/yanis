@@ -155,13 +155,44 @@ body{font-family:"Segoe UI",Arial,sans-serif;background:#1a1a2e}
 #detail-panel.open{transform:translateX(0)}
 #detail-header{background:#1a1a2e;color:white;padding:10px 14px;display:flex;
   align-items:center;gap:8px;flex-shrink:0}
-#detail-body{flex:1;overflow-y:auto;padding:12px 14px;font-size:12.5px}
-#detail-body table{width:100%;border-collapse:collapse;margin-bottom:6px}
-#detail-body td{padding:3px 4px 3px 0;vertical-align:top;border-bottom:1px solid #f5f5f5;font-size:11.5px}
-#detail-body td:first-child{font-weight:600;color:#888;white-space:nowrap;width:110px;font-size:11px}
-#detail-body img{width:100%;border-radius:6px;margin:8px 0;cursor:zoom-in;box-shadow:0 2px 8px rgba(0,0,0,.2)}
-.detail-section{margin-top:10px;border-top:1px solid #eee;padding-top:8px}
-.detail-section-title{font-size:11px;font-weight:700;color:#666;margin-bottom:6px}
+#detail-body{flex:1;overflow-y:auto;padding:0;font-size:12.5px}
+/* ── Panneau détail ArcGIS-style ─────────────────────────────── */
+.dp-hero{padding:10px 14px 8px;border-top:4px solid #1a1a2e;background:#fafafa}
+.dp-badge{display:inline-block;font-size:9px;font-weight:700;padding:2px 7px;
+  border-radius:10px;margin-bottom:4px;letter-spacing:.5px;color:white}
+.dp-main{font-size:13px;font-weight:700;line-height:1.25;color:#1a1a2e;word-break:break-word}
+.dp-sub{font-size:11px;color:#666;margin-top:2px;line-height:1.3;word-break:break-word}
+.dp-sec{padding:7px 14px;border-bottom:1px solid #f0f0f0}
+.dp-sec-hd{font-size:9px;font-weight:700;color:#bbb;text-transform:uppercase;
+  letter-spacing:.8px;margin-bottom:5px}
+.dp-row{display:flex;padding:2px 0;line-height:1.4}
+.dp-k{color:#aaa;font-size:10.5px;min-width:90px;width:90px;flex-shrink:0;padding-right:6px}
+.dp-v{color:#1a1a2e;font-size:11.5px;flex:1;word-break:break-word}
+.dp-photo-w{padding:8px 14px;border-bottom:1px solid #f0f0f0}
+.dp-photo-w img{width:100%;border-radius:5px;cursor:zoom-in;
+  box-shadow:0 2px 8px rgba(0,0,0,.18);transition:transform .2s}
+.dp-photo-w img:hover{transform:scale(1.02)}
+.dp-actions{padding:7px 14px;border-bottom:1px solid #f0f0f0;display:flex;flex-wrap:wrap;gap:6px}
+.dp-sp{display:inline-flex;align-items:center;gap:5px;background:#e3f2fd;color:#1565c0;
+  border-radius:5px;padding:5px 10px;font-size:11.5px;font-weight:600;
+  text-decoration:none;border:none;cursor:pointer}
+.dp-sp:hover{background:#bbdefb}
+.dpj{padding:8px 14px 14px}
+.dpj-hd{display:flex;align-items:center;gap:6px;margin-bottom:7px}
+.dpj-lbl{font-size:9px;font-weight:700;color:#bbb;text-transform:uppercase;
+  letter-spacing:.8px;flex:1}
+.dpj-cnt{background:#e8f5e9;color:#2e7d32;font-size:10px;font-weight:700;
+  padding:1px 8px;border-radius:10px;min-width:18px;text-align:center}
+.dpj-item{display:flex;align-items:center;gap:6px;padding:5px 0;border-bottom:1px solid #f5f5f5}
+.dpj-item a{color:#0078d4;text-decoration:none;flex:1;font-size:11.5px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dpj-item a:hover{text-decoration:underline}
+.dpj-date{color:#ccc;font-size:9.5px;white-space:nowrap;flex-shrink:0}
+.dpj-add{display:inline-flex;align-items:center;gap:5px;margin-top:8px;
+  background:#f1f8e9;border:1px solid #c5e1a5;border-radius:5px;
+  padding:5px 10px;font-size:11.5px;font-weight:600;color:#33691e;cursor:pointer}
+.dpj-add:hover{background:#dcedc8}
+.dpj-empty{color:#ccc;font-size:11.5px;padding:2px 0}
 /* KML choice modal */
 #kml-choice-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;
   background:rgba(0,0,0,.55);z-index:9500;align-items:center;justify-content:center}
@@ -437,7 +468,7 @@ var boisLayer=L.geoJSON(null,{
     var p=f.properties;
     l.bindTooltip("🌳 "+c(p.TYPE_OBJET),{sticky:true});
     l.on("click",function(e){L.DomEvent.stopPropagation(e);
-      openDetail("🌳 "+c(p.TYPE_OBJET||"Boisement"),buildDetailTable(p));});
+      openDetailGeneric("Bois","🌳 "+c(p.TYPE_OBJET||"Boisement"),p,"#388e3c");});
   }
 }).addTo(map);
 
@@ -463,6 +494,18 @@ function _restoreLayerStates(){
       else if(!on&&map.hasLayer(d.layer))map.removeLayer(d.layer);
     });
   }catch(e){}
+}
+
+// ─── CHARGEMENT CHUNKED (évite le gel de l'UI sur les grosses couches) ───
+function addChunked(addFn,items,batchSize,onDone){
+  var i=0;batchSize=batchSize||80;
+  function step(){
+    var end=Math.min(i+batchSize,items.length);
+    while(i<end)addFn(items[i++]);
+    if(i<items.length)requestAnimationFrame(step);
+    else if(onDone)onDone();
+  }
+  if(items.length)requestAnimationFrame(step);else if(onDone)onDone();
 }
 
 // ─── CHARGEMENT ───
@@ -505,7 +548,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     onEachFeature:function(f,l){
       l.bindTooltip(c(f.properties.Name)||"LGV SEA",{sticky:true});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetail("🚄 "+c(f.properties.Name||"LGV SEA"),buildDetailTable(f.properties));});
+        openDetailGeneric("Rail","🚄 LGV SEA",f.properties,"#cc0000");});
     }
   }).addTo(map);
   try{map.fitBounds(railLayer.getBounds().pad(.05));}catch(e){}
@@ -569,7 +612,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var p=f.properties;
       l.bindTooltip(c(p.NOM_ACCES||p.Name||p.name||"Accès"),{sticky:true});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetail("🚧 "+c(p.NOM_ACCES||p.Name||p.name||"Accès"),buildDetailTable(p));});
+        openDetailGeneric("Accès","🚧 "+c(p.NOM_ACCES||p.Name||p.name||"Accès"),p,"#ff6600");});
     }
   }); // accLayer ajouté via updateVisibility (zoom>=12)
   layerData.acces=(acces.features||[]).map(function(f){return{props:f.properties,layer:null,bbox:null,geom:f.geometry};});
@@ -582,7 +625,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var p=f.properties;
       l.bindTooltip("Zone OLD "+(c(p.CODE)||""),{sticky:true});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetail("🔷 Zone OLD "+c(p.CODE||""),buildDetailTable(p));});
+        openDetailGeneric("OLD","🔷 Zone OLD "+c(p.CODE||""),p,"#0d47a1");});
     }
   }).addTo(map);
   layerData.old=(old.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -596,7 +639,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var p=f.properties;
       l.bindTooltip(c(p.projet||p.type||"MC"),{sticky:true});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetail("🌿 Mesure compensatoire",buildDetailTable(p));});
+        openDetailGeneric("MC","🌿 Mesure compensatoire",p,"#7b1fa2");});
     }
   });
   layerData.mc=(mc.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -622,7 +665,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var nom=c(p.sitename||p.cd_sig||"");
       l.bindTooltip(nom,{permanent:true,sticky:false,className:"tip-n2",direction:"center"});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetail("Natura 2000 "+n2Badge(t)+" "+nom,buildDetailTable(p));});
+        openDetailGeneric("N2000","Natura 2000 "+nom,p,"#1b5e20");});
     }
   }).addTo(map);
   layerData.n2=(n2.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -639,7 +682,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       var p=f.properties;
       l.bindTooltip("🐑 "+c(p.Appellation||p.Name),{sticky:true});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetail("🐑 "+c(p.Appellation||p.Name||"Écopâturage"),buildDetailTable(p));});
+        openDetailGeneric("Eco","🐑 "+c(p.Appellation||p.Name||"Écopâturage"),p,"#2e7d32");});
     }
   }).addTo(map);
   layerData.eco=(eco.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
@@ -871,51 +914,47 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   function stripB64(props){var p=Object.assign({},props);delete p._ph_b64;return p;}
 
   loadJSON("oa").then(function(oa){
-    L.geoJSON(oa,{
-      pane:"pane-oa",
+    var oaFeats=oa.features||[];
+    var oaOpts={pane:"pane-oa",
       pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🏗",22),pane:"pane-oa"})},
       onEachFeature:function(f,l){
-        var code=c(f.properties.CODE_OBJET);
-        var lib=c(f.properties.LIBELLE_LO);
+        var code=c(f.properties.CODE_OBJET),lib=c(f.properties.LIBELLE_LO);
         var lbl=(code&&lib)?code+" – "+lib:(code||lib);
         l.bindTooltip(lbl,{permanent:true,direction:"top",className:"tip-oa",offset:[0,-13]});
         l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOA(l.feature.properties);});
-      }
-    }).addTo(oaCluster);
-    var cnt=(oa.features||[]).length;
-    var el=document.getElementById("cnt-oa");if(el)el.textContent=cnt;
-    _updateLpCount("oa",cnt);
-    layerData.oa=(oa.features||[]).map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
-    _loading.oa=false;
-    if(window._updateLoadStatus)_updateLoadStatus();
-    buildSearchIndex();
-    refreshTableIfOpen();
+      }};
+    addChunked(function(f){L.geoJSON(f,oaOpts).addTo(oaCluster);},oaFeats,30,function(){
+      var cnt=oaFeats.length;
+      var el=document.getElementById("cnt-oa");if(el)el.textContent=cnt;
+      _updateLpCount("oa",cnt);
+      layerData.oa=oaFeats.map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
+      _loading.oa=false;
+      if(window._updateLoadStatus)_updateLoadStatus();
+      buildSearchIndex();refreshTableIfOpen();
+    });
   }).catch(function(e){
     var el=document.getElementById("cnt-oa");if(el)el.textContent="0";
-    _updateLpCount("oa",0);
-    _loading.oa=false;
+    _updateLpCount("oa",0);_loading.oa=false;
     if(window._updateLoadStatus)_updateLoadStatus();
-    refreshTableIfOpen();
-    console.error("OA erreur:",e);
+    refreshTableIfOpen();console.error("OA erreur:",e);
   });
 
   loadJSON("oh").then(function(oh){
-    ohLayer.addData(oh);
-    var cnt=(oh.features||[]).length;
-    var el=document.getElementById("cnt-oh");if(el)el.textContent=cnt;
-    _updateLpCount("oh",cnt);
-    layerData.oh=(oh.features||[]).map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
-    _loading.oh=false;
-    if(window._updateLoadStatus)_updateLoadStatus();
-    buildSearchIndex();
-    refreshTableIfOpen();
+    var ohFeats=oh.features||[];
+    addChunked(function(f){ohLayer.addData(f);},ohFeats,60,function(){
+      var cnt=ohFeats.length;
+      var el=document.getElementById("cnt-oh");if(el)el.textContent=cnt;
+      _updateLpCount("oh",cnt);
+      layerData.oh=ohFeats.map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
+      _loading.oh=false;
+      if(window._updateLoadStatus)_updateLoadStatus();
+      buildSearchIndex();refreshTableIfOpen();
+    });
   }).catch(function(e){
     var el=document.getElementById("cnt-oh");if(el)el.textContent="0";
-    _updateLpCount("oh",0);
-    _loading.oh=false;
+    _updateLpCount("oh",0);_loading.oh=false;
     if(window._updateLoadStatus)_updateLoadStatus();
-    refreshTableIfOpen();
-    console.error("OH erreur:",e);
+    refreshTableIfOpen();console.error("OH erreur:",e);
   });
 
   loadJSON("pam").then(function(pam){
@@ -1379,7 +1418,7 @@ function restoreKMLLayers(ctrl){
 }
 
 // ═══════════════════════════════════════════════════════════════
-// PANNEAU DÉTAILS (fenêtre contextuelle)
+// PANNEAU DÉTAILS – style ArcGIS
 // ═══════════════════════════════════════════════════════════════
 function openDetail(title,bodyHtml){
   document.getElementById("detail-title").innerHTML=title;
@@ -1388,62 +1427,105 @@ function openDetail(title,bodyHtml){
 }
 function closeDetail(){document.getElementById("detail-panel").classList.remove("open");}
 
-function buildDetailTable(props,skip){
-  skip=skip||["_ph_b64","_ph_path","_ph_url","_sp_url"];
-  var html="<table>";
-  Object.keys(props).forEach(function(k){
-    if(skip.indexOf(k)>=0)return;
-    var v=c(props[k]);if(!v)return;
-    html+="<tr><td>"+esc(k)+"</td><td>"+esc(v)+"</td></tr>";
-  });
-  return html+"</table>";
+// ── Briques HTML du panneau ─────────────────────────────────────────────────
+function dpHero(badge,title,sub,color){
+  return'<div class="dp-hero" style="border-top-color:'+color+'">'+
+    '<div class="dp-badge" style="background:'+color+'">'+badge+'</div>'+
+    '<div class="dp-main">'+esc(title)+'</div>'+
+    (sub?'<div class="dp-sub">'+esc(sub)+'</div>':'')+
+    '</div>';
 }
-
-function renderPJInline(code){
+function dpSec(hd,pairs){
+  var rows=(pairs||[]).filter(function(r){return c(r[1]);}).map(function(r){
+    return'<div class="dp-row"><span class="dp-k">'+r[0]+'</span><span class="dp-v">'+esc(c(r[1]))+'</span></div>';
+  }).join('');
+  return rows?'<div class="dp-sec"><div class="dp-sec-hd">'+hd+'</div>'+rows+'</div>':'';
+}
+function dpAllFields(props){
+  var skip=["_ph_b64","_ph_path","_ph_url","_sp_url"];
+  var rows=Object.keys(props).filter(function(k){return skip.indexOf(k)<0&&c(props[k]);}).map(function(k){
+    return'<div class="dp-row"><span class="dp-k">'+esc(k)+'</span><span class="dp-v">'+esc(c(props[k]))+'</span></div>';
+  }).join('');
+  return rows?'<div class="dp-sec"><div class="dp-sec-hd">Attributs</div>'+rows+'</div>':'';
+}
+function dpPhoto(p){var h=photoHtml(p);return h?'<div class="dp-photo-w">'+h+'</div>':'';}
+function dpSp(p){
+  if(!p._sp_url||p._sp_url==="null"||p._sp_url==="None")return'';
+  return'<div class="dp-actions"><a class="dp-sp" href="'+esc(c(p._sp_url))+'" target="_blank">📂 SharePoint</a></div>';
+}
+function featureKey(type,p){
+  var id=c(p.CODE_OBJET||p.code_objet||p.NOM_ACCES||p.Name||p.name||p.CODE||p.code||p.cd_sig||p.Appellation||p.libelle||"");
+  return (type+"_"+id).replace(/[^\w]/g,"_").slice(0,50);
+}
+function _dpjItems(code){
   var list=getPJList(code);
-  if(!list.length)return"<p style=\"color:#aaa;font-size:11.5px\">Aucune pièce jointe.</p>";
-  return list.map(function(p,i){
-    return"<div class=\"pj-item\"><a href=\""+p.data+"\" download=\""+esc(p.name)+"\" style=\"color:#0078d4;font-size:12px\">📄 "+esc(p.name)+"</a>"+
-      "<button class=\"pj-del\" onclick=\"deletePJDetail('"+esc(code)+"',"+i+")\">✕</button></div>";
-  }).join("");
+  return list.length?list.map(function(p,i){
+    var d="";try{d=new Date(p.date).toLocaleDateString("fr-FR");}catch(e){}
+    return'<div class="dpj-item"><a href="'+p.data+'" download="'+esc(p.name)+'">📄 '+esc(p.name)+'</a>'+
+      '<span class="dpj-date">'+d+'</span>'+
+      '<button class="pj-del" onclick="dpjDel(\''+esc(code)+'\','+i+')">✕</button></div>';
+  }).join(''):'<div class="dpj-empty">Aucune pièce jointe</div>';
 }
-function deletePJDetail(code,idx){
+function dpPJWrap(code){
+  var sc=esc(code),cnt=getPJList(code).length;
+  return'<div class="dpj">'+
+    '<div class="dpj-hd"><span class="dpj-lbl">📎 Pièces jointes</span>'+
+    '<span class="dpj-cnt" id="dpj-cnt-'+sc+'">'+cnt+'</span></div>'+
+    '<div id="dpj-'+sc+'">'+_dpjItems(code)+'</div>'+
+    '<label class="dpj-add">➕ Ajouter un fichier'+
+    '<input type="file" multiple style="display:none" onchange="dpjAdd(\''+sc+'\',this)"/></label>'+
+    '</div>';
+}
+function dpjDel(code,idx){
   var list=getPJList(code);list.splice(idx,1);savePJList(code,list);
-  var el=document.getElementById("dpj-"+code);if(el)el.innerHTML=renderPJInline(code);
+  var el=document.getElementById("dpj-"+code);if(el)el.innerHTML=_dpjItems(code);
+  var cnt=document.getElementById("dpj-cnt-"+code);if(cnt)cnt.textContent=list.length;
 }
-function addPJDetail(code,input){
-  var files=Array.from(input.files);var list=getPJList(code);var toRead=files.length;
+function dpjAdd(code,input){
+  var files=Array.from(input.files),list=getPJList(code),toRead=files.length;
   files.forEach(function(file){
     var reader=new FileReader();
     reader.onload=function(e){
       list.push({name:file.name,data:e.target.result,type:file.type,date:new Date().toISOString()});
-      toRead--;if(!toRead){savePJList(code,list);var el=document.getElementById("dpj-"+code);if(el)el.innerHTML=renderPJInline(code);}
+      toRead--;if(!toRead){
+        savePJList(code,list);
+        var el=document.getElementById("dpj-"+code);if(el)el.innerHTML=_dpjItems(code);
+        var cnt=document.getElementById("dpj-cnt-"+code);if(cnt)cnt.textContent=list.length;
+      }
     };reader.readAsDataURL(file);
   });input.value="";
 }
-function pjSection(code,label){
-  var safeCode=esc(code);
-  return"<div class=\"detail-section\"><div class=\"detail-section-title\">📎 Pièces jointes</div>"+
-    "<div id=\"dpj-"+safeCode+"\">"+renderPJInline(code)+"</div>"+
-    "<label class=\"btn-pj\" style=\"margin-top:6px;display:inline-block\">➕ Ajouter"+
-    "<input type=\"file\" multiple style=\"display:none\" onchange=\"addPJDetail('"+safeCode+"',this)\"/></label>"+
-    "</div>";
+
+// ── Ouverture panneau ───────────────────────────────────────────────────────
+function openDetailGeneric(badge,title,p,color){
+  var body=dpHero(badge,title,"",color)+dpPhoto(p)+dpAllFields(p)+dpSp(p);
+  openDetail(title,body);
 }
 function openDetailOA(p){
   var code=c(p.CODE_OBJET),lib=c(p.LIBELLE_LO);
-  var title="🏗 "+(code?code+" – ":"")+lib;
-  var body=photoHtml(p)+buildDetailTable(p)+spHtml(p)+pjSection(code,code+" "+lib);
-  openDetail(title,body);
+  var body=dpHero("OA",code,lib,"#00bcd4")+
+    dpPhoto(p)+
+    dpSec("Localisation",[["PK",p._pk_fmt],["Voie",p.VOIE],["Commune",p.COMMUNE],["Département",p.DEPARTEMEN]])+
+    dpSec("Caractéristiques",[["Famille",p.LIBELLE_FA],["Type",p.LIBELLE_TY||p.TYPE_OBJ],["Dimensions",p.DIMENSIONS]])+
+    dpSp(p)+dpPJWrap(code||featureKey("OA",p));
+  openDetail("🏗 "+(code?code+" – ":"")+lib,body);
 }
 function openDetailOH(p){
   var code=c(p.code_objet),lib=c(p.libelle_ob);
-  var title="💧 "+(code?code+" – ":"")+lib;
-  var body=photoHtml(p)+buildDetailTable(p)+spHtml(p)+pjSection(code,code+" "+lib);
-  openDetail(title,body);
+  var body=dpHero("OH",code,lib,"#ef6c00")+
+    dpPhoto(p)+
+    dpSec("Localisation",[["PK",p._pk_fmt],["Voie",p.voie]])+
+    dpSec("Caractéristiques",[["Type",p.type_objet],["Structure",p.structure],["Longueur",p.longueur?(c(p.longueur)+" m"):""],["Cours d'eau",p.ecoul_nom]])+
+    dpSp(p)+dpPJWrap(code||featureKey("OH",p));
+  openDetail("💧 "+(code?code+" – ":"")+lib,body);
 }
 function openDetailPAM(p){
   var lib=c(p.libelle||p.axe||"PAM");
-  var body=photoHtml(p)+buildDetailTable(p)+spHtml(p);
+  var body=dpHero("PAM",lib,"","#9c27b0")+
+    dpPhoto(p)+
+    dpSec("Localisation",[["Axe",p.axe],["PK EF",p.pk_ef],["PK GC",p.pk_gc],["Décalage",p.decalage]])+
+    (c(p.commentair)?dpSec("Commentaire",[["Note",p.commentair]]): "")+
+    dpSp(p);
   openDetail("🌱 "+lib,body);
 }
 
