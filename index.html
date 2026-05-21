@@ -516,7 +516,7 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260520b";
+var _cbv="?v=20260521a";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -806,7 +806,10 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     mapEl.classList.toggle("lbl-oa", z>=10);
     mapEl.classList.toggle("lbl-oh", z>=15);
   }
-  map.on("click",function(){closeDetail();});
+  map.on("click",function(){
+    if(_detailJustOpened){_detailJustOpened=false;return;}
+    closeDetail();
+  });
   map.on("zoomend",updateVisibility);
   updateVisibility();
 
@@ -965,22 +968,23 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   });
 
   loadJSON("pam").then(function(pam){
-    L.geoJSON(pam,{
+    var pamFeats=pam.features||[];
+    var pamOpts={pane:"pane-oa",
       pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🌱",20),pane:"pane-oa"})},
       onEachFeature:function(f,l){
         var p=f.properties;
         l.bindTooltip(c(p.libelle||p.axe||"PAM"),{sticky:true});
         l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailPAM(l.feature.properties);});
-      }
-    }).addTo(pamCluster);
-    var cnt=(pam.features||[]).length;
-    var el=document.getElementById("cnt-pam");if(el)el.textContent=cnt;
-    _updateLpCount("pam",cnt);
-    layerData.pam=(pam.features||[]).map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
-    _loading.pam=false;
-    if(window._updateLoadStatus)_updateLoadStatus();
-    buildSearchIndex();
-    refreshTableIfOpen();
+      }};
+    addChunked(function(f){L.geoJSON(f,pamOpts).addTo(pamCluster);},pamFeats,30,function(){
+      var cnt=pamFeats.length;
+      var el=document.getElementById("cnt-pam");if(el)el.textContent=cnt;
+      _updateLpCount("pam",cnt);
+      layerData.pam=pamFeats.map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
+      _loading.pam=false;
+      if(window._updateLoadStatus)_updateLoadStatus();
+      buildSearchIndex();refreshTableIfOpen();
+    });
   }).catch(function(e){
     var el=document.getElementById("cnt-pam");if(el)el.textContent="0";
     _updateLpCount("pam",0);
@@ -992,14 +996,15 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
 
   // ── Boisements (Phase 2 – 2,3 Mo, canvas) ────────────────────────────────
   loadJSONSafe("bois").then(function(boisData){
-    boisLayer.addData(boisData);
-    var bcnt=(boisData.features||[]).length;
-    layerData.bois=(boisData.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
-    _loading.bois=false;
-    if(window._updateLpCount)_updateLpCount("bois",bcnt);
-    if(window._updateLoadStatus)_updateLoadStatus();
-    buildSearchIndex();
-    refreshTableIfOpen();
+    var boisFeats=boisData.features||[];
+    addChunked(function(f){boisLayer.addData(f);},boisFeats,100,function(){
+      var bcnt=boisFeats.length;
+      layerData.bois=boisFeats.map(function(f){return{props:f.properties,geom:f.geometry};});
+      _loading.bois=false;
+      if(window._updateLpCount)_updateLpCount("bois",bcnt);
+      if(window._updateLoadStatus)_updateLoadStatus();
+      buildSearchIndex();refreshTableIfOpen();
+    });
   }).catch(function(e){
     _loading.bois=false;
     if(window._updateLpCount)_updateLpCount("bois",0);
@@ -1427,7 +1432,9 @@ function restoreKMLLayers(ctrl){
 // ═══════════════════════════════════════════════════════════════
 // PANNEAU DÉTAILS – style ArcGIS
 // ═══════════════════════════════════════════════════════════════
+var _detailJustOpened=false;
 function openDetail(title,bodyHtml){
+  _detailJustOpened=true;
   document.getElementById("detail-title").innerHTML=title;
   document.getElementById("detail-body").innerHTML=bodyHtml;
   document.getElementById("detail-panel").classList.add("open");
