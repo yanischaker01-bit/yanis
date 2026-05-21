@@ -1,5 +1,5 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v5';
+const CACHE = 'lgv-sea-v6';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 const PRECACHE = [
@@ -26,6 +26,11 @@ const PRECACHE = [
   'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css',
   'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js'
 ];
+
+/* Réception du message SKIP_WAITING depuis la page → activation immédiate */
+self.addEventListener('message', e => {
+  if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
+});
 
 self.addEventListener('install', e => {
   e.waitUntil(

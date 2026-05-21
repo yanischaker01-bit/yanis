@@ -283,6 +283,10 @@ button,a,[onclick]{touch-action:manipulation}
 </div>
 <!-- Bouton localiser -->
 <button id="locate-btn" title="Me localiser" onclick="locateMe()">📍</button>
+<!-- Badge version -->
+<div id="ver-badge" title="Version de l'application" style="position:absolute;bottom:8px;right:8px;z-index:800;
+  background:rgba(26,26,46,.75);color:rgba(255,255,255,.55);font-size:9.5px;
+  padding:2px 6px;border-radius:8px;pointer-events:none;letter-spacing:.3px"></div>
 <!-- Boutons flottants -->
 <div id="fab-bar">
   <button id="install-btn" class="fab fab-white" title="Installer l'application sur cet appareil" onclick="installApp()" style="display:flex">📲</button>
@@ -530,7 +534,8 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521e";
+var _cbv="?v=20260521f";
+var APP_VER="v6";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -1592,29 +1597,28 @@ window.installApp=installApp;
 /* ── PWA Service Worker – mise à jour automatique ── */
 if('serviceWorker' in navigator){
   window.addEventListener('load',function(){
-    var hadController=!!navigator.serviceWorker.controller;
+    var reloading=false;
     navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'})
     .then(function(reg){
+      // Affiche la version courante
+      var badge=document.getElementById('ver-badge');
+      if(badge)badge.textContent=APP_VER;
+      // Vérifie immédiatement si une mise à jour existe
       reg.update();
       reg.addEventListener('updatefound',function(){
         var w=reg.installing;
         if(!w)return;
         w.addEventListener('statechange',function(){
-          if(w.state==='installed'&&navigator.serviceWorker.controller){
-            var b=document.createElement('div');
-            b.style.cssText='position:fixed;bottom:70px;left:50%;transform:translateX(-50%);'+
-              'z-index:9998;background:#1a1a2e;color:white;padding:8px 18px;border-radius:20px;'+
-              'font-size:12.5px;display:flex;align-items:center;gap:12px;box-shadow:0 4px 16px rgba(0,0,0,.5)';
-            b.innerHTML='Mise à jour disponible'+
-              '<button onclick="window.location.reload()" style="background:#cc0000;color:white;border:none;'+
-              'border-radius:12px;padding:5px 14px;cursor:pointer;font-size:12px;font-weight:700">Actualiser</button>';
-            document.body.appendChild(b);
+          if(w.state==='installed'){
+            // Demande au nouveau SW de prendre le contrôle immédiatement
+            w.postMessage({type:'SKIP_WAITING'});
           }
         });
       });
     }).catch(function(e){console.warn('SW:',e);});
+    // Quand le SW change de contrôleur → rechargement automatique
     navigator.serviceWorker.addEventListener('controllerchange',function(){
-      if(hadController)window.location.reload();
+      if(!reloading){reloading=true;window.location.reload();}
     });
   });
 }
