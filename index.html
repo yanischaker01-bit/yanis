@@ -534,8 +534,8 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521f";
-var APP_VER="v6";
+var _cbv="?v=20260521g";
+var APP_VER="v7";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -562,13 +562,15 @@ if(location.protocol==="file:"){
   showError("Protocole file:// – les fichiers de données ne peuvent pas être chargés directement.");
 } else {
 
-Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONSafe))
-.then(function(d){
-  var rail=d[0],pk=d[1],pkH=d[2],acces=d[3],old=d[4],mc=d[5],n2=d[6],eco=d[7];
-  document.getElementById("loader").remove();
+// Rail en premier → carte visible immédiatement (~30 Ko)
+var _railProm=loadJSONSafe("rail");
+// Autres couches Phase 1 en parallèle (pk_hecto différé au zoom≥16 — 1 Mo économisé)
+var _restProm=Promise.all(["pk","acces","old","mc","n2","eco"].map(loadJSONSafe));
+var railLayer;
 
-  // ── Tracé ──────────────────────────────────────────────────────────────
-  var railLayer=L.geoJSON(rail,{
+_railProm.then(function(rail){
+  document.getElementById("loader").remove();
+  railLayer=L.geoJSON(rail,{
     pane:"pane-rail",
     style:{color:"#cc0000",weight:4.5,opacity:.95},
     onEachFeature:function(f,l){
@@ -583,6 +585,13 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
     if(_sp&&_sp.lat)map.setView([_sp.lat,_sp.lng],_sp.zoom,{animate:false});}catch(e){}
   map.on("moveend",function(){try{var _c=map.getCenter();
     localStorage.setItem("lgv_map_pos",JSON.stringify({lat:_c.lat,lng:_c.lng,zoom:map.getZoom()}));}catch(e){}});
+});
+
+Promise.all([_railProm,_restProm]).then(function(results){
+  var d=results[1];
+  var pk=d[0],acces=d[1],old=d[2],mc=d[3],n2=d[4],eco=d[5];
+  // loader déjà retiré par _railProm (fallback si rail a échoué)
+  var _lel=document.getElementById("loader");if(_lel)_lel.remove();
 
   // ── Couches PK – 4 niveaux selon zoom ──────────────────────────────────
   function pkMeters(lbl){
@@ -624,11 +633,9 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   });
   // Legacy reference pour layer control toggle
   var pkLayer=pk1Layer;
-  // PK 100m : hectométriques – init paresseuse (crée ~3000 DOM uniquement si zoom≥16)
-  _pkHData=pkH;
-  var pkHectoLayer=L.layerGroup(); // rempli dans updateVisibility au premier zoom≥16
+  // PK 100m : chargement différé au premier zoom≥16 (1 Mo non bloquant)
+  var pkHectoLayer=L.layerGroup();
   addPKtoIndex(pk);
-  addPKHectoToIndex(pkH);
 
   // ── Accès ──────────────────────────────────────────────────────────────
   var accLayer=L.geoJSON(acces,{
@@ -807,17 +814,28 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
       [pk50Layer,pk10Layer,pk1Layer].forEach(layerOff);
     }
     if(!_pkHectoOff&&z>=16){
-      if(!_pkHInited&&_pkHData){
-        _pkHInited=true;
-        L.geoJSON(_pkHData,{
-          pane:"pane-pk",
-          pointToLayer:function(f,ll){return L.circleMarker(ll,mkPkStyle(2.5,"#666","#eee",1));},
-          onEachFeature:function(f,l){
-            l.bindTooltip(c(f.properties._pk_label),{permanent:true,direction:"top",className:"tip-pk tip-pkh",offset:[0,-4]});
-          }
-        }).addTo(pkHectoLayer);
+      if(!_pkHInited){
+        if(_pkHData){
+          _pkHInited=true;
+          L.geoJSON(_pkHData,{
+            pane:"pane-pk",
+            pointToLayer:function(f,ll){return L.circleMarker(ll,mkPkStyle(2.5,"#666","#eee",1));},
+            onEachFeature:function(f,l){
+              l.bindTooltip(c(f.properties._pk_label),{permanent:true,direction:"top",className:"tip-pk tip-pkh",offset:[0,-4]});
+            }
+          }).addTo(pkHectoLayer);
+          layerOn(pkHectoLayer);
+        } else {
+          // Premier zoom≥16 : charger pk_hecto maintenant (1 Mo différé)
+          loadJSONSafe("pk_hecto").then(function(data){
+            _pkHData=data;
+            addPKHectoToIndex(data);
+            if(!_pkHectoOff)updateVisibility();
+          });
+        }
+      } else {
+        layerOn(pkHectoLayer);
       }
-      layerOn(pkHectoLayer);
     } else layerOff(pkHectoLayer);
     // ── Accès (zoom ≥ 12) ──────────────────────────────────────────────
     if(!_accOff&&z>=12)layerOn(accLayer); else layerOff(accLayer);
@@ -1036,7 +1054,7 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   // ── Restaurer KML depuis localStorage ────────────────────────────────────
   restoreKMLLayers(layerCtrl);
 
-}).catch(function(err){showError(err.message);console.error(err);});
+}).catch(function(err){showError(err&&err.message||"Erreur de chargement");console.error(err);});
 
 } // end else (not file://)
 
