@@ -1,5 +1,5 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v4';
+const CACHE = 'lgv-sea-v5';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 const PRECACHE = [
@@ -55,6 +55,20 @@ self.addEventListener('fetch', e => {
         .then(r => {
           const clone = r.clone();
           caches.open(TILE_CACHE).then(c => c.put(e.request, clone));
+          return r;
+        })
+        .catch(() => caches.match(e.request))
+    );
+    return;
+  }
+
+  /* Navigation (index.html) → réseau d'abord pour toujours avoir la version fraîche */
+  if (e.request.mode === 'navigate') {
+    e.respondWith(
+      fetch(e.request, {cache: 'no-cache'})
+        .then(r => {
+          const clone = r.clone();
+          caches.open(CACHE).then(c => c.put(e.request, clone));
           return r;
         })
         .catch(() => caches.match(e.request))
