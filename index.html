@@ -285,6 +285,7 @@ button,a,[onclick]{touch-action:manipulation}
 <button id="locate-btn" title="Me localiser" onclick="locateMe()">📍</button>
 <!-- Boutons flottants -->
 <div id="fab-bar">
+  <button id="install-btn" class="fab fab-white" title="Installer l'application sur cet appareil" onclick="installApp()" style="display:none">📲</button>
   <button class="fab fab-white" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
   <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
   <button class="fab fab-white" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
@@ -529,7 +530,7 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521c";
+var _cbv="?v=20260521d";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -718,7 +719,8 @@ Promise.all(["rail","pk","pk_hecto","acces","old","mc","n2","eco"].map(loadJSONS
   // OH couche (lignes) – étiquettes permanentes masquées par CSS, révélées au zoom≥15
   var ohLayer=L.geoJSON(null,{
     pane:"pane-oh",
-    style:{color:"#ef6c00",weight:4.5,opacity:.95},
+    interactive:true,
+    style:{color:"#ef6c00",weight:8,opacity:.9},
     onEachFeature:function(f,l){
       var p=f.properties;
       var cod=c(p.code_objet),libob=c(p.libelle_ob);
@@ -1554,10 +1556,59 @@ function openDetailPAM(p){
   openDetail("🌱 "+lib,body);
 }
 
-/* ── PWA Service Worker ── */
+/* ── PWA Install ── */
+var _installPrompt=null;
+window.addEventListener('beforeinstallprompt',function(e){
+  e.preventDefault();
+  _installPrompt=e;
+  var btn=document.getElementById('install-btn');
+  if(btn)btn.style.display='flex';
+});
+window.addEventListener('appinstalled',function(){
+  _installPrompt=null;
+  var btn=document.getElementById('install-btn');
+  if(btn)btn.style.display='none';
+});
+function installApp(){
+  if(!_installPrompt){
+    alert('Installer l\'application :\n\n📱 Android Chrome : appuyez sur ⋮ → "Ajouter à l\'écran d\'accueil"\n🍎 Safari iOS : appuyez sur partager → "Sur l\'écran d\'accueil"');
+    return;
+  }
+  _installPrompt.prompt();
+  _installPrompt.userChoice.then(function(r){
+    _installPrompt=null;
+    if(r.outcome==='accepted'){var btn=document.getElementById('install-btn');if(btn)btn.style.display='none';}
+  });
+}
+window.installApp=installApp;
+
+/* ── PWA Service Worker – mise à jour automatique ── */
 if('serviceWorker' in navigator){
   window.addEventListener('load',function(){
-    navigator.serviceWorker.register('./sw.js').catch(function(e){console.warn('SW:',e);});
+    var hadController=!!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'})
+    .then(function(reg){
+      reg.update();
+      reg.addEventListener('updatefound',function(){
+        var w=reg.installing;
+        if(!w)return;
+        w.addEventListener('statechange',function(){
+          if(w.state==='installed'&&navigator.serviceWorker.controller){
+            var b=document.createElement('div');
+            b.style.cssText='position:fixed;bottom:70px;left:50%;transform:translateX(-50%);'+
+              'z-index:9998;background:#1a1a2e;color:white;padding:8px 18px;border-radius:20px;'+
+              'font-size:12.5px;display:flex;align-items:center;gap:12px;box-shadow:0 4px 16px rgba(0,0,0,.5)';
+            b.innerHTML='Mise à jour disponible'+
+              '<button onclick="window.location.reload()" style="background:#cc0000;color:white;border:none;'+
+              'border-radius:12px;padding:5px 14px;cursor:pointer;font-size:12px;font-weight:700">Actualiser</button>';
+            document.body.appendChild(b);
+          }
+        });
+      });
+    }).catch(function(e){console.warn('SW:',e);});
+    navigator.serviceWorker.addEventListener('controllerchange',function(){
+      if(hadController)window.location.reload();
+    });
   });
 }
 </script>
