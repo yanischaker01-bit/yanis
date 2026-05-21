@@ -214,7 +214,7 @@ button,a,[onclick]{touch-action:manipulation}
   cursor:pointer;color:#c62828;font-size:11px;margin-left:auto;flex-shrink:0}
 /* ══ Mobile / Téléphone ══════════════════════════════════════════════ */
 @media(max-width:768px){
-  #detail-panel{width:100%;max-width:100%;top:auto;height:70vh;transform:translateY(100%);
+  #detail-panel{position:fixed;width:100%;max-width:100%;top:auto;height:70vh;transform:translateY(100%);
     box-shadow:0 -4px 20px rgba(0,0,0,.2);transition:transform .25s cubic-bezier(.4,0,.2,1)}
   #detail-panel.open{transform:translateY(0)}
   #dp-backdrop.open{background:rgba(0,0,0,.25)}
@@ -290,6 +290,7 @@ button,a,[onclick]{touch-action:manipulation}
 <!-- Boutons flottants -->
 <div id="fab-bar">
   <button id="install-btn" class="fab fab-white" title="Installer l'application sur cet appareil" onclick="installApp()" style="display:flex">📲</button>
+  <button class="fab fab-white" title="Télécharger toutes les données en local (hors-ligne rapide)" onclick="downloadOfflinePack()">⬇️</button>
   <button class="fab fab-white" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
   <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
   <button class="fab fab-white" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
@@ -349,8 +350,10 @@ button,a,[onclick]{touch-action:manipulation}
 
 // ─── PANES (z-order) ───
 var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21}).setView([46.3,-0.2],8);
+// SVG renderer pour couches polygones interactives (clic fiable sur Firefox/mobile)
+var _svgRenderer=L.svg();
 ["pane-bois","pane-old","pane-eco","pane-mc","pane-n2","pane-oh",
- "pane-rail","pane-oa","pane-acces","pane-pk","pane-kml","pane-focus"].forEach(function(p,i){
+ "pane-rail","pane-oa-poly","pane-oa","pane-acces","pane-pk","pane-kml","pane-focus"].forEach(function(p,i){
   map.createPane(p).style.zIndex=400+i*5;
 });
 var _locMarker=null;
@@ -534,8 +537,8 @@ function addChunked(addFn,items,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var _cbv="?v=20260521g";
-var APP_VER="v7";
+var _cbv="?v=20260521h";
+var APP_VER="v8";
 function loadJSON(name){
   return fetch("data/"+name+".geojson"+_cbv)
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -653,6 +656,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── OLD ────────────────────────────────────────────────────────────────
   var oldLayer=L.geoJSON(old,{
     pane:"pane-old",
+    renderer:_svgRenderer,
     style:{color:"#0d47a1",weight:3,fillColor:"#4f83ff",fillOpacity:.16,dashArray:"10 4"},
     onEachFeature:function(f,l){
       var p=f.properties;
@@ -666,6 +670,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── MC ─────────────────────────────────────────────────────────────────
   var mcLayer=L.geoJSON(mc,{
     pane:"pane-mc",
+    renderer:_svgRenderer,
     style:{color:"#7b1fa2",weight:2.2,fillColor:"#ab47bc",fillOpacity:.16},
     pointToLayer:function(f,ll){return L.circleMarker(ll,{radius:6,color:"#7b1fa2",weight:2,fillColor:"#ce93d8",fillOpacity:.75,pane:"pane-mc"})},
     onEachFeature:function(f,l){
@@ -691,6 +696,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   }
   var n2Layer=L.geoJSON(n2,{
     pane:"pane-n2",
+    renderer:_svgRenderer,
     style:n2Style,
     onEachFeature:function(f,l){
       var p=f.properties;
@@ -706,6 +712,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── Écopâturage ────────────────────────────────────────────────────────
   var ecoLayer=L.geoJSON(eco,{
     pane:"pane-eco",
+    renderer:_svgRenderer,
     style:function(f){
       var active=c(f.properties.Occupation).toUpperCase()==="ACTIVE";
       return{color:active?"#2e7d32":"#999",weight:2,
@@ -724,10 +731,10 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // disableClusteringAtZoom:15 → marqueurs individuels dès zoom≥15, clic direct = panneau détail
   var oaCluster=makePointGroup({iconCreateFunction:clusterIco("#00bcd4"),
     clusterPane:"pane-oa",maxClusterRadius:50,spiderfyOnMaxZoom:true,showCoverageOnHover:false,
-    chunkedLoading:true,disableClusteringAtZoom:15});
+    chunkedLoading:true,disableClusteringAtZoom:13});
   var pamCluster=makePointGroup({iconCreateFunction:clusterIco("#9c27b0"),
     clusterPane:"pane-oa",maxClusterRadius:50,spiderfyOnMaxZoom:true,showCoverageOnHover:false,
-    chunkedLoading:true,disableClusteringAtZoom:15});
+    chunkedLoading:true,disableClusteringAtZoom:13});
   oaCluster.addTo(map);
   pamCluster.addTo(map);
 
@@ -961,6 +968,23 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ─── Phase 2 : couches lourdes ──────────────────────────────────────────
   // Garde les propriétés mais retire _ph_b64 de layerData (trop lourd en mémoire)
   function stripB64(props){var p=Object.assign({},props);delete p._ph_b64;return p;}
+
+  // ── OA polygones (oa_poly.geojson – emprise des ouvrages) ────────────────
+  var oaPolyLayer=L.geoJSON(null,{
+    pane:"pane-oa-poly",
+    renderer:_svgRenderer,
+    style:{color:"#00bcd4",weight:2,fillColor:"#00bcd4",fillOpacity:.18},
+    onEachFeature:function(f,l){
+      var p=f.properties;
+      var lbl=c(p.LIBELLE_COURT||p.LIBELLE||"OA");
+      l.bindTooltip("🏗 "+lbl,{sticky:true});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOAPoly(l.feature.properties);});
+    }
+  }).addTo(map);
+  loadJSONSafe("oa_poly").then(function(ap){
+    (ap.features||[]).forEach(function(f){oaPolyLayer.addData(f);});
+  });
+  if(layerCtrl)layerCtrl.addOverlay(oaPolyLayer,"<span style=\"color:#00bcd4\">▬</span> OA – Emprises");
 
   loadJSON("oa").then(function(oa){
     var oaFeats=oa.features||[];
@@ -1556,6 +1580,18 @@ function openDetailGeneric(badge,title,p,color){
   var body=dpHero(badge,title,"",color)+dpPhoto(p)+dpAllFields(p)+dpSp(p);
   openDetail(title,body);
 }
+function openDetailOAPoly(p){
+  var code=c(p.LIBELLE_COURT||p.CODE_OBJET||""),lib=c(p.LIBELLE||p.LIBELLE_LO||"");
+  var title=code?(code+(lib&&lib!==code?" – "+lib:"")):(lib||"OA");
+  var body=dpHero("OA",title,"","#00bcd4")+
+    dpPhoto(p)+
+    dpSec("Localisation",[["PK EF",p.PKEF||p._pk_fmt],["Commune",p.COMMUNE]])+
+    dpSec("Caractéristiques",[["Type",p.TYPE||p.LIBELLE_FA],["Infrastructure portée",p.INFRA_PORTEE],
+      ["Infrastructure franchie",p.INFRA_FRANCHIE],["Hauteur libre",p.HAUTEUR_LIBRE?(c(p.HAUTEUR_LIBRE)+" m"):""],
+      ["Longueur biaisée",p.LONGUEUR_BIAISE?(c(p.LONGUEUR_BIAISE)+" m"):""]])+
+    dpSp(p)+dpPJWrap(code||featureKey("OA",p));
+  openDetail("🏗 "+title,body);
+}
 function openDetailOA(p){
   var code=c(p.CODE_OBJET),lib=c(p.LIBELLE_LO);
   var body=dpHero("OA",code,lib,"#00bcd4")+
@@ -1605,12 +1641,49 @@ function installApp(){
   }
   // Pas de prompt natif disponible : instructions manuelles
   alert('📲 Installer l\'application :\n\n'
-    +'✅ Android Chrome : appuyez sur ⋮ (menu) → "Ajouter à l\'écran d\'accueil"\n\n'
-    +'✅ Android Chrome v3+ : icône 📲 dans la barre d\'adresse\n\n'
-    +'🍎 Safari iOS : appuyez sur 🔗 (partager) → "Sur l\'écran d\'accueil"\n\n'
-    +'💻 PC Chrome/Edge : icône 💻 dans la barre d\'adresse');
+    +'✅ Android Chrome : ⋮ menu → "Ajouter à l\'écran d\'accueil"\n\n'
+    +'🦊 Firefox Android : ⋮ menu → "Installer" ou "Ajouter à l\'écran d\'accueil"\n\n'
+    +'🍎 Safari iOS : 🔗 (partager) → "Sur l\'écran d\'accueil"\n\n'
+    +'💻 Chrome/Edge PC : icône 💻 dans la barre d\'adresse\n\n'
+    +'💻 Firefox PC : ⋮ menu → "Installer ce site en tant qu\'app"');
 }
 window.installApp=installApp;
+
+/* ── Téléchargement pack hors-ligne ── */
+function downloadOfflinePack(){
+  var files=[
+    'data/rail.geojson','data/pk.geojson','data/pk_hecto.geojson',
+    'data/oa.geojson','data/oa_poly.geojson','data/oh.geojson',
+    'data/pam.geojson','data/acces.geojson','data/old.geojson',
+    'data/mc.geojson','data/n2.geojson','data/eco.geojson','data/bois.geojson',
+    'index.html','sw.js','manifest.json',
+    'icons/icon-192.png','icons/icon-512.png'
+  ];
+  var done=0,total=files.length;
+  var dlBtn=document.querySelector('[onclick="downloadOfflinePack()"]');
+  if(dlBtn){dlBtn.textContent='⏳';dlBtn.disabled=true;}
+  // Utilise le cache SW si disponible, sinon fetch réseau
+  function tryDownload(f){
+    var url=f+_cbv;
+    (window.caches?caches.match(url):Promise.resolve(null)).then(function(cached){
+      var p=cached?Promise.resolve(cached):fetch(url);
+      return p.then(function(r){return r.blob();}).then(function(blob){
+        var a=document.createElement('a');
+        a.href=URL.createObjectURL(blob);
+        a.download=f.split('/').pop();
+        // Regrouper en ZIP n'est pas possible sans lib, donc on télécharge individuellement
+        a.click();
+        URL.revokeObjectURL(a.href);
+      });
+    }).catch(function(){}).finally(function(){
+      done++;
+      if(done===total&&dlBtn){dlBtn.textContent='⬇️';dlBtn.disabled=false;}
+    });
+  }
+  if(!confirm('Télécharger '+total+' fichiers de données pour usage hors-ligne ?\n(Les fichiers seront téléchargés un à un dans votre dossier Téléchargements)'))return;
+  files.forEach(function(f,i){setTimeout(function(){tryDownload(f);},i*300);});
+}
+window.downloadOfflinePack=downloadOfflinePack;
 
 /* ── PWA Service Worker – mise à jour automatique ── */
 if('serviceWorker' in navigator){

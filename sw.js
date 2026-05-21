@@ -1,5 +1,5 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v7';
+const CACHE = 'lgv-sea-v8';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 const PRECACHE = [
@@ -12,6 +12,7 @@ const PRECACHE = [
   './data/pk.geojson',
   './data/pk_hecto.geojson',
   './data/oa.geojson',
+  './data/oa_poly.geojson',
   './data/oh.geojson',
   './data/pam.geojson',
   './data/acces.geojson',
