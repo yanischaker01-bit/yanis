@@ -368,6 +368,17 @@ button,a,[onclick]{touch-action:manipulation}
 var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21}).setView([46.3,-0.2],8);
 // SVG renderer pour couches polygones interactives (clic fiable sur Firefox/mobile)
 var _svgRenderer=L.svg();
+var _boisCanvas=L.canvas({tolerance:5});
+// ── Bbox cache + viewport filter pour viewport culling ──
+function _featBbox(f){
+  if(f._bbox)return f._bbox;
+  var crds=f.geometry&&f.geometry.coordinates;
+  if(!crds)return(f._bbox=[0,0,0,0]);
+  var mnx=Infinity,mny=Infinity,mxx=-Infinity,mxy=-Infinity;
+  (function sc(a){typeof a[0]==="number"?(a[0]<mnx&&(mnx=a[0]),a[1]<mny&&(mny=a[1]),a[0]>mxx&&(mxx=a[0]),a[1]>mxy&&(mxy=a[1])):a.forEach(sc);})(crds);
+  return(f._bbox=[mnx,mny,mxx,mxy]);
+}
+function _inBounds(f,b){var bb=_featBbox(f);return bb[2]>=b.getWest()&&bb[0]<=b.getEast()&&bb[3]>=b.getSouth()&&bb[1]<=b.getNorth();}
 ["pane-bois","pane-old","pane-eco","pane-mc","pane-n2","pane-oh",
  "pane-rail","pane-oa-poly","pane-oa","pane-acces","pane-pk","pane-kml","pane-focus"].forEach(function(p,i){
   map.createPane(p).style.zIndex=400+i*5;
@@ -504,6 +515,7 @@ function boisColor(type){
 }
 var boisLayer=L.geoJSON(null,{
   pane:"pane-bois",
+  renderer:_boisCanvas,
   style:function(f){
     var t=(f.properties||{}).TYPE_OBJET;
     return{color:"#FFEB3B",weight:2,fillColor:boisColor(t),fillOpacity:.5,dashArray:"6 3"};
@@ -791,7 +803,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
     onEachFeature:function(f,l){
       var p=f.properties;
       var cod=c(p.code_objet),libob=c(p.libelle_ob);
-      var lbl=(cod&&libob)?cod+" – "+libob:(cod||libob);
+      var lbl=libob||cod||"OH";
       l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oh"});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOH(l.feature.properties);});
     }
@@ -923,7 +935,32 @@ Promise.all([_railProm,_restProm]).then(function(results){
       mapEl.classList.toggle("lbl-oh", z>=12);
     });
   }
-  map.on("zoomend",updateVisibility);
+  // ── Viewport culling boisements (canvas, 2 Mo) ──────────────────────────
+  var _boisFeatsAll=[],_boisVCReady=false,_boisVCTimer=null;
+  function _refreshBoisVC(){
+    clearTimeout(_boisVCTimer);
+    _boisVCTimer=setTimeout(function(){
+      if(!_boisFeatsAll.length||!map.hasLayer(boisLayer))return;
+      var z=map.getZoom();
+      var feats=z>=12?_boisFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.4));})
+                     :_boisFeatsAll;
+      boisLayer.clearLayers();
+      addChunked(function(f){boisLayer.addData(f);},feats,150);
+    },220);
+  }
+  // Rebuild boisements viewport au pan uniquement si fortement zoomé
+  map.on('moveend',function(){if(_boisVCReady&&map.getZoom()>=13)_refreshBoisVC();});
+
+  // ── Fluidité zoom : masquer couches lourdes pendant l'animation ─────────
+  var _zpanes=['pane-bois','pane-old','pane-eco','pane-mc','pane-n2','pane-oa-poly','pane-oh'];
+  map.on('zoomstart',function(){
+    _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='hidden';});
+  });
+  map.on('zoomend',function(){
+    _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='';});
+    updateVisibility();
+    if(_boisVCReady)_refreshBoisVC();
+  });
   updateVisibility();
 
   // ── Panneau liste des couches ────────────────────────────────────────────
@@ -1110,12 +1147,17 @@ Promise.all([_railProm,_restProm]).then(function(results){
     console.error("PAM erreur:",e);
   });
 
-  // ── Boisements (Phase 2 – 2,3 Mo, canvas) ────────────────────────────────
+  // ── Boisements (Phase 2 – 2,3 Mo, canvas + viewport culling) ────────────
   _boisProm.then(function(boisData){
-    var boisFeats=boisData.features||[];
-    addChunked(function(f){boisLayer.addData(f);},boisFeats,150,function(){
-      var bcnt=boisFeats.length;
-      layerData.bois=boisFeats.map(function(f){return{props:f.properties,geom:f.geometry};});
+    _boisFeatsAll=boisData.features||[];
+    _boisFeatsAll.forEach(_featBbox); // pré-calcul bbox pour _inBounds rapide
+    var z=map.getZoom();
+    // Chargement initial filtré si déjà zoomé (évite 2 Mo d'un coup)
+    var initFeats=z>=12?_boisFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));}):_boisFeatsAll;
+    addChunked(function(f){boisLayer.addData(f);},initFeats,150,function(){
+      var bcnt=_boisFeatsAll.length;
+      _boisVCReady=true;
+      layerData.bois=_boisFeatsAll.map(function(f){return{props:f.properties,geom:f.geometry};});
       _loading.bois=false;
       if(window._updateLpCount)_updateLpCount("bois",bcnt);
       if(window._updateLoadStatus)_updateLoadStatus();
