@@ -1759,20 +1759,22 @@ if('serviceWorker' in navigator){
     navigator.serviceWorker.register('./sw.js',{updateViaCache:'none'})
     .then(function(reg){
       updateNetBadge();
-      // Vérifie immédiatement si une mise à jour existe
       reg.update();
       reg.addEventListener('updatefound',function(){
         var w=reg.installing;
         if(!w)return;
         w.addEventListener('statechange',function(){
-          if(w.state==='installed'){
-            // Demande au nouveau SW de prendre le contrôle immédiatement
+          /* skipWaiting() est appelé dans l'install event du SW → l'état saute
+             directement installing→activating sans passer par 'installed'.
+             On envoie SKIP_WAITING sur 'activating' aussi pour couvrir les deux cas. */
+          if(w.state==='installed'||w.state==='activating'){
             w.postMessage({type:'SKIP_WAITING'});
           }
         });
       });
+      /* Vérification périodique toutes les 10 min (sessions longues) */
+      setInterval(function(){reg.update();},10*60*1000);
     }).catch(function(e){console.warn('SW:',e);});
-    // Quand le SW change de contrôleur → rechargement automatique
     navigator.serviceWorker.addEventListener('controllerchange',function(){
       if(!reloading){reloading=true;window.location.reload();}
     });
