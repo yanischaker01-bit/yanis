@@ -835,6 +835,24 @@ Promise.all([_railProm,_restProm]).then(function(results){
   };
   legend.addTo(map);
 
+  // ── OA polygones (oa_poly.geojson – emprise des ouvrages) ────────────────
+  // DOIT être avant updateVisibility() et initLayersPanel() pour éviter TypeError
+  var oaPolyLayer=L.geoJSON(null,{
+    pane:"pane-oa-poly",
+    renderer:_svgRenderer,
+    style:{color:"#00bcd4",weight:2,fillColor:"#00bcd4",fillOpacity:.18},
+    onEachFeature:function(f,l){
+      var p=f.properties;
+      var lbl=c(p.LIBELLE_COURT||p.CODE_OBJET||p.LIBELLE||"OA");
+      l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oa"});
+      l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOAPoly(l.feature.properties);});
+    }
+  }).addTo(map);
+  _oaPolyProm.then(function(ap){
+    addChunked(function(f){oaPolyLayer.addData(f);},(ap.features||[]),80);
+  });
+  if(layerCtrl)layerCtrl.addOverlay(oaPolyLayer,"<span style=\"color:#00bcd4\">▬</span> OA – Emprises");
+
   // ── Gestion échelle : couches + étiquettes ──────────────────────────────
   var mapEl=map.getContainer();
   // Préférences utilisateur (désactivé via contrôle couches)
@@ -1020,23 +1038,6 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ─── Phase 2 : couches lourdes ──────────────────────────────────────────
   // Garde les propriétés mais retire _ph_b64 de layerData (trop lourd en mémoire)
   function stripB64(props){var p=Object.assign({},props);delete p._ph_b64;return p;}
-
-  // ── OA polygones (oa_poly.geojson – emprise des ouvrages) ────────────────
-  var oaPolyLayer=L.geoJSON(null,{
-    pane:"pane-oa-poly",
-    renderer:_svgRenderer,
-    style:{color:"#00bcd4",weight:2,fillColor:"#00bcd4",fillOpacity:.18},
-    onEachFeature:function(f,l){
-      var p=f.properties;
-      var lbl=c(p.LIBELLE_COURT||p.CODE_OBJET||p.LIBELLE||"OA");
-      l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oa"});
-      l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOAPoly(l.feature.properties);});
-    }
-  }).addTo(map);
-  _oaPolyProm.then(function(ap){
-    addChunked(function(f){oaPolyLayer.addData(f);},(ap.features||[]),80);
-  });
-  if(layerCtrl)layerCtrl.addOverlay(oaPolyLayer,"<span style=\"color:#00bcd4\">▬</span> OA – Emprises");
 
   _oaProm.then(function(oa){
     var oaFeats=oa.features||[];
