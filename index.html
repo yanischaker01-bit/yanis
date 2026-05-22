@@ -523,13 +523,13 @@ function _saveLayerStates(){
   try{
     var s={};
     _lpDefs.forEach(function(d){s[d.lsKey||d.label]=map.hasLayer(d.layer);});
-    localStorage.setItem("lgv_layers_v10",JSON.stringify(s));
+    localStorage.setItem("lgv_layers_v12",JSON.stringify(s));
   }catch(e){}
 }
 function _restoreLayerStates(){
   if(!_lpDefs)return;
   try{
-    var s=JSON.parse(localStorage.getItem("lgv_layers_v10")||"{}");
+    var s=JSON.parse(localStorage.getItem("lgv_layers_v12")||"{}");
     _lpDefs.forEach(function(d){
       var key=d.lsKey||d.label;
       if(!(key in s))return;
@@ -565,7 +565,7 @@ function addMarkersChunked(feats,opts,cluster,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var APP_VER="v10";
+var APP_VER="v12";
 function loadJSON(name){
   return fetch("data/"+name+".geojson")
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -778,7 +778,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   var pamCluster=makePointGroup({iconCreateFunction:clusterIco("#9c27b0"),
     clusterPane:"pane-oa",maxClusterRadius:60,spiderfyOnMaxZoom:true,showCoverageOnHover:false,
     chunkedLoading:true,chunkInterval:200,chunkDelay:50,disableClusteringAtZoom:15});
-  oaCluster.addTo(map);
+  // oaCluster : hors par défaut — les polygones OA (oaPolyLayer) sont la couche principale
   pamCluster.addTo(map);
 
   // OH couche (lignes) – renderer canvas avec tolérance 15px pour faciliter le clic sur mobile
@@ -893,8 +893,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
       } else layerOff(pkHectoLayer);
       // ── Accès (zoom ≥ 12) ──────────────────────────────────────────
       if(!_accOff&&z>=12)layerOn(accLayer); else layerOff(accLayer);
-      // ── OA Polygones (zoom ≥ 11) ────────────────────────────────────
-      if(!_oaPolyOff&&z>=11)layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
+      // ── OA Polygones (zoom ≥ 8 – couche principale OA) ──────────────
+      if(!_oaPolyOff&&z>=8)layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
       // ── Labels CSS permanents ────────────────────────────────────────
       mapEl.classList.toggle("lbl-pk50", !_pkOff&&z>=7&&z<10);
       mapEl.classList.toggle("lbl-pk10", !_pkOff&&z>=10&&z<13);
@@ -902,7 +902,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=16);
       mapEl.classList.toggle("lbl-n2", z>=8);
       mapEl.classList.toggle("lbl-oa", z>=10);
-      mapEl.classList.toggle("lbl-oh", z>=15);
+      mapEl.classList.toggle("lbl-oh", z>=12);
     });
   }
   map.on("zoomend",updateVisibility);
@@ -918,7 +918,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       {label:"PK (zoom-adaptatif)",    lsKey:"pk",      layer:pkLayer,      color:"#333",    type:"dot"},
       {label:"PK 100m (zoom≥16)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
       {label:"Accès (zoom≥12)"+n1("acces"), lsKey:"acces", layer:accLayer,  emoji:"🚧"},
-      {label:"OA – Emprises (zoom≥11)", lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4", type:"fill"},
+      {label:"OA – Emprises polygones",  lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4", type:"fill"},
       {label:"OA – Ouvrages d'Art",    lsKey:"oa",      layer:oaCluster,   emoji:"🏗",     lpId:"lp-oa"},
       {label:"OH – Hydrauliques",      lsKey:"oh",      layer:ohLayer,     color:"#ff8c00", type:"line", lpId:"lp-oh"},
       {label:"PAM",                    lsKey:"pam",     layer:pamCluster,  emoji:"🌱",     lpId:"lp-pam"},
@@ -1028,8 +1028,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
     style:{color:"#00bcd4",weight:2,fillColor:"#00bcd4",fillOpacity:.18},
     onEachFeature:function(f,l){
       var p=f.properties;
-      var lbl=c(p.LIBELLE_COURT||p.LIBELLE||"OA");
-      l.bindTooltip("🏗 "+lbl,{sticky:true});
+      var lbl=c(p.LIBELLE_COURT||p.CODE_OBJET||p.LIBELLE||"OA");
+      l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oa"});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOAPoly(l.feature.properties);});
     }
   }).addTo(map);
@@ -1716,7 +1716,7 @@ function updateNetBadge(){
   if(b)b.textContent=APP_VER+(navigator.onLine?' 🟢':' 🔴');
   var ob=document.getElementById('offline-btn');
   if(ob){
-    var cached=localStorage.getItem('lgv_cached_v10');
+    var cached=localStorage.getItem('lgv_cached_v12');
     ob.dataset.state=!navigator.onLine?(cached?'ready':'offline'):(cached?'ready':'');
   }
 }
@@ -1744,7 +1744,7 @@ async function warmOfflineCache(){
                .catch(function(){done++;});
     }));
   }
-  try{localStorage.setItem('lgv_cached_v10','1');}catch(e){}
+  try{localStorage.setItem('lgv_cached_v12','1');}catch(e){}
   if(btn){btn.textContent='✅';btn.title='Carte disponible hors-ligne ✓';}
   showNetToast('✅ Carte disponible hors-ligne');
   setTimeout(function(){if(btn){btn.textContent='📶';btn.disabled=false;}updateNetBadge();},2500);
