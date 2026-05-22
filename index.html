@@ -361,7 +361,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-// CARTE LGV SEA  –  Leaflet v13
+// CARTE LGV SEA  –  Leaflet v14
 // ═══════════════════════════════════════════════════════════════
 
 // ─── PANES (z-order) ───
@@ -536,13 +536,13 @@ function _saveLayerStates(){
   try{
     var s={};
     _lpDefs.forEach(function(d){s[d.lsKey||d.label]=d.getOn?d.getOn():map.hasLayer(d.layer);});
-    localStorage.setItem("lgv_layers_v13",JSON.stringify(s));
+    localStorage.setItem("lgv_layers_v14",JSON.stringify(s));
   }catch(e){}
 }
 function _restoreLayerStates(){
   if(!_lpDefs)return;
   try{
-    var s=JSON.parse(localStorage.getItem("lgv_layers_v13")||"{}");
+    var s=JSON.parse(localStorage.getItem("lgv_layers_v14")||"{}");
     _lpDefs.forEach(function(d){
       var key=d.lsKey||d.label;
       if(!(key in s))return;
@@ -579,7 +579,7 @@ function addMarkersChunked(feats,opts,cluster,batchSize,onDone){
 }
 
 // ─── CHARGEMENT ───
-var APP_VER="v13";
+var APP_VER="v14";
 function loadJSON(name){
   return fetch("data/"+name+".geojson")
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.json();});
@@ -591,12 +591,15 @@ function loadJSONSafe(name){
     return emptyFC();
   });
 }
-// Loader Windows-1252 → pour n2.geojson dont la source était en ANSI/CP1252
-function loadJSONWin1252(name){
+// Détection automatique encodage : UTF-8 (fatal) → fallback Windows-1252
+function loadJSONAutoEncoding(name){
   return fetch("data/"+name+".geojson")
     .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.arrayBuffer();})
-    .then(function(buf){return JSON.parse(new TextDecoder("windows-1252").decode(buf));})
-    .catch(function(err){console.warn("Couche "+name+" (win1252) indisponible:",err);return emptyFC();});
+    .then(function(buf){
+      try{return JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(buf));}
+      catch(e){return JSON.parse(new TextDecoder("windows-1252").decode(buf));}
+    })
+    .catch(function(err){console.warn("Couche "+name+" (enc auto) indisponible:",err);return emptyFC();});
 }
 function showError(msg){
   var el=document.getElementById("loader");if(!el)return;
@@ -618,7 +621,7 @@ var _railProm=loadJSONSafe("rail");
 // Couches Phase 1 + oa_poly en parallèle (pk_hecto différé au zoom≥16 — 1 Mo économisé)
 var _oaPolyProm=loadJSONSafe("oa_poly");
 var _restProm=Promise.all(["pk","acces","old","mc","n2","eco"].map(function(n){
-  return n==="n2"?loadJSONWin1252(n):loadJSONSafe(n);
+  return n==="n2"?loadJSONAutoEncoding(n):loadJSONSafe(n);
 }));
 // Phase 2 pré-chargées dès le démarrage — données disponibles avant la fin de Phase 1
 var _oaProm=loadJSONSafe("oa");
@@ -918,7 +921,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       } else {
         [pk50Layer,pk10Layer,pk1Layer].forEach(layerOff);
       }
-      if(!_pkHectoOff&&z>=16){
+      if(!_pkHectoOff&&z>=17){
         if(!_pkHInited){
           if(_pkHData){
             _pkHInited=true;
@@ -938,25 +941,32 @@ Promise.all([_railProm,_restProm]).then(function(results){
           }
         } else layerOn(pkHectoLayer);
       } else layerOff(pkHectoLayer);
-      // ── Couches zoom-adaptatives (ordre croissant de zoom min) ─────
-      if(!_n2Off&&z>=8) layerOn(n2Layer);     else layerOff(n2Layer);
-      if(!_oldOff&&z>=9) layerOn(oldLayer);   else layerOff(oldLayer);
-      if(!_mcOff&&z>=10) layerOn(mcLayer);    else layerOff(mcLayer);
-      if(!_oaPolyOff&&z>=11) layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
-      if(!_oaOff&&z>=11) layerOn(oaCluster);  else layerOff(oaCluster);
-      if(!_ecoOff&&z>=11) layerOn(ecoLayer);  else layerOff(ecoLayer);
-      if(!_ohOff&&z>=12) layerOn(ohLayer);    else layerOff(ohLayer);
-      if(!_boisOff&&z>=12) layerOn(boisLayer); else layerOff(boisLayer);
-      if(!_accOff&&z>=12) layerOn(accLayer);  else layerOff(accLayer);
-      if(!_pamOff&&z>=13) layerOn(pamCluster); else layerOff(pamCluster);
+      // ── Couches zoom-adaptatives ─────────────────────────────────────
+      // Ordre : du plus global au plus détaillé (géomaticien)
+      if(!_n2Off&&z>=8)    layerOn(n2Layer);      else layerOff(n2Layer);
+      if(!_oldOff&&z>=9)   layerOn(oldLayer);     else layerOff(oldLayer);
+      if(!_mcOff&&z>=10)   layerOn(mcLayer);      else layerOff(mcLayer);
+      if(!_oaOff&&z>=11)   layerOn(oaCluster);    else layerOff(oaCluster);
+      if(!_ecoOff&&z>=11)  layerOn(ecoLayer);     else layerOff(ecoLayer);
+      if(!_boisOff&&z>=12) layerOn(boisLayer);    else layerOff(boisLayer);
+      if(!_accOff&&z>=12)  layerOn(accLayer);     else layerOff(accLayer);
+      if(!_oaPolyOff&&z>=13) layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
+      if(!_pamOff&&z>=13)  layerOn(pamCluster);   else layerOff(pamCluster);
+      if(!_ohOff&&z>=16)   layerOn(ohLayer);      else layerOff(ohLayer);
       // ── Labels CSS permanents ────────────────────────────────────────
       mapEl.classList.toggle("lbl-pk50", !_pkOff&&z>=7&&z<10);
       mapEl.classList.toggle("lbl-pk10", !_pkOff&&z>=10&&z<13);
-      mapEl.classList.toggle("lbl-pk1",  !_pkOff&&z>=13&&z<16);
-      mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=16);
+      mapEl.classList.toggle("lbl-pk1",  !_pkOff&&z>=13&&z<17);
+      mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=17);
       mapEl.classList.toggle("lbl-n2",  !_n2Off&&z>=8);
-      mapEl.classList.toggle("lbl-oa",  !_oaPolyOff&&z>=11);
-      mapEl.classList.toggle("lbl-oh",  !_ohOff&&z>=12);
+      mapEl.classList.toggle("lbl-oa",  !_oaPolyOff&&z>=13);
+      mapEl.classList.toggle("lbl-oh",  !_ohOff&&z>=16);
+      // ── Badge zoom panel couches ──────────────────────────────────────
+      document.querySelectorAll('.lp-mz[data-minzoom]').forEach(function(el){
+        var needed=z<parseInt(el.dataset.minzoom);
+        el.style.color=needed?'#e53935':'#bbb';
+        el.style.fontWeight=needed?'700':'400';
+      });
     });
   }
   // ── Viewport culling boisements (canvas, 2 Mo) ──────────────────────────
@@ -978,12 +988,11 @@ Promise.all([_railProm,_restProm]).then(function(results){
     clearTimeout(_ohVCTimer);
     _ohVCTimer=setTimeout(function(){
       if(!_ohFeatsAll.length||!map.hasLayer(ohLayer))return;
-      var z=map.getZoom();
-      var feats=z>=13?_ohFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));})
-                     :_ohFeatsAll;
+      // À z≥16 on est toujours très zoomé → culling systématique
+      var feats=_ohFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.6));});
       ohLayer.clearLayers();
       addChunked(function(f){ohLayer.addData(f);},feats,100);
-    },220);
+    },200);
   }
   // ── Viewport culling OA polygones (484 features, canvas) ─────────────────
   var _oaPolyFeatsAll=[],_oaPolyVCReady=false,_oaPolyVCTimer=null;
@@ -1002,7 +1011,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   map.on('moveend',function(){
     var z=map.getZoom();
     if(_boisVCReady&&!_boisOff&&z>=12)_refreshBoisVC();
-    if(_ohVCReady&&!_ohOff&&z>=12)_refreshOHVC();
+    if(_ohVCReady&&!_ohOff&&z>=16)_refreshOHVC();
     if(_oaPolyVCReady&&!_oaPolyOff&&z>=14)_refreshOAPolyVC();
   });
 
@@ -1026,28 +1035,28 @@ Promise.all([_railProm,_restProm]).then(function(results){
     if(!body)return;
     function n1(key){var n=(layerData[key]||[]).length;return n?" ("+n+")":"";}
     var defs=[
-      {label:"Tracé LGV",                      lsKey:"rail",    layer:railLayer,   color:"#cc0000",type:"line"},
-      {label:"PK (zoom-adaptatif)",             lsKey:"pk",      layer:pkLayer,     color:"#333",   type:"dot"},
-      {label:"PK 100m (z≥16)",                 lsKey:"pkhecto", layer:pkHectoLayer,color:"#666",   type:"dot"},
-      {label:"N2000 (z≥8)"+n1("n2"),           lsKey:"n2",      layer:n2Layer,     color:"#1b5e20",type:"fill",
+      {label:"Tracé LGV",             lsKey:"rail",    layer:railLayer,   color:"#cc0000",type:"line"},
+      {label:"PK (zoom-adaptatif)",   lsKey:"pk",      layer:pkLayer,     color:"#333",   type:"dot"},
+      {label:"PK 100m",               lsKey:"pkhecto", layer:pkHectoLayer,color:"#666",   type:"dot",   minZoom:17},
+      {label:"N2000"+n1("n2"),        lsKey:"n2",      layer:n2Layer,     color:"#1b5e20",type:"fill",  minZoom:8,
         offFn:function(v){_n2Off=v;},  getOn:function(){return !_n2Off;}},
-      {label:"Zones OLD (z≥9)"+n1("old"),      lsKey:"old",     layer:oldLayer,    color:"#3366ff",type:"fill",
+      {label:"Zones OLD"+n1("old"),   lsKey:"old",     layer:oldLayer,    color:"#3366ff",type:"fill",  minZoom:9,
         offFn:function(v){_oldOff=v;}, getOn:function(){return !_oldOff;}},
-      {label:"Mesures comp. (z≥10)"+n1("mc"),  lsKey:"mc",      layer:mcLayer,     color:"#9c27b0",type:"fill",
+      {label:"Mesures comp."+n1("mc"),lsKey:"mc",      layer:mcLayer,     color:"#9c27b0",type:"fill",  minZoom:10,
         offFn:function(v){_mcOff=v;},  getOn:function(){return !_mcOff;}},
-      {label:"OA Emprises (z≥11)",             lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4",type:"fill",
+      {label:"OA Emprises",           lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4",type:"fill",  minZoom:13,
         offFn:function(v){_oaPolyOff=v;},getOn:function(){return !_oaPolyOff;}},
-      {label:"OA Ouvrages d'Art (z≥11)",       lsKey:"oa",      layer:oaCluster,   emoji:"🏗",lpId:"lp-oa",
+      {label:"OA Ouvrages d'Art",     lsKey:"oa",      layer:oaCluster,   emoji:"🏗",lpId:"lp-oa",     minZoom:11,
         offFn:function(v){_oaOff=v;},   getOn:function(){return !_oaOff;}},
-      {label:"Écopâturage (z≥11)"+n1("eco"),   lsKey:"eco",     layer:ecoLayer,    color:"#81c784",type:"fill",
+      {label:"Écopâturage"+n1("eco"), lsKey:"eco",     layer:ecoLayer,    color:"#81c784",type:"fill",  minZoom:11,
         offFn:function(v){_ecoOff=v;},  getOn:function(){return !_ecoOff;}},
-      {label:"OH Hydrauliques (z≥12)",         lsKey:"oh",      layer:ohLayer,     color:"#ff8c00",type:"line",lpId:"lp-oh",
+      {label:"OH Hydrauliques",       lsKey:"oh",      layer:ohLayer,     color:"#ff8c00",type:"line",lpId:"lp-oh",minZoom:16,
         offFn:function(v){_ohOff=v;},   getOn:function(){return !_ohOff;}},
-      {label:"Boisements (z≥12)",              lsKey:"bois",    layer:boisLayer,   color:"#388e3c",type:"fill",lpId:"lp-bois",
+      {label:"Boisements"+n1("bois"), lsKey:"bois",    layer:boisLayer,   color:"#388e3c",type:"fill",lpId:"lp-bois",minZoom:12,
         offFn:function(v){_boisOff=v;}, getOn:function(){return !_boisOff;}},
-      {label:"Accès (z≥12)"+n1("acces"),       lsKey:"acces",   layer:accLayer,    emoji:"🚧",
+      {label:"Accès"+n1("acces"),     lsKey:"acces",   layer:accLayer,    emoji:"🚧",                  minZoom:12,
         offFn:function(v){_accOff=v;},  getOn:function(){return !_accOff;}},
-      {label:"PAM (z≥13)",                     lsKey:"pam",     layer:pamCluster,  emoji:"🌱",lpId:"lp-pam",
+      {label:"PAM",                   lsKey:"pam",     layer:pamCluster,  emoji:"🌱",lpId:"lp-pam",    minZoom:13,
         offFn:function(v){_pamOff=v;},  getOn:function(){return !_pamOff;}},
     ];
     _lpDefs=defs;
@@ -1083,7 +1092,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
       else if(d.type==="dot") sw="<div style=\"width:10px;height:10px;border-radius:50%;border:2px solid "+d.color+";background:white;flex-shrink:0\"></div>";
       else sw="<div class=\"lp-swatch\" style=\"background:"+d.color+";opacity:.7\"></div>";
       var badge=d.lpId?"<small id=\""+d.lpId+"\" style=\"color:#bbb;font-size:10px\"> ⏳</small>":"";
-      item.innerHTML=sw+"<span>"+d.label+badge+"</span>";
+      var mzBadge=d.minZoom?"<small class=\"lp-mz\" data-minzoom=\""+d.minZoom+"\" style=\"margin-left:auto;font-size:9px;color:#bbb;white-space:nowrap;padding-left:4px\">z≥"+d.minZoom+"</small>":"";
+      item.innerHTML=sw+"<span style=\"flex:1\">"+d.label+badge+"</span>"+mzBadge;
       item.insertBefore(chk,item.firstChild);
       body.appendChild(item);
     });
@@ -1175,7 +1185,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
     _ohFeatsAll=ohFeats;
     _ohFeatsAll.forEach(_featBbox);
     var z=map.getZoom();
-    var initFeats=z>=13?_ohFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));})
+    var initFeats=z>=16?_ohFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.6));})
                        :_ohFeatsAll;
     addChunked(function(f){ohLayer.addData(f);},initFeats,100,function(){
       var cnt=ohFeats.length;
@@ -1744,6 +1754,24 @@ function dpjAdd(code,input){
   });input.value="";
 }
 
+// ── Copier PK (terrain) ─────────────────────────────────────────────────────
+function dpCopyPK(pk){
+  if(!pk)return;
+  var done=function(){showNetToast('📋 PK copié : '+pk);};
+  if(navigator.clipboard){navigator.clipboard.writeText(pk).then(done).catch(done);}
+  else{try{var t=document.createElement('textarea');t.value=pk;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);}catch(e){}done();}
+}
+function dpPkBar(pkFmt){
+  if(!pkFmt)return '';
+  return '<div class="dp-actions"><button class="dp-sp" onclick="dpCopyPK(\''+esc(pkFmt)+'\')" '+
+    'style="background:#fff3e0;color:#e65100;border:1px solid #ffe0b2;cursor:pointer">📋 '+esc(pkFmt)+'</button></div>';
+}
+// ── Swipe-down pour fermer panneau détail sur mobile ─────────────────────────
+(function(){
+  var dp=document.getElementById('detail-panel'),sy=0;
+  dp.addEventListener('touchstart',function(e){sy=e.touches[0].clientY;},{passive:true});
+  dp.addEventListener('touchend',function(e){if(e.changedTouches[0].clientY-sy>70)closeDetail();},{passive:true});
+})();
 // ── Ouverture panneau ───────────────────────────────────────────────────────
 function openDetailGeneric(badge,title,p,color){
   var body=dpHero(badge,title,"",color)+dpPhoto(p)+dpAllFields(p)+dpSp(p);
@@ -1752,9 +1780,11 @@ function openDetailGeneric(badge,title,p,color){
 function openDetailOAPoly(p){
   var code=c(p.LIBELLE_COURT||p.CODE_OBJET||""),lib=c(p.LIBELLE||p.LIBELLE_LO||"");
   var title=code?(code+(lib&&lib!==code?" – "+lib:"")):(lib||"OA");
+  var pk=c(p.PKEF||p._pk_fmt);
   var body=dpHero("OA",title,"","#00bcd4")+
+    dpPkBar(pk)+
     dpPhoto(p)+
-    dpSec("Localisation",[["PK EF",p.PKEF||p._pk_fmt],["Commune",p.COMMUNE]])+
+    dpSec("Localisation",[["PK EF",pk],["Commune",p.COMMUNE]])+
     dpSec("Caractéristiques",[["Type",p.TYPE||p.LIBELLE_FA],["Infrastructure portée",p.INFRA_PORTEE],
       ["Infrastructure franchie",p.INFRA_FRANCHIE],["Hauteur libre",p.HAUTEUR_LIBRE?(c(p.HAUTEUR_LIBRE)+" m"):""],
       ["Longueur biaisée",p.LONGUEUR_BIAISE?(c(p.LONGUEUR_BIAISE)+" m"):""]])+
@@ -1764,6 +1794,7 @@ function openDetailOAPoly(p){
 function openDetailOA(p){
   var code=c(p.CODE_OBJET),lib=c(p.LIBELLE_LO);
   var body=dpHero("OA",code,lib,"#00bcd4")+
+    dpPkBar(c(p._pk_fmt))+
     dpPhoto(p)+
     dpSec("Localisation",[["PK",p._pk_fmt],["Voie",p.VOIE],["Commune",p.COMMUNE],["Département",p.DEPARTEMEN]])+
     dpSec("Caractéristiques",[["Famille",p.LIBELLE_FA],["Type",p.LIBELLE_TY||p.TYPE_OBJ],["Dimensions",p.DIMENSIONS]])+
@@ -1773,15 +1804,19 @@ function openDetailOA(p){
 function openDetailOH(p){
   var code=c(p.code_objet),lib=c(p.libelle_ob);
   var body=dpHero("OH",code,lib,"#ef6c00")+
+    dpPkBar(c(p._pk_fmt))+
     dpPhoto(p)+
-    dpSec("Localisation",[["PK",p._pk_fmt],["Voie",p.voie]])+
-    dpSec("Caractéristiques",[["Type",p.type_objet],["Structure",p.structure],["Longueur",p.longueur?(c(p.longueur)+" m"):""],["Cours d'eau",p.ecoul_nom]])+
+    dpSec("Localisation",[["PK",p._pk_fmt],["Voie",p.voie],["Cours d'eau",p.ecoul_nom]])+
+    dpSec("Caractéristiques",[["Type",p.type_objet],["Structure",p.structure],
+      ["Longueur",p.longueur?(c(p.longueur)+" m"):""],["Radier",p.radier],["Diamètre",p.diametre]])+
     dpSp(p)+dpPJWrap(code||featureKey("OH",p));
   openDetail("💧 "+(code?code+" – ":"")+lib,body);
 }
 function openDetailPAM(p){
   var lib=c(p.libelle||p.axe||"PAM");
+  var pkRef=c(p.pk_ef||p.pk_gc);
   var body=dpHero("PAM",lib,"","#9c27b0")+
+    dpPkBar(pkRef)+
     dpPhoto(p)+
     dpSec("Localisation",[["Axe",p.axe],["PK EF",p.pk_ef],["PK GC",p.pk_gc],["Décalage",p.decalage]])+
     (c(p.commentair)?dpSec("Commentaire",[["Note",p.commentair]]): "")+
@@ -1833,7 +1868,7 @@ function updateNetBadge(){
   if(b)b.textContent=APP_VER+(navigator.onLine?' 🟢':' 🔴');
   var ob=document.getElementById('offline-btn');
   if(ob){
-    var cached=localStorage.getItem('lgv_cached_v12');
+    var cached=localStorage.getItem('lgv_cached_v14');
     ob.dataset.state=!navigator.onLine?(cached?'ready':'offline'):(cached?'ready':'');
   }
 }
@@ -1861,7 +1896,7 @@ async function warmOfflineCache(){
                .catch(function(){done++;});
     }));
   }
-  try{localStorage.setItem('lgv_cached_v12','1');}catch(e){}
+  try{localStorage.setItem('lgv_cached_v14','1');}catch(e){}
   if(btn){btn.textContent='✅';btn.title='Carte disponible hors-ligne ✓';}
   showNetToast('✅ Carte disponible hors-ligne');
   setTimeout(function(){if(btn){btn.textContent='📶';btn.disabled=false;}updateNetBadge();},2500);
