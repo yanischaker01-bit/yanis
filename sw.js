@@ -63,6 +63,9 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = e.request.url;
 
+  /* reset.html → jamais mis en cache, toujours réseau */
+  if (url.includes('reset.html')) return;
+
   /* Tuiles OSM → réseau d'abord, cache en fallback */
   if (/openstreetmap\.org|tile\./.test(url)) {
     e.respondWith(
