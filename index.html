@@ -361,7 +361,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 // ═══════════════════════════════════════════════════════════════
-// CARTE LGV SEA  –  Leaflet v12
+// CARTE LGV SEA  –  Leaflet v13
 // ═══════════════════════════════════════════════════════════════
 
 // ─── PANES (z-order) ───
@@ -535,19 +535,20 @@ function _saveLayerStates(){
   if(!_lpDefs)return;
   try{
     var s={};
-    _lpDefs.forEach(function(d){s[d.lsKey||d.label]=map.hasLayer(d.layer);});
-    localStorage.setItem("lgv_layers_v12",JSON.stringify(s));
+    _lpDefs.forEach(function(d){s[d.lsKey||d.label]=d.getOn?d.getOn():map.hasLayer(d.layer);});
+    localStorage.setItem("lgv_layers_v13",JSON.stringify(s));
   }catch(e){}
 }
 function _restoreLayerStates(){
   if(!_lpDefs)return;
   try{
-    var s=JSON.parse(localStorage.getItem("lgv_layers_v12")||"{}");
+    var s=JSON.parse(localStorage.getItem("lgv_layers_v13")||"{}");
     _lpDefs.forEach(function(d){
       var key=d.lsKey||d.label;
       if(!(key in s))return;
       var on=s[key];
-      if(on&&!map.hasLayer(d.layer))d.layer.addTo(map);
+      if(d.offFn){d.offFn(!on);}
+      else if(on&&!map.hasLayer(d.layer))d.layer.addTo(map);
       else if(!on&&map.hasLayer(d.layer))map.removeLayer(d.layer);
     });
   }catch(e){}
@@ -729,7 +730,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
         openDetailGeneric("OLD","🔷 Zone OLD "+c(p.CODE||""),p,"#0d47a1");});
     }
-  }).addTo(map);
+  });
   layerData.old=(old.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
 
   // ── MC ─────────────────────────────────────────────────────────────────
@@ -771,7 +772,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
         openDetailGeneric("N2000","Natura 2000 "+nom,p,"#1b5e20");});
     }
-  }).addTo(map);
+  });
   layerData.n2=(n2.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
 
   // ── Écopâturage ────────────────────────────────────────────────────────
@@ -789,7 +790,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
         openDetailGeneric("Eco","🐑 "+c(p.Appellation||p.Name||"Écopâturage"),p,"#2e7d32");});
     }
-  }).addTo(map);
+  });
   layerData.eco=(eco.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
 
   // ── Clusters OA / PAM ─────────────────────────────────────────────────
@@ -800,8 +801,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   var pamCluster=makePointGroup({iconCreateFunction:clusterIco("#9c27b0"),
     clusterPane:"pane-oa",maxClusterRadius:60,spiderfyOnMaxZoom:true,showCoverageOnHover:false,
     chunkedLoading:true,chunkInterval:200,chunkDelay:50,disableClusteringAtZoom:15});
-  // oaCluster : hors par défaut — les polygones OA (oaPolyLayer) sont la couche principale
-  pamCluster.addTo(map);
+  // oaCluster + pamCluster : ajoutés via updateVisibility() selon zoom
 
   // OH couche (lignes) – renderer canvas avec tolérance 15px pour faciliter le clic sur mobile
   var _ohCanvas=L.canvas({tolerance:15});
@@ -817,7 +817,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oh"});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOH(l.feature.properties);});
     }
-  }).addTo(map);
+  });
 
   // ── Contrôle couches ────────────────────────────────────────────────────
   var overlays={};
@@ -883,23 +883,25 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── Gestion échelle : couches + étiquettes ──────────────────────────────
   var mapEl=map.getContainer();
   // Préférences utilisateur (désactivé via contrôle couches)
-  var _pkOff=false,_pkHectoOff=false,_accOff=false;
+  var _pkOff=false,_pkHectoOff=false;
+  // Flags "off" pour couches zoom-adaptatives (false = couche souhaitée par l'utilisateur)
+  var _accOff=false,_oaPolyOff=false,_oaOff=false,_ohOff=false,_pamOff=false;
+  var _oldOff=false,_mcOff=false,_n2Off=false,_ecoOff=false,_boisOff=false;
+  // Leaflet native layer control → synchronise les flags
   map.on("overlayremove",function(e){
     if(e.layer===pkLayer)_pkOff=true;
-    if(e.layer===pkHectoLayer)_pkHectoOff=true;
-    if(e.layer===accLayer)_accOff=true;
+    else if(e.layer===pkHectoLayer)_pkHectoOff=true;
+    else if(_lpDefs){_lpDefs.forEach(function(d){if(d.layer===e.layer&&d.offFn)d.offFn(true);});}
     updateVisibility();
   });
   map.on("overlayadd",function(e){
-    if(e.layer===pkLayer){_pkOff=false;updateVisibility();}
-    if(e.layer===pkHectoLayer){_pkHectoOff=false;updateVisibility();}
-    if(e.layer===accLayer){_accOff=false;updateVisibility();}
+    if(e.layer===pkLayer)_pkOff=false;
+    else if(e.layer===pkHectoLayer)_pkHectoOff=false;
+    else if(_lpDefs){_lpDefs.forEach(function(d){if(d.layer===e.layer&&d.offFn)d.offFn(false);});}
+    updateVisibility();
   });
   function layerOn(l){if(!map.hasLayer(l))l.addTo(map);}
   function layerOff(l){if(map.hasLayer(l))map.removeLayer(l);}
-  var _oaPolyOff=false;
-  map.on("overlayremove",function(e){if(e.layer===oaPolyLayer)_oaPolyOff=true;});
-  map.on("overlayadd",function(e){if(e.layer===oaPolyLayer){_oaPolyOff=false;updateVisibility();}});
 
   var _uvPending=false;
   function updateVisibility(){
@@ -936,18 +938,25 @@ Promise.all([_railProm,_restProm]).then(function(results){
           }
         } else layerOn(pkHectoLayer);
       } else layerOff(pkHectoLayer);
-      // ── Accès (zoom ≥ 12) ──────────────────────────────────────────
-      if(!_accOff&&z>=12)layerOn(accLayer); else layerOff(accLayer);
-      // ── OA Polygones (zoom ≥ 8 – couche principale OA) ──────────────
-      if(!_oaPolyOff&&z>=8)layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
+      // ── Couches zoom-adaptatives (ordre croissant de zoom min) ─────
+      if(!_n2Off&&z>=8) layerOn(n2Layer);     else layerOff(n2Layer);
+      if(!_oldOff&&z>=9) layerOn(oldLayer);   else layerOff(oldLayer);
+      if(!_mcOff&&z>=10) layerOn(mcLayer);    else layerOff(mcLayer);
+      if(!_oaPolyOff&&z>=11) layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
+      if(!_oaOff&&z>=11) layerOn(oaCluster);  else layerOff(oaCluster);
+      if(!_ecoOff&&z>=11) layerOn(ecoLayer);  else layerOff(ecoLayer);
+      if(!_ohOff&&z>=12) layerOn(ohLayer);    else layerOff(ohLayer);
+      if(!_boisOff&&z>=12) layerOn(boisLayer); else layerOff(boisLayer);
+      if(!_accOff&&z>=12) layerOn(accLayer);  else layerOff(accLayer);
+      if(!_pamOff&&z>=13) layerOn(pamCluster); else layerOff(pamCluster);
       // ── Labels CSS permanents ────────────────────────────────────────
       mapEl.classList.toggle("lbl-pk50", !_pkOff&&z>=7&&z<10);
       mapEl.classList.toggle("lbl-pk10", !_pkOff&&z>=10&&z<13);
       mapEl.classList.toggle("lbl-pk1",  !_pkOff&&z>=13&&z<16);
       mapEl.classList.toggle("lbl-pkh",  !_pkHectoOff&&z>=16);
-      mapEl.classList.toggle("lbl-n2", z>=8);
-      mapEl.classList.toggle("lbl-oa", z>=10);
-      mapEl.classList.toggle("lbl-oh", z>=12);
+      mapEl.classList.toggle("lbl-n2",  !_n2Off&&z>=8);
+      mapEl.classList.toggle("lbl-oa",  !_oaPolyOff&&z>=11);
+      mapEl.classList.toggle("lbl-oh",  !_ohOff&&z>=12);
     });
   }
   // ── Viewport culling boisements (canvas, 2 Mo) ──────────────────────────
@@ -989,12 +998,12 @@ Promise.all([_railProm,_restProm]).then(function(results){
       addChunked(function(f){oaPolyLayer.addData(f);},feats,80);
     },220);
   }
-  // Rebuild viewport au pan uniquement si fortement zoomé
+  // Rebuild viewport au pan uniquement si couche visible (seuils alignés sur minZoom)
   map.on('moveend',function(){
     var z=map.getZoom();
-    if(_boisVCReady&&z>=13)_refreshBoisVC();
-    if(_ohVCReady&&z>=13)_refreshOHVC();
-    if(_oaPolyVCReady&&z>=14)_refreshOAPolyVC();
+    if(_boisVCReady&&!_boisOff&&z>=12)_refreshBoisVC();
+    if(_ohVCReady&&!_ohOff&&z>=12)_refreshOHVC();
+    if(_oaPolyVCReady&&!_oaPolyOff&&z>=14)_refreshOAPolyVC();
   });
 
   // ── Fluidité zoom : masquer couches lourdes pendant l'animation ─────────
@@ -1005,9 +1014,9 @@ Promise.all([_railProm,_restProm]).then(function(results){
   map.on('zoomend',function(){
     _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='';});
     updateVisibility();
-    if(_boisVCReady)_refreshBoisVC();
-    if(_ohVCReady)_refreshOHVC();
-    if(_oaPolyVCReady)_refreshOAPolyVC();
+    if(_boisVCReady&&!_boisOff)_refreshBoisVC();
+    if(_ohVCReady&&!_ohOff)_refreshOHVC();
+    if(_oaPolyVCReady&&!_oaPolyOff)_refreshOAPolyVC();
   });
   updateVisibility();
 
@@ -1017,19 +1026,29 @@ Promise.all([_railProm,_restProm]).then(function(results){
     if(!body)return;
     function n1(key){var n=(layerData[key]||[]).length;return n?" ("+n+")":"";}
     var defs=[
-      {label:"Tracé LGV",             lsKey:"rail",    layer:railLayer,    color:"#cc0000", type:"line"},
-      {label:"PK (zoom-adaptatif)",    lsKey:"pk",      layer:pkLayer,      color:"#333",    type:"dot"},
-      {label:"PK 100m (zoom≥16)",      lsKey:"pkhecto", layer:pkHectoLayer, color:"#666",    type:"dot"},
-      {label:"Accès (zoom≥12)"+n1("acces"), lsKey:"acces", layer:accLayer,  emoji:"🚧"},
-      {label:"OA – Emprises polygones",  lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4", type:"fill"},
-      {label:"OA – Ouvrages d'Art",    lsKey:"oa",      layer:oaCluster,   emoji:"🏗",     lpId:"lp-oa"},
-      {label:"OH – Hydrauliques",      lsKey:"oh",      layer:ohLayer,     color:"#ff8c00", type:"line", lpId:"lp-oh"},
-      {label:"PAM",                    lsKey:"pam",     layer:pamCluster,  emoji:"🌱",     lpId:"lp-pam"},
-      {label:"Zones OLD"+n1("old"),    lsKey:"old",     layer:oldLayer,    color:"#3366ff", type:"fill"},
-      {label:"Mesures comp."+n1("mc"), lsKey:"mc",      layer:mcLayer,     color:"#9c27b0", type:"fill"},
-      {label:"Natura 2000"+n1("n2"),   lsKey:"n2",      layer:n2Layer,     color:"#1b5e20", type:"fill"},
-      {label:"Écopâturage"+n1("eco"),  lsKey:"eco",     layer:ecoLayer,    color:"#81c784", type:"fill"},
-      {label:"Boisements",             lsKey:"bois",    layer:boisLayer,   color:"#388e3c", type:"fill", lpId:"lp-bois"},
+      {label:"Tracé LGV",                      lsKey:"rail",    layer:railLayer,   color:"#cc0000",type:"line"},
+      {label:"PK (zoom-adaptatif)",             lsKey:"pk",      layer:pkLayer,     color:"#333",   type:"dot"},
+      {label:"PK 100m (z≥16)",                 lsKey:"pkhecto", layer:pkHectoLayer,color:"#666",   type:"dot"},
+      {label:"N2000 (z≥8)"+n1("n2"),           lsKey:"n2",      layer:n2Layer,     color:"#1b5e20",type:"fill",
+        offFn:function(v){_n2Off=v;},  getOn:function(){return !_n2Off;}},
+      {label:"Zones OLD (z≥9)"+n1("old"),      lsKey:"old",     layer:oldLayer,    color:"#3366ff",type:"fill",
+        offFn:function(v){_oldOff=v;}, getOn:function(){return !_oldOff;}},
+      {label:"Mesures comp. (z≥10)"+n1("mc"),  lsKey:"mc",      layer:mcLayer,     color:"#9c27b0",type:"fill",
+        offFn:function(v){_mcOff=v;},  getOn:function(){return !_mcOff;}},
+      {label:"OA Emprises (z≥11)",             lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4",type:"fill",
+        offFn:function(v){_oaPolyOff=v;},getOn:function(){return !_oaPolyOff;}},
+      {label:"OA Ouvrages d'Art (z≥11)",       lsKey:"oa",      layer:oaCluster,   emoji:"🏗",lpId:"lp-oa",
+        offFn:function(v){_oaOff=v;},   getOn:function(){return !_oaOff;}},
+      {label:"Écopâturage (z≥11)"+n1("eco"),   lsKey:"eco",     layer:ecoLayer,    color:"#81c784",type:"fill",
+        offFn:function(v){_ecoOff=v;},  getOn:function(){return !_ecoOff;}},
+      {label:"OH Hydrauliques (z≥12)",         lsKey:"oh",      layer:ohLayer,     color:"#ff8c00",type:"line",lpId:"lp-oh",
+        offFn:function(v){_ohOff=v;},   getOn:function(){return !_ohOff;}},
+      {label:"Boisements (z≥12)",              lsKey:"bois",    layer:boisLayer,   color:"#388e3c",type:"fill",lpId:"lp-bois",
+        offFn:function(v){_boisOff=v;}, getOn:function(){return !_boisOff;}},
+      {label:"Accès (z≥12)"+n1("acces"),       lsKey:"acces",   layer:accLayer,    emoji:"🚧",
+        offFn:function(v){_accOff=v;},  getOn:function(){return !_accOff;}},
+      {label:"PAM (z≥13)",                     lsKey:"pam",     layer:pamCluster,  emoji:"🌱",lpId:"lp-pam",
+        offFn:function(v){_pamOff=v;},  getOn:function(){return !_pamOff;}},
     ];
     _lpDefs=defs;
     _restoreLayerStates();
@@ -1047,14 +1066,14 @@ Promise.all([_railProm,_restProm]).then(function(results){
       item.className="lp-item";
       var chk=document.createElement("input");
       chk.type="checkbox";
-      chk.checked=map.hasLayer(d.layer);
+      chk.checked=d.getOn?d.getOn():map.hasLayer(d.layer);
       chk.addEventListener("change",function(){
-        if(chk.checked)d.layer.addTo(map);
-        else map.removeLayer(d.layer);
-        if(d.layer===pkLayer)_pkOff=!chk.checked;
-        if(d.layer===pkHectoLayer)_pkHectoOff=!chk.checked;
-        if(d.layer===accLayer)_accOff=!chk.checked;
-        if(d.layer===oaPolyLayer)_oaPolyOff=!chk.checked;
+        if(d.offFn){d.offFn(!chk.checked);}
+        else{
+          if(chk.checked)d.layer.addTo(map); else map.removeLayer(d.layer);
+          if(d.layer===pkLayer)_pkOff=!chk.checked;
+          if(d.layer===pkHectoLayer)_pkHectoOff=!chk.checked;
+        }
         updateVisibility();
         _saveLayerStates();
       });
@@ -1073,22 +1092,23 @@ Promise.all([_railProm,_restProm]).then(function(results){
     kmlDiv.id="kml-layers-section";
     body.appendChild(kmlDiv);
     refreshKMLSection();
-    // ── Sync depuis le contrôle Leaflet ──
+    // ── Sync depuis le contrôle Leaflet natif ──
     map.on("overlayadd overlayremove",function(){
       body.querySelectorAll(".lp-item input").forEach(function(cb,i){
-        if(defs[i])cb.checked=map.hasLayer(defs[i].layer);
+        if(defs[i])cb.checked=defs[i].getOn?defs[i].getOn():map.hasLayer(defs[i].layer);
       });
       _saveLayerStates();
     });
     // ── Tout cocher / décocher ──
     window.setAllLayers=function(on){
       defs.forEach(function(d){
-        if(on&&!map.hasLayer(d.layer))d.layer.addTo(map);
-        else if(!on&&map.hasLayer(d.layer))map.removeLayer(d.layer);
-        if(d.layer===pkLayer)_pkOff=!on;
-        if(d.layer===pkHectoLayer)_pkHectoOff=!on;
-        if(d.layer===accLayer)_accOff=!on;
-        if(d.layer===oaPolyLayer)_oaPolyOff=!on;
+        if(d.offFn){d.offFn(!on);}
+        else{
+          if(on&&!map.hasLayer(d.layer))d.layer.addTo(map);
+          else if(!on&&map.hasLayer(d.layer))map.removeLayer(d.layer);
+          if(d.layer===pkLayer)_pkOff=!on;
+          if(d.layer===pkHectoLayer)_pkHectoOff=!on;
+        }
       });
       updateVisibility();
       _saveLayerStates();
