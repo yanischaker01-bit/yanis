@@ -36,8 +36,17 @@ self.addEventListener('message', e => {
 self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE)
-      .then(c => c.addAll(PRECACHE))
-      .then(() => self.skipWaiting())
+      .then(function(c) {
+        /* addAll() échoue si un fichier manque — précache individuellement */
+        return Promise.all(
+          PRECACHE.map(function(url) {
+            return c.add(url).catch(function() {
+              console.warn('SW: précache ignoré:', url);
+            });
+          })
+        );
+      })
+      .then(function() { return self.skipWaiting(); })
   );
 });
 

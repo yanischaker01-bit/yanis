@@ -3073,7 +3073,11 @@ sector_base_km = float(sector_base_km_raw) if not pd.isna(sector_base_km_raw) el
 snapshot_ts = pd.to_datetime(snapshot.get("timestamp_utc"), utc=True, errors="coerce")
 snapshot_age_h = _snapshot_age_hours(snapshot_ts)
 
-weather_df = _prepare_weather_df(weather_df, snapshot_ts)
+try:
+    weather_df = _prepare_weather_df(weather_df, snapshot_ts)
+except Exception as _prep_exc:
+    st.warning(f"Normalisation météo partielle : {_prep_exc}")
+    weather_df = weather_df.copy() if not weather_df.empty else pd.DataFrame()
 
 if not sectors_df.empty:
     for col in [

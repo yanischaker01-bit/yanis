@@ -523,13 +523,13 @@ function _saveLayerStates(){
   try{
     var s={};
     _lpDefs.forEach(function(d){s[d.lsKey||d.label]=map.hasLayer(d.layer);});
-    localStorage.setItem("lgv_layers_v2",JSON.stringify(s));
+    localStorage.setItem("lgv_layers_v10",JSON.stringify(s));
   }catch(e){}
 }
 function _restoreLayerStates(){
   if(!_lpDefs)return;
   try{
-    var s=JSON.parse(localStorage.getItem("lgv_layers_v2")||"{}");
+    var s=JSON.parse(localStorage.getItem("lgv_layers_v10")||"{}");
     _lpDefs.forEach(function(d){
       var key=d.lsKey||d.label;
       if(!(key in s))return;
@@ -905,8 +905,6 @@ Promise.all([_railProm,_restProm]).then(function(results){
       mapEl.classList.toggle("lbl-oh", z>=15);
     });
   }
-  // Fermer le panneau détail au début du zoom (évite les panneaux orphelins)
-  map.on("zoomstart",closeDetail);
   map.on("zoomend",updateVisibility);
   updateVisibility();
 
