@@ -369,6 +369,7 @@ var map=L.map("map",{zoomControl:false,preferCanvas:true,maxZoom:21}).setView([4
 // SVG renderer pour couches polygones interactives (clic fiable sur Firefox/mobile)
 var _svgRenderer=L.svg();
 var _boisCanvas=L.canvas({tolerance:5});
+var _polyCanvas=L.canvas({tolerance:5}); // OLD, MC, N2, Eco, OA poly
 // ── Bbox cache + viewport filter pour viewport culling ──
 function _featBbox(f){
   if(f._bbox)return f._bbox;
@@ -589,6 +590,13 @@ function loadJSONSafe(name){
     return emptyFC();
   });
 }
+// Loader Windows-1252 → pour n2.geojson dont la source était en ANSI/CP1252
+function loadJSONWin1252(name){
+  return fetch("data/"+name+".geojson")
+    .then(function(r){if(!r.ok)throw new Error(name+" : HTTP "+r.status);return r.arrayBuffer();})
+    .then(function(buf){return JSON.parse(new TextDecoder("windows-1252").decode(buf));})
+    .catch(function(err){console.warn("Couche "+name+" (win1252) indisponible:",err);return emptyFC();});
+}
 function showError(msg){
   var el=document.getElementById("loader");if(!el)return;
   el.style.cssText="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);"+
@@ -608,7 +616,9 @@ if(location.protocol==="file:"){
 var _railProm=loadJSONSafe("rail");
 // Couches Phase 1 + oa_poly en parallèle (pk_hecto différé au zoom≥16 — 1 Mo économisé)
 var _oaPolyProm=loadJSONSafe("oa_poly");
-var _restProm=Promise.all(["pk","acces","old","mc","n2","eco"].map(loadJSONSafe));
+var _restProm=Promise.all(["pk","acces","old","mc","n2","eco"].map(function(n){
+  return n==="n2"?loadJSONWin1252(n):loadJSONSafe(n);
+}));
 // Phase 2 pré-chargées dès le démarrage — données disponibles avant la fin de Phase 1
 var _oaProm=loadJSONSafe("oa");
 var _ohProm=loadJSONSafe("oh");
@@ -711,7 +721,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── OLD ────────────────────────────────────────────────────────────────
   var oldLayer=L.geoJSON(old,{
     pane:"pane-old",
-    renderer:_svgRenderer,
+    renderer:_polyCanvas,
     style:{color:"transparent",weight:0,fillColor:"#4f83ff",fillOpacity:.22},
     onEachFeature:function(f,l){
       var p=f.properties;
@@ -725,7 +735,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── MC ─────────────────────────────────────────────────────────────────
   var mcLayer=L.geoJSON(mc,{
     pane:"pane-mc",
-    renderer:_svgRenderer,
+    renderer:_polyCanvas,
     style:{color:"#7b1fa2",weight:2.2,fillColor:"#ab47bc",fillOpacity:.16},
     pointToLayer:function(f,ll){return L.circleMarker(ll,{radius:6,color:"#7b1fa2",weight:2,fillColor:"#ce93d8",fillOpacity:.75,pane:"pane-mc"})},
     onEachFeature:function(f,l){
@@ -751,7 +761,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   }
   var n2Layer=L.geoJSON(n2,{
     pane:"pane-n2",
-    renderer:_svgRenderer,
+    renderer:_polyCanvas,
     style:n2Style,
     onEachFeature:function(f,l){
       var p=f.properties;
@@ -767,7 +777,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // ── Écopâturage ────────────────────────────────────────────────────────
   var ecoLayer=L.geoJSON(eco,{
     pane:"pane-eco",
-    renderer:_svgRenderer,
+    renderer:_polyCanvas,
     style:function(f){
       var active=c(f.properties.Occupation).toUpperCase()==="ACTIVE";
       return{color:active?"#2e7d32":"#999",weight:2,
@@ -851,7 +861,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   // DOIT être avant updateVisibility() et initLayersPanel() pour éviter TypeError
   var oaPolyLayer=L.geoJSON(null,{
     pane:"pane-oa-poly",
-    renderer:_svgRenderer,
+    renderer:_polyCanvas,
     style:{color:"#00bcd4",weight:2,fillColor:"#00bcd4",fillOpacity:.18},
     onEachFeature:function(f,l){
       var p=f.properties;
@@ -861,7 +871,12 @@ Promise.all([_railProm,_restProm]).then(function(results){
     }
   }).addTo(map);
   _oaPolyProm.then(function(ap){
-    addChunked(function(f){oaPolyLayer.addData(f);},(ap.features||[]),80);
+    _oaPolyFeatsAll=(ap.features||[]);
+    _oaPolyFeatsAll.forEach(_featBbox);
+    var z=map.getZoom();
+    var initFeats=z>=14?_oaPolyFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));})
+                       :_oaPolyFeatsAll;
+    addChunked(function(f){oaPolyLayer.addData(f);},initFeats,80,function(){_oaPolyVCReady=true;});
   });
   if(layerCtrl)layerCtrl.addOverlay(oaPolyLayer,"<span style=\"color:#00bcd4\">▬</span> OA – Emprises");
 
@@ -948,8 +963,39 @@ Promise.all([_railProm,_restProm]).then(function(results){
       addChunked(function(f){boisLayer.addData(f);},feats,150);
     },220);
   }
-  // Rebuild boisements viewport au pan uniquement si fortement zoomé
-  map.on('moveend',function(){if(_boisVCReady&&map.getZoom()>=13)_refreshBoisVC();});
+  // ── Viewport culling OH (canvas, lignes) ─────────────────────────────────
+  var _ohFeatsAll=[],_ohVCReady=false,_ohVCTimer=null;
+  function _refreshOHVC(){
+    clearTimeout(_ohVCTimer);
+    _ohVCTimer=setTimeout(function(){
+      if(!_ohFeatsAll.length||!map.hasLayer(ohLayer))return;
+      var z=map.getZoom();
+      var feats=z>=13?_ohFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));})
+                     :_ohFeatsAll;
+      ohLayer.clearLayers();
+      addChunked(function(f){ohLayer.addData(f);},feats,100);
+    },220);
+  }
+  // ── Viewport culling OA polygones (484 features, canvas) ─────────────────
+  var _oaPolyFeatsAll=[],_oaPolyVCReady=false,_oaPolyVCTimer=null;
+  function _refreshOAPolyVC(){
+    clearTimeout(_oaPolyVCTimer);
+    _oaPolyVCTimer=setTimeout(function(){
+      if(!_oaPolyFeatsAll.length||!map.hasLayer(oaPolyLayer))return;
+      var z=map.getZoom();
+      var feats=z>=14?_oaPolyFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.4));})
+                     :_oaPolyFeatsAll;
+      oaPolyLayer.clearLayers();
+      addChunked(function(f){oaPolyLayer.addData(f);},feats,80);
+    },220);
+  }
+  // Rebuild viewport au pan uniquement si fortement zoomé
+  map.on('moveend',function(){
+    var z=map.getZoom();
+    if(_boisVCReady&&z>=13)_refreshBoisVC();
+    if(_ohVCReady&&z>=13)_refreshOHVC();
+    if(_oaPolyVCReady&&z>=14)_refreshOAPolyVC();
+  });
 
   // ── Fluidité zoom : masquer couches lourdes pendant l'animation ─────────
   var _zpanes=['pane-bois','pane-old','pane-eco','pane-mc','pane-n2','pane-oa-poly','pane-oh'];
@@ -960,6 +1006,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
     _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='';});
     updateVisibility();
     if(_boisVCReady)_refreshBoisVC();
+    if(_ohVCReady)_refreshOHVC();
+    if(_oaPolyVCReady)_refreshOAPolyVC();
   });
   updateVisibility();
 
@@ -1104,8 +1152,14 @@ Promise.all([_railProm,_restProm]).then(function(results){
 
   _ohProm.then(function(oh){
     var ohFeats=oh.features||[];
-    addChunked(function(f){ohLayer.addData(f);},ohFeats,100,function(){
+    _ohFeatsAll=ohFeats;
+    _ohFeatsAll.forEach(_featBbox);
+    var z=map.getZoom();
+    var initFeats=z>=13?_ohFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));})
+                       :_ohFeatsAll;
+    addChunked(function(f){ohLayer.addData(f);},initFeats,100,function(){
       var cnt=ohFeats.length;
+      _ohVCReady=true;
       var el=document.getElementById("cnt-oh");if(el)el.textContent=cnt;
       _updateLpCount("oh",cnt);
       layerData.oh=ohFeats.map(function(f){return{props:stripB64(f.properties),geom:f.geometry};});
