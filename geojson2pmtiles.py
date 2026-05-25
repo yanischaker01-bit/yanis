@@ -22,6 +22,16 @@ from pmtiles.writer import Writer
 
 DATA_DIR = Path(__file__).parent / "data"
 
+# Simplification tolerance in degrees per zoom level.
+# 0.001 deg ~ 70-100 m depending on latitude.
+# Applied to polygon geometry before MVT encoding to reduce tile size at low zooms.
+_SIMPLIFY = {
+    6: 0.0030, 7: 0.0020, 8: 0.0015, 9: 0.0010,
+    10: 0.0006, 11: 0.0004, 12: 0.0002, 13: 0.0001,
+    14: 0.00006, 15: 0.00003,
+    # zoom >= 16 : no simplification (full precision)
+}
+
 LAYERS = [
     # (geojson_file, layer_name, min_zoom, max_zoom, encoding)
     ("bois.geojson",    "bois",    8,  17, "utf-8"),
@@ -103,6 +113,7 @@ def convert_layer(geojson_file, layer_name, min_zoom, max_zoom, encoding):
 
                 candidate_idx = tree.query(tile_box, predicate="intersects")
 
+                tol = _SIMPLIFY.get(zoom, 0)
                 tile_feats = []
                 for idx in candidate_idx:
                     geom = geoms[idx]
@@ -117,6 +128,14 @@ def convert_layer(geojson_file, layer_name, min_zoom, max_zoom, encoding):
                         # for line layers keep LineString too
                         if clipped.geom_type not in ("LineString", "MultiLineString"):
                             continue
+                    # Simplify at low zooms to reduce tile size
+                    if tol > 0:
+                        try:
+                            simplified = clipped.simplify(tol, preserve_topology=True)
+                            if not simplified.is_empty:
+                                clipped = simplified
+                        except Exception:
+                            pass
                     tile_feats.append({
                         "geometry": mapping(clipped),
                         "properties": features[idx]["properties"],

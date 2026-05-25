@@ -180,7 +180,7 @@ button,a,[onclick]{touch-action:manipulation}
   cursor:pointer;color:#c62828;font-size:11px}
 .leaflet-control-layers-list label{font-size:12px}
 /* Detail side panel */
-#dp-backdrop{display:none;position:fixed;inset:0;z-index:899;background:transparent;cursor:pointer}
+#dp-backdrop{display:none;position:fixed;inset:0;z-index:899;background:transparent;pointer-events:none}
 #dp-backdrop.open{display:block}
 #detail-panel{position:absolute;top:0;right:0;bottom:0;width:340px;max-width:92vw;
   background:white;z-index:900;transform:translateX(100%);
@@ -433,6 +433,7 @@ map.on("locationfound",function(e){
   _locMarker.bindPopup("<b>Votre position</b><br>Précision : "+Math.round(e.accuracy)+" m").openPopup();
 });
 map.on("locationerror",function(e){alert("Localisation impossible : "+e.message);});
+map.on('click',closeDetail);
 var layerCtrl=null;
 L.control.zoom({position:"topright"}).addTo(map);
 L.control.scale({imperial:false,position:"bottomright"}).addTo(map);
@@ -567,8 +568,10 @@ var boisVG=L.vectorGrid.protobuf('pmtiles://data/bois.pmtiles/{z}/{x}/{y}',{
 });
 _setupVGHover(boisVG,function(p){return'🌳 '+c(p.TYPE_OBJET||'Boisement');});
 boisVG.on('click',function(e){
-  if(e.originalEvent)L.DomEvent.stopPropagation(e.originalEvent);
-  var p=(e.propagatedFrom||e.layer||{}).properties||{};
+  L.DomEvent.stopPropagation(e.originalEvent||e);
+  if(map.hasLayer(_vgTip))map.removeLayer(_vgTip);
+  var src=e.propagatedFrom||e.layer||e.sourceTarget||{};
+  var p=src.properties||{};
   openDetailGeneric('Bois','🌳 '+c(p.TYPE_OBJET||'Boisement'),p,'#388e3c');
 });
 
@@ -576,6 +579,7 @@ var n2VG=L.vectorGrid.protobuf('pmtiles://data/n2.pmtiles/{z}/{x}/{y}',{
   rendererFactory:L.canvas.tile,
   pane:'pane-n2',
   interactive:true,
+  updateWhenZooming:false,
   maxNativeZoom:14,
   vectorTileLayerStyles:{
     n2:function(p){
@@ -588,8 +592,10 @@ var n2VG=L.vectorGrid.protobuf('pmtiles://data/n2.pmtiles/{z}/{x}/{y}',{
 });
 _setupVGHover(n2VG,function(p){return c(p.sitename||p.cd_sig||'N2000');});
 n2VG.on('click',function(e){
-  if(e.originalEvent)L.DomEvent.stopPropagation(e.originalEvent);
-  var p=(e.propagatedFrom||e.layer||{}).properties||{};
+  L.DomEvent.stopPropagation(e.originalEvent||e);
+  if(map.hasLayer(_vgTip))map.removeLayer(_vgTip);
+  var src=e.propagatedFrom||e.layer||e.sourceTarget||{};
+  var p=src.properties||{};
   openDetailGeneric('N2000','Natura 2000 '+c(p.sitename||p.cd_sig),p,'#1b5e20');
 });
 
@@ -597,6 +603,7 @@ var oldVG=L.vectorGrid.protobuf('pmtiles://data/old.pmtiles/{z}/{x}/{y}',{
   rendererFactory:L.canvas.tile,
   pane:'pane-old',
   interactive:true,
+  updateWhenZooming:false,
   maxNativeZoom:15,
   vectorTileLayerStyles:{
     old:{fill:true,fillColor:'#4f83ff',fillOpacity:.22,color:'transparent',weight:0}
@@ -604,8 +611,10 @@ var oldVG=L.vectorGrid.protobuf('pmtiles://data/old.pmtiles/{z}/{x}/{y}',{
 });
 _setupVGHover(oldVG,function(p){return'Zone OLD '+c(p.CODE||'');});
 oldVG.on('click',function(e){
-  if(e.originalEvent)L.DomEvent.stopPropagation(e.originalEvent);
-  var p=(e.propagatedFrom||e.layer||{}).properties||{};
+  L.DomEvent.stopPropagation(e.originalEvent||e);
+  if(map.hasLayer(_vgTip))map.removeLayer(_vgTip);
+  var src=e.propagatedFrom||e.layer||e.sourceTarget||{};
+  var p=src.properties||{};
   openDetailGeneric('OLD','🔷 Zone OLD '+c(p.CODE||''),p,'#0d47a1');
 });
 
@@ -621,8 +630,10 @@ var mcVG=L.vectorGrid.protobuf('pmtiles://data/mc.pmtiles/{z}/{x}/{y}',{
 });
 _setupVGHover(mcVG,function(p){return c(p.projet||p.type||'MC');});
 mcVG.on('click',function(e){
-  if(e.originalEvent)L.DomEvent.stopPropagation(e.originalEvent);
-  var p=(e.propagatedFrom||e.layer||{}).properties||{};
+  L.DomEvent.stopPropagation(e.originalEvent||e);
+  if(map.hasLayer(_vgTip))map.removeLayer(_vgTip);
+  var src=e.propagatedFrom||e.layer||e.sourceTarget||{};
+  var p=src.properties||{};
   openDetailGeneric('MC','🌿 Mesure compensatoire',p,'#7b1fa2');
 });
 
@@ -630,6 +641,7 @@ var ecoVG=L.vectorGrid.protobuf('pmtiles://data/eco.pmtiles/{z}/{x}/{y}',{
   rendererFactory:L.canvas.tile,
   pane:'pane-eco',
   interactive:true,
+  updateWhenZooming:false,
   maxNativeZoom:14,
   vectorTileLayerStyles:{
     eco:function(p){
@@ -641,8 +653,10 @@ var ecoVG=L.vectorGrid.protobuf('pmtiles://data/eco.pmtiles/{z}/{x}/{y}',{
 });
 _setupVGHover(ecoVG,function(p){return'🐑 '+c(p.Appellation||p.Name||'Écopâturage');});
 ecoVG.on('click',function(e){
-  if(e.originalEvent)L.DomEvent.stopPropagation(e.originalEvent);
-  var p=(e.propagatedFrom||e.layer||{}).properties||{};
+  L.DomEvent.stopPropagation(e.originalEvent||e);
+  if(map.hasLayer(_vgTip))map.removeLayer(_vgTip);
+  var src=e.propagatedFrom||e.layer||e.sourceTarget||{};
+  var p=src.properties||{};
   openDetailGeneric('Eco','🐑 '+c(p.Appellation||p.Name||'Écopâturage'),p,'#2e7d32');
 });
 
@@ -1030,8 +1044,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
     if(_oaPolyVCReady&&!_oaPolyOff&&z>=13)_refreshOAPolyVC();
   });
 
-  // Fluidité zoom : masquer panes lourds pendant l'animation (oa-poly retiré → GeoJSON)
-  var _zpanes=['pane-bois','pane-old','pane-eco','pane-mc','pane-n2','pane-oh'];
+  // Fluidité zoom : masquer uniquement les couches VectorGrid lourdes (bois, mc) pendant l'animation
+  var _zpanes=['pane-bois','pane-mc'];
   map.on('zoomstart',function(){
     _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='hidden';});
   });
