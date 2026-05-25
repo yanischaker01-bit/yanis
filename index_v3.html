@@ -112,9 +112,10 @@ button,a,[onclick]{touch-action:manipulation}
   font-size:12.5px;display:none;pointer-events:none;white-space:nowrap;transition:opacity .3s}
 /* Lightbox */
 #lightbox{display:none;position:fixed;top:0;left:0;width:100%;height:100%;
-  background:rgba(0,0,0,.85);z-index:99999;align-items:center;justify-content:center;cursor:zoom-out}
+  background:rgba(0,0,0,.92);z-index:99999;align-items:center;justify-content:center;cursor:zoom-out;flex-direction:column;gap:10px}
 #lightbox.open{display:flex}
-#lightbox img{max-width:90vw;max-height:90vh;border-radius:6px}
+#lightbox img{max-width:98vw;max-height:92vh;border-radius:4px;object-fit:contain;image-rendering:auto}
+#lb-hint{color:rgba(255,255,255,.55);font-size:11px;pointer-events:none}
 /* Detail panel */
 #dp-backdrop{display:none;position:fixed;inset:0;z-index:899;background:transparent;pointer-events:none}
 #dp-backdrop.open{display:block}
@@ -135,8 +136,10 @@ button,a,[onclick]{touch-action:manipulation}
 .dp-k{color:#aaa;font-size:10.5px;min-width:90px;width:90px;flex-shrink:0;padding-right:6px}
 .dp-v{color:#1a1a2e;font-size:11.5px;flex:1;word-break:break-word}
 .dp-photo-w{padding:8px 14px;border-bottom:1px solid #f0f0f0}
-.dp-photo-w img{width:100%;border-radius:5px;cursor:zoom-in;box-shadow:0 2px 8px rgba(0,0,0,.18);transition:transform .2s}
-.dp-photo-w img:hover{transform:scale(1.02)}
+.dp-photo-w img{width:100%;border-radius:5px;cursor:zoom-in;box-shadow:0 2px 8px rgba(0,0,0,.18);
+  image-rendering:auto;-webkit-image-rendering:-webkit-optimize-contrast;transition:transform .2s}
+.dp-photo-w img:hover{transform:scale(1.01)}
+.dp-photo-w .ph-hint{font-size:10px;color:#aaa;text-align:center;margin-top:3px}
 .dp-actions{padding:7px 14px;border-bottom:1px solid #f0f0f0;display:flex;flex-wrap:wrap;gap:6px}
 .dp-sp{display:inline-flex;align-items:center;gap:5px;background:#e3f2fd;color:#1565c0;
   border-radius:5px;padding:5px 10px;font-size:11.5px;font-weight:600;text-decoration:none;border:none;cursor:pointer}
@@ -250,7 +253,7 @@ button,a,[onclick]{touch-action:manipulation}
     <button onclick="cancelKML()" style="margin-top:10px;width:100%;background:#eee;border:none;border-radius:5px;padding:7px;cursor:pointer;font-size:12px">Annuler</button>
   </div>
 </div>
-<div id="lightbox" onclick="this.classList.remove('open')"><img id="lb-img" src="" alt=""/></div>
+<div id="lightbox" onclick="this.classList.remove('open')"><img id="lb-img" src="" alt=""/><span id="lb-hint">Appuyer pour fermer</span></div>
 
 <script src="https://unpkg.com/maplibre-gl@4/dist/maplibre-gl.js"></script>
 <script src="https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js"></script>
@@ -302,8 +305,9 @@ var map = new maplibregl.Map({
   maxZoom: 21,
   attributionControl: {compact:true}
 });
-map.addControl(new maplibregl.NavigationControl({showCompass:false}), 'top-right');
-map.addControl(new maplibregl.ScaleControl({unit:'metric'}), 'bottom-right');
+// Navigation (+/-) en bas à gauche pour ne pas gêner la FAB ni la recherche
+map.addControl(new maplibregl.NavigationControl({showCompass:false}), 'bottom-left');
+map.addControl(new maplibregl.ScaleControl({unit:'metric'}), 'bottom-left');
 
 var HOME_CENTER=[-0.2,46.3], HOME_ZOOM=8;
 function resetView(){map.flyTo({center:HOME_CENTER,zoom:HOME_ZOOM});}
@@ -317,7 +321,7 @@ var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
 
 // ── Visibilité couches (état utilisateur) ──
-var _vis={rail:true,pk:true,pkhecto:false,pkmetric:false,oa:true,oh:true,pam:true,acces:true,
+var _vis={rail:true,pk:true,pkhecto:true,pkmetric:true,oa:true,oh:true,pam:true,acces:true,
            oapoly:true,bois:true,n2:true,old:true,mc:true,eco:true};
 
 // ── IDs couches par clé ──
@@ -528,40 +532,45 @@ function _initVectorLayers(){
   map.on('mouseleave','oh-line',function(){map.getCanvas().style.cursor='';});
   map.on('click','oh-line',function(e){if(e.features.length)openDetailOH(e.features[0].properties);});
 
-  // ── PK (4 niveaux) ──
-  function pkCircle(id,filter,minz,maxz,radius,color){
-    map.addLayer({id:id,type:'circle',source:'pk',filter:filter,minzoom:minz,maxzoom:maxz||22,
-      paint:{'circle-radius':radius,'circle-color':'white','circle-stroke-width':2.5,'circle-stroke-color':color}});
-  }
-  function pkLabel(id,filter,cls,minz,maxz,size,offset){
-    map.addLayer({id:id,type:'symbol',source:'pk',filter:filter,minzoom:minz,maxzoom:maxz||22,
-      layout:{'text-field':['get','_pk_label'],'text-size':size||9.5,'text-font':['Open Sans Regular'],
-        'text-offset':[0,offset||-1.3],'text-anchor':'bottom'},
-      paint:{'text-color':'#222','text-halo-color':'rgba(255,255,255,.92)','text-halo-width':1.2}});
-  }
-  pkCircle('pk50-c',['all',['has','_pk_label'],['==',['%',['to-number',['replace',['replace',['get','_pk_label'],'PK ',''],['+','000']],0],50000],0]],7,10,8,'#cc0000');
-  pkLabel('pk50-lbl',['all',['has','_pk_label'],['==',['%',['to-number',['replace',['replace',['get','_pk_label'],'PK ',''],['+','000']],0],50000],0]],null,7,10,11);
-  pkCircle('pk10-c',['has','_pk_label'],10,13,6,'#555');
-  pkLabel('pk10-lbl',['has','_pk_label'],null,10,13,10);
-  pkCircle('pk1-c',['has','_pk_label'],13,17,4,'#333');
-  pkLabel('pk1-lbl',['has','_pk_label'],null,13,17,9.5);
+  // ── PK (zoom-adaptatif) ──
+  // Extrait le km depuis "PK 33+000" → 33, utilisé pour filtrer par densité
+  var _pkKm=['to-number',['slice',['get','_pk_label'],3,['index-of','+',['get','_pk_label']]],0];
+  var _fPk50=['all',['has','_pk_label'],['==',['%',_pkKm,50],0]];  // tous les 50 km
+  var _fPk10=['all',['has','_pk_label'],['==',['%',_pkKm,10],0]];  // tous les 10 km
+  var _fPkAll=['has','_pk_label'];
 
-  // ── PK métriques (PMTiles, zoom max) ──
+  function _addPkCircle(id,filter,minz,maxz,r,color){
+    map.addLayer({id:id,type:'circle',source:'pk',filter:filter,minzoom:minz,maxzoom:maxz||22,
+      paint:{'circle-radius':r,'circle-color':'white','circle-stroke-width':2.5,'circle-stroke-color':color,
+        'circle-stroke-opacity':0.9}});
+  }
+  function _addPkLabel(id,filter,minz,maxz,size,offset){
+    map.addLayer({id:id,type:'symbol',source:'pk',filter:filter,minzoom:minz,maxzoom:maxz||22,
+      layout:{'text-field':['get','_pk_label'],'text-size':size,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+        'text-offset':[0,offset],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+      paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
+  }
+  _addPkCircle('pk50-c',_fPk50,  7,10, 8,'#cc0000');  _addPkLabel('pk50-lbl',_fPk50,  7,10, 12,-1.6);
+  _addPkCircle('pk10-c',_fPk10, 10,13, 6,'#555');     _addPkLabel('pk10-lbl',_fPk10, 10,13, 10,-1.4);
+  _addPkCircle('pk1-c', _fPkAll,13,17, 5,'#333');     _addPkLabel('pk1-lbl', _fPkAll,13,17, 9.5,-1.3);
+
+  // ── PK hectométriques (100 m) ──
+  map.addLayer({id:'pkh-c',type:'circle',source:'pk_hecto',minzoom:16,maxzoom:18,
+    paint:{'circle-radius':2.5,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#666'}});
+  map.addLayer({id:'pkh-lbl',type:'symbol',source:'pk_hecto',minzoom:16,maxzoom:18,
+    layout:{'text-field':['get','_pk_label'],'text-size':8.5,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
+    paint:{'text-color':'#444','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.3}});
+
+  // ── PK métriques (1 m via PMTiles, zoom max) ──
   map.addSource('pk_metric',{type:'vector',url:'pmtiles://data/pk_metric.pmtiles'});
   map.addLayer({id:'pkm-c',type:'circle',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
-    paint:{'circle-radius':2,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#9e9e9e'}});
+    paint:{'circle-radius':1.8,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#777'}});
   map.addLayer({id:'pkm-lbl',type:'symbol',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
-    layout:{'text-field':['coalesce',['get','_pk_label'],['get','PK'],['get','pk'],''],
-      'text-size':8,'text-font':['Open Sans Regular'],'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
-    paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1}});
-
-  // ── PK hectométriques ──
-  map.addLayer({id:'pkh-c',type:'circle',source:'pk_hecto',minzoom:17,
-    paint:{'circle-radius':2.5,'circle-color':'#eee','circle-stroke-width':1,'circle-stroke-color':'#666'}});
-  map.addLayer({id:'pkh-lbl',type:'symbol',source:'pk_hecto',minzoom:17,
-    layout:{'text-field':['get','_pk_label'],'text-size':8,'text-font':['Open Sans Regular'],
-      'text-offset':[0,-1],'text-anchor':'bottom'},
-    paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1}});
+    layout:{'text-field':['coalesce',['get','_pk_label'],['get','pk'],''],
+      'text-size':7.5,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
+    paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1}});
 
   // ── OA clusters + points ──
   map.addLayer({id:'oa-cluster-fill',type:'circle',source:'oa',filter:['has','point_count'],minzoom:11,
@@ -684,8 +693,9 @@ function _loadAllData(){
     buildSearchIndex();refreshTableIfOpen();
   });
 
-  // PK hecto (lazy - stocké pour index recherche)
+  // PK hectométriques
   loadJSON('pk_hecto').then(function(d){
+    map.getSource('pk_hecto').setData(d);
     _pkHData=d;
     addPKHectoToIndex(d);
   });
@@ -755,8 +765,8 @@ function _initLayersPanel(){
   var defs=[
     {key:'rail',  label:'Tracé LGV',         color:'#cc0000',type:'line'},
     {key:'pk',    label:'PK (zoom-adaptatif)',color:'#333',   type:'dot'},
-    {key:'pkhecto', label:'PK 100m',            color:'#666',   type:'dot', minZoom:17},
-    {key:'pkmetric',label:'PK métriques (1m)',  color:'#9e9e9e',type:'dot', minZoom:18},
+    {key:'pkhecto', label:'PK 100m (z≥16)',      color:'#666',   type:'dot', minZoom:16},
+    {key:'pkmetric',label:'PK 1m (z≥18)',        color:'#9e9e9e',type:'dot', minZoom:18},
     {key:'n2',    label:'N2000',              color:'#1b5e20',type:'fill',minZoom:6},
     {key:'old',   label:'Zones OLD',          color:'#3366ff',type:'fill',minZoom:7},
     {key:'mc',    label:'Mesures comp.',      color:'#9c27b0',type:'fill',minZoom:8},
@@ -1099,7 +1109,7 @@ function openDetailOAPoly(p){
     dpSec('Caractéristiques',[['Type',p.TYPE||p.LIBELLE_FA],['Infrastructure portée',p.INFRA_PORTEE],
       ['Infrastructure franchie',p.INFRA_FRANCHIE],['Hauteur libre',p.HAUTEUR_LIBRE?(c(p.HAUTEUR_LIBRE)+' m'):''],
       ['Longueur biaisée',p.LONGUEUR_BIAISE?(c(p.LONGUEUR_BIAISE)+' m'):'']  ])+
-    dpSp(p);
+    dpSp(p)+dpPJWrap(code||featureKey('OA',p));
   openDetail('🏗 '+title,body);
 }
 function openDetailOA(p){
@@ -1107,7 +1117,7 @@ function openDetailOA(p){
   var body=dpHero('OA',code,lib,'#00bcd4')+dpPkBar(c(p._pk_fmt))+dpPhoto(p)+
     dpSec('Localisation',[['PK',p._pk_fmt],['Voie',p.VOIE],['Commune',p.COMMUNE],['Département',p.DEPARTEMEN]])+
     dpSec('Caractéristiques',[['Famille',p.LIBELLE_FA],['Type',p.LIBELLE_TY||p.TYPE_OBJ],['Dimensions',p.DIMENSIONS]])+
-    dpSp(p);
+    dpSp(p)+dpPJWrap(code||featureKey('OA',p));
   openDetail('🏗 '+(code?code+' – ':'')+lib,body);
 }
 function openDetailOH(p){
@@ -1116,7 +1126,7 @@ function openDetailOH(p){
     dpSec('Localisation',[['PK',p._pk_fmt],['Voie',p.voie],['Cours d\'eau',p.ecoul_nom]])+
     dpSec('Caractéristiques',[['Type',p.type_objet],['Structure',p.structure],
       ['Longueur',p.longueur?(c(p.longueur)+' m'):''],['Radier',p.radier],['Diamètre',p.diametre]])+
-    dpSp(p);
+    dpSp(p)+dpPJWrap(code||featureKey('OH',p));
   openDetail('💧 '+(code?code+' – ':'')+lib,body);
 }
 // PAM : JAMAIS de dpPJWrap (contrainte permanente)
