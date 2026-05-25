@@ -1,10 +1,12 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v14';
+const CACHE = 'lgv-sea-v2';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 const PRECACHE = [
   './',
   './index.html',
+  './index_v2.html',
+  './sw.js',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -25,7 +27,11 @@ const PRECACHE = [
   'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js',
   'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css',
   'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css',
-  'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js'
+  'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js',
+  'https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js',
+  'https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.min.js',
+  'https://cdn.jsdelivr.net/npm/@tmcw/togeojson@5.8.0/dist/togeojson.umd.js',
+  'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js'
 ];
 
 /* Réception du message SKIP_WAITING depuis la page → activation immédiate */
@@ -66,8 +72,8 @@ self.addEventListener('fetch', e => {
   /* reset.html → jamais mis en cache, toujours réseau */
   if (url.includes('reset.html')) return;
 
-  /* Tuiles OSM → réseau d'abord, cache en fallback */
-  if (/openstreetmap\.org|tile\./.test(url)) {
+  /* Tuiles OSM/Esri/IGN → réseau d'abord, cache en fallback */
+  if (/openstreetmap\.org|arcgisonline\.com|geoportail/.test(url)) {
     e.respondWith(
       fetch(e.request)
         .then(r => {
@@ -80,7 +86,7 @@ self.addEventListener('fetch', e => {
     return;
   }
 
-  /* Navigation (index.html) → réseau d'abord pour toujours avoir la version fraîche */
+  /* Navigation (index*.html) → réseau d'abord pour toujours avoir la version fraîche */
   if (e.request.mode === 'navigate') {
     e.respondWith(
       fetch(e.request, {cache: 'no-cache'})
