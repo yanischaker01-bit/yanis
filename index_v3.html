@@ -274,7 +274,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.4';
+var APP_VER = 'v3.5';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -823,7 +823,6 @@ function _initLayersPanel(){
   });
   html+='<div id="kml-layers-section"></div>';
   body.innerHTML=html;
-  _restoreLayerStates(defs);
   _updateZoomBadges();
   map.on('zoom',_updateZoomBadges);
 }
@@ -836,15 +835,10 @@ function _updateZoomBadges(){
 }
 window.toggleLayer=function(key,on){
   setVis(key,on);
-  try{var s={};
-    document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){
-      var k=cb.id.replace('lp-chk-','');if(k)s[k]=cb.checked;});
-    localStorage.setItem('lgv_layers_v5',JSON.stringify(s));}catch(e){}
 };
 window.setAllLayers=function(on){
   Object.keys(LAYER_IDS).forEach(function(k){setVis(k,on);});
   document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){cb.checked=on;});
-  try{var s={};document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){var k=cb.id.replace('lp-chk-','');if(k)s[k]=cb.checked;});localStorage.setItem('lgv_layers_v5',JSON.stringify(s));}catch(e){}
 };
 window.switchBM=function(name){
   ['sat','osm','ign'].forEach(function(id){
@@ -852,16 +846,9 @@ window.switchBM=function(name){
     var btn=document.getElementById('bm-'+id);if(btn)btn.classList.toggle('active',id===name);
   });
 };
-function _restoreLayerStates(defs){
-  try{
-    var s=JSON.parse(localStorage.getItem('lgv_layers_v5')||'{}');
-    (defs||[]).forEach(function(d){
-      if(!(d.key in s))return;
-      var on=s[d.key];
-      setVis(d.key,on);
-      var cb=document.getElementById('lp-chk-'+d.key);if(cb)cb.checked=on;
-    });
-  }catch(e){}
+function _restoreLayerStates(){
+  /* Persistance supprimée : toutes les couches démarrent visibles par défaut */
+  try{localStorage.removeItem('lgv_layers_v5');localStorage.removeItem('lgv_layers_v4');localStorage.removeItem('lgv_layers_v3');}catch(e){}
 }
 function _updateLpCount(key,n){
   var el=document.getElementById('lp-'+key);if(!el)return;
