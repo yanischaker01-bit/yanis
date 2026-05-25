@@ -26,7 +26,12 @@ def main():
     print("Reprojection EPSG:2154 -> WGS84 ...")
     tf = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
 
+    # Metropolitan France bounding box (LGV SEA: Tours–Bordeaux)
+    LNG_MIN, LNG_MAX = -2.0, 2.5
+    LAT_MIN, LAT_MAX = 43.5, 48.0
+
     features, geoms = [], []
+    skipped = 0
     with fiona.open(str(SHP)) as src:
         total = len(src)
         for i, feat in enumerate(src):
@@ -34,6 +39,9 @@ def main():
                 print(f"  {i}/{total} …")
             coords = feat["geometry"]["coordinates"]
             lng, lat = tf.transform(coords[0], coords[1])
+            if not (LNG_MIN <= lng <= LNG_MAX and LAT_MIN <= lat <= LAT_MAX):
+                skipped += 1
+                continue
             pk_m = int(round(feat["properties"]["pk"] or 0))
             voie = str(feat["properties"]["voie"] or "")
             label = f"{pk_m}"
@@ -42,7 +50,7 @@ def main():
                               "properties": {"pk": pk_m, "voie": voie, "_pk_label": label}})
             geoms.append(geom)
 
-    print(f"  {len(features)} points chargés.")
+    print(f"  {len(features)} points charges ({skipped} ignores hors zone).")
 
     # Bounding box
     from shapely.ops import unary_union
