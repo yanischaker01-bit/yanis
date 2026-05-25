@@ -77,7 +77,7 @@ def main():
 
                 try:
                     mvt = mapbox_vector_tile.encode(
-                        {LAYER: {"features": tile_feats}},
+                        {"name": LAYER, "features": tile_feats},
                         default_options={
                             "extents": 4096,
                             "quantize_bounds": (tb.west, tb.south, tb.east, tb.north),

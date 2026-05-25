@@ -1126,7 +1126,7 @@ function openDetailOH(p){
     dpSec('Localisation',[['PK',p._pk_fmt],['Voie',p.voie],['Cours d\'eau',p.ecoul_nom]])+
     dpSec('Caractéristiques',[['Type',p.type_objet],['Structure',p.structure],
       ['Longueur',p.longueur?(c(p.longueur)+' m'):''],['Radier',p.radier],['Diamètre',p.diametre]])+
-    dpSp(p)+dpPJWrap(code||featureKey('OH',p));
+    dpSp(p);
   openDetail('💧 '+(code?code+' – ':'')+lib,body);
 }
 // PAM : JAMAIS de dpPJWrap (contrainte permanente)
