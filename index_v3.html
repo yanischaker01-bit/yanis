@@ -261,6 +261,16 @@ button,a,[onclick]{touch-action:manipulation}
 <script src="https://cdn.jsdelivr.net/npm/@tmcw/togeojson@5.8.0/dist/togeojson.umd.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
+/* ── Cache-bust automatique sur changement de version ── */
+(function(){
+  var V='v3.6';
+  try{
+    if(location.search.indexOf('reset=1')!==-1)return;
+    var s=localStorage.getItem('lgv_app_ver');
+    localStorage.setItem('lgv_app_ver',V);
+    if(s&&s!==V){location.replace(location.pathname+'?reset=1');}
+  }catch(e){}
+})();
 /* ── Force-reset via ?reset=1 : vide caches + désinscrit SW + recharge ── */
 if(location.search.indexOf('reset=1')!==-1){
   (async function(){
@@ -274,7 +284,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.5';
+var APP_VER = 'v3.6';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -327,6 +337,7 @@ window.toggleLayersPanel=function(){document.getElementById('layers-panel').clas
 
 // ── Données chargées ──
 var layerData={oa:[],oh:[],acces:[],pam:[],pk:[]};
+var _oaByCode={};
 var _loading={oa:true,oh:true,pam:true};
 var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
@@ -422,6 +433,8 @@ if(location.protocol==='file:'){
     _initVectorLayers();
     _loadAllData();
     _initLayersPanel();
+    /* Force toutes les couches visibles — protection contre tout état résiduel */
+    Object.keys(LAYER_IDS).forEach(function(k){setVis(k,true);});
     _initSearch();
     _restoreMapPos();
   });
@@ -597,7 +610,11 @@ function _initVectorLayers(){
     });
   });
   map.on('click','oa-pt',function(e){
-    if(e.features.length)openDetailOA(e.features[0].properties);
+    if(!e.features.length)return;
+    var raw=e.features[0].properties;
+    var code=String(raw.CODE_OBJET||'');
+    var p=(code&&_oaByCode[code])?_oaByCode[code]:raw;
+    openDetailOA(p);
   });
   map.on('mouseenter','oa-cluster-fill',function(){map.getCanvas().style.cursor='pointer';});
   map.on('mouseleave','oa-cluster-fill',function(){map.getCanvas().style.cursor='';});
@@ -736,7 +753,11 @@ function _loadAllData(){
   loadJSON('oa').then(function(d){
     map.getSource('oa').setData(d);
     var cnt=(d.features||[]).length;
-    layerData.oa=(d.features||[]).map(function(f){return{props:_stripB64(f.properties),geom:f.geometry};});
+    layerData.oa=(d.features||[]).map(function(f){
+      var props=_stripB64(f.properties);
+      if(props.CODE_OBJET)_oaByCode[String(props.CODE_OBJET)]=props;
+      return{props:props,geom:f.geometry};
+    });
     _loading.oa=false;
     _updateLpCount('oa',cnt);
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
@@ -916,7 +937,10 @@ function findNearest(){
     var lat=pos.coords.latitude,lng=pos.coords.longitude,acc=pos.coords.accuracy;
     map.flyTo({center:[lng,lat],zoom:Math.max(map.getZoom(),14)});
 
-    var npk=_nearestOf(lat,lng,layerData.pk);
+    /* Précision 100m avec pk_hecto si chargé, sinon 1km */
+    var _pkPool=(_pkHData&&_pkHData.features&&_pkHData.features.length)?
+      _pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}):layerData.pk;
+    var npk=_nearestOf(lat,lng,_pkPool);
     var nacc=_nearestOf(lat,lng,layerData.acces);
     var npam=_nearestOf(lat,lng,layerData.pam);
 
@@ -933,7 +957,7 @@ function findNearest(){
       var p=npk.f.props,co=npk.f.geom.coordinates;
       html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
       html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
-      html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+c(p._pk_label||'')+'</div>';
+      html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+c(p._pk_label||p.Name||'')+'</div>';
       html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+'</div>';
       html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
       html+=zoomBtn(co,17,'→ Zoom sur ce PK');
