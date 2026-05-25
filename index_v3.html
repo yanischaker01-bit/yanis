@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.1';
+var APP_VER = 'v3.2';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -332,8 +332,8 @@ var LAYER_IDS = {
   pkmetric:['pkm-c','pkm-lbl'],
   oa:      ['oa-cluster-fill','oa-cluster-lbl','oa-pt'],
   oh:      ['oh-line','oh-lbl'],
-  pam:     ['pam-cluster-fill','pam-cluster-lbl','pam-pt'],
-  acces:   ['acc-pt'],
+  pam:     ['pam-cluster-fill','pam-cluster-lbl','pam-pt','pam-lbl'],
+  acces:   ['acc-pt','acc-lbl'],
   oapoly:  ['oapoly-fill','oapoly-outline','oapoly-lbl'],
   bois:    ['bois-fill','bois-outline'],
   n2:      ['n2-fill','n2-outline'],
@@ -605,6 +605,12 @@ function _initVectorLayers(){
     paint:{'text-color':'white'}});
   map.addLayer({id:'pam-pt',type:'symbol',source:'pam',filter:['!',['has','point_count']],minzoom:13,
     layout:{'text-field':'🌱','text-size':20,'text-allow-overlap':true,'text-ignore-placement':true}});
+  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',filter:['!',['has','point_count']],minzoom:15,
+    layout:{'text-field':['get','libelle'],'text-size':10,
+      'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-anchor':'top','text-offset':[0,1.2],
+      'text-allow-overlap':false,'text-ignore-placement':false},
+    paint:{'text-color':'#4a148c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
   map.on('click','pam-cluster-fill',function(e){
     var f=e.features[0];
     map.getSource('pam').getClusterExpansionZoom(f.properties.cluster_id).then(function(z){
@@ -620,9 +626,15 @@ function _initVectorLayers(){
 
   // ── Accès ──
   map.addLayer({id:'acc-pt',type:'symbol',source:'acces',minzoom:12,
-    layout:{'text-field':'🚧','text-size':18,'text-allow-overlap':false,'text-ignore-placement':false,
+    layout:{'text-field':'🚧','text-size':18,'text-allow-overlap':true,'text-ignore-placement':true,
       'text-offset':[0,0]},
     paint:{}});
+  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:14,
+    layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
+      'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-anchor':'top','text-offset':[0,1.2],
+      'text-allow-overlap':false,'text-ignore-placement':false},
+    paint:{'text-color':'#e65100','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
   map.on('click','acc-pt',function(e){
     if(e.features.length)openDetailGeneric('Accès','🚧 '+c(e.features[0].properties.NOM_ACCES||e.features[0].properties.Name||'Accès'),e.features[0].properties,'#ff6600');
   });
@@ -807,12 +819,12 @@ window.toggleLayer=function(key,on){
   try{var s={};
     document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){
       var k=cb.id.replace('lp-chk-','');if(k)s[k]=cb.checked;});
-    localStorage.setItem('lgv_layers_v4',JSON.stringify(s));}catch(e){}
+    localStorage.setItem('lgv_layers_v5',JSON.stringify(s));}catch(e){}
 };
 window.setAllLayers=function(on){
   Object.keys(LAYER_IDS).forEach(function(k){setVis(k,on);});
   document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){cb.checked=on;});
-  try{var s={};document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){var k=cb.id.replace('lp-chk-','');if(k)s[k]=cb.checked;});localStorage.setItem('lgv_layers_v4',JSON.stringify(s));}catch(e){}
+  try{var s={};document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){var k=cb.id.replace('lp-chk-','');if(k)s[k]=cb.checked;});localStorage.setItem('lgv_layers_v5',JSON.stringify(s));}catch(e){}
 };
 window.switchBM=function(name){
   ['sat','osm','ign'].forEach(function(id){
@@ -822,7 +834,7 @@ window.switchBM=function(name){
 };
 function _restoreLayerStates(defs){
   try{
-    var s=JSON.parse(localStorage.getItem('lgv_layers_v4')||'{}');
+    var s=JSON.parse(localStorage.getItem('lgv_layers_v5')||'{}');
     (defs||[]).forEach(function(d){
       if(!(d.key in s))return;
       var on=s[d.key];
