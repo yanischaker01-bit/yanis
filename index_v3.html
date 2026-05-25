@@ -229,6 +229,7 @@ button,a,[onclick]{touch-action:manipulation}
   <button id="install-btn" class="fab fab-white" style="display:none" title="Installer l'application" onclick="installApp()">📲</button>
   <button id="offline-btn" class="fab fab-white" title="Mettre en cache hors-ligne" onclick="warmOfflineCache()">📶</button>
   <button class="fab fab-white" title="Me localiser" onclick="locateMe()">📍</button>
+  <button class="fab fab-white" title="PK / Accès / PAM le plus proche" onclick="findNearest()" style="background:#cc0000;color:white;font-size:14px;font-weight:700">PK?</button>
   <button class="fab fab-white" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
   <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
   <button class="fab fab-white" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
@@ -273,7 +274,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.3';
+var APP_VER = 'v3.4';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -325,7 +326,7 @@ window.resetView=resetView;
 window.toggleLayersPanel=function(){document.getElementById('layers-panel').classList.toggle('open');};
 
 // ── Données chargées ──
-var layerData={oa:[],oh:[],acces:[],pam:[]};
+var layerData={oa:[],oh:[],acces:[],pam:[],pk:[]};
 var _loading={oa:true,oh:true,pam:true};
 var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
@@ -703,6 +704,7 @@ function _loadAllData(){
   // PK – pré-filtrage JS → 3 sources (pk_s50 / pk_s10 / pk_s1)
   loadJSON('pk').then(function(d){
     var all=d.features||[];
+    layerData.pk=all.map(function(f){return{props:f.properties,geom:f.geometry};});
     function _extractKm(f){
       var lbl=(f.properties&&f.properties._pk_label)||'';
       var p=lbl.indexOf('+');
@@ -901,6 +903,83 @@ function locateMe(){
   },function(e){alert('Localisation impossible : '+e.message);},{enableHighAccuracy:true,timeout:10000});
 }
 window.locateMe=locateMe;
+
+// ══════════════════════════════════════════════════════════
+// DETECTION PK / ACCES / PAM LE PLUS PROCHE
+// ══════════════════════════════════════════════════════════
+function _haversine(lat1,lng1,lat2,lng2){
+  var R=6371000,r=Math.PI/180;
+  var dLat=(lat2-lat1)*r,dLng=(lng2-lng1)*r;
+  var a=Math.sin(dLat/2)*Math.sin(dLat/2)+Math.cos(lat1*r)*Math.cos(lat2*r)*Math.sin(dLng/2)*Math.sin(dLng/2);
+  return R*2*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+function _nearestOf(lat,lng,features){
+  var best=null,bestD=Infinity;
+  features.forEach(function(f){
+    if(!f.geom||f.geom.type!=='Point')return;
+    var d=_haversine(lat,lng,f.geom.coordinates[1],f.geom.coordinates[0]);
+    if(d<bestD){bestD=d;best={f:f,d:d};}
+  });
+  return best;
+}
+function _dStr(m){return m<1000?Math.round(m)+' m':(m/1000).toFixed(2)+' km';}
+function findNearest(){
+  if(!navigator.geolocation){alert('Géolocalisation non disponible.');return;}
+  navigator.geolocation.getCurrentPosition(function(pos){
+    var lat=pos.coords.latitude,lng=pos.coords.longitude,acc=pos.coords.accuracy;
+    map.flyTo({center:[lng,lat],zoom:Math.max(map.getZoom(),14)});
+
+    var npk=_nearestOf(lat,lng,layerData.pk);
+    var nacc=_nearestOf(lat,lng,layerData.acces);
+    var npam=_nearestOf(lat,lng,layerData.pam);
+
+    function zoomBtn(coords,z,label){
+      var co=JSON.stringify(coords);
+      return '<button onclick="map.flyTo({center:'+co+',zoom:'+z+'});closeDetail()" '+
+        'style="font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;margin-top:4px">'+label+'</button>';
+    }
+
+    var html='<div style="padding:12px;display:flex;flex-direction:column;gap:10px">';
+    html+='<p style="font-size:11px;color:#888;margin:0">📍 Précision GPS : '+Math.round(acc)+' m</p>';
+
+    if(npk){
+      var p=npk.f.props,co=npk.f.geom.coordinates;
+      html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
+      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
+      html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+c(p._pk_label||'')+'</div>';
+      html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+'</div>';
+      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
+      html+=zoomBtn(co,17,'→ Zoom sur ce PK');
+      html+='</div>';
+    } else {html+='<div style="padding:8px;color:#aaa">PK : données non chargées</div>';}
+
+    if(nacc){
+      var p=nacc.f.props,co=nacc.f.geom.coordinates;
+      html+='<div style="padding:10px;background:#fff8e1;border-radius:8px;border-left:4px solid #e65100">';
+      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">Accès le plus proche</div>';
+      html+='<div style="font-size:15px;font-weight:700;color:#e65100">🚧 '+c(p.NOM_ACCES||p.Name||'Accès')+'</div>';
+      if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
+      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
+      html+=zoomBtn(co,16,'→ Zoom sur cet accès');
+      html+='</div>';
+    } else {html+='<div style="padding:8px;color:#aaa">Accès : données non chargées</div>';}
+
+    if(npam){
+      var p=npam.f.props,co=npam.f.geom.coordinates;
+      html+='<div style="padding:10px;background:#f3e5f5;border-radius:8px;border-left:4px solid #9c27b0">';
+      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PAM la plus proche</div>';
+      html+='<div style="font-size:15px;font-weight:700;color:#9c27b0">🌱 '+c(p.libelle||'PAM')+'</div>';
+      if(p.axe)html+='<div style="font-size:12px;color:#555">Axe : '+c(p.axe)+'</div>';
+      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npam.d)+'</div>';
+      html+=zoomBtn(co,16,'→ Zoom sur cette PAM');
+      html+='</div>';
+    } else {html+='<div style="padding:8px;color:#aaa">PAM : données non chargées</div>';}
+
+    html+='</div>';
+    openDetail('📍 Éléments LGV proches',html);
+  },function(e){alert('Localisation impossible : '+e.message);},{enableHighAccuracy:true,timeout:10000});
+}
+window.findNearest=findNearest;
 
 // ══════════════════════════════════════════════════════════
 // RECHERCHE
