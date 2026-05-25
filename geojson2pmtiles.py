@@ -34,12 +34,13 @@ _SIMPLIFY = {
 
 LAYERS = [
     # (geojson_file, layer_name, min_zoom, max_zoom, encoding)
-    ("bois.geojson",    "bois",    8,  17, "utf-8"),
-    ("n2.geojson",      "n2",      6,  14, None),      # auto-detect utf-8/cp1252
-    ("old.geojson",     "old",     7,  15, "utf-8"),
-    ("mc.geojson",      "mc",      8,  16, "utf-8"),
-    ("eco.geojson",     "eco",     8,  14, "utf-8"),
-    ("oa_poly.geojson", "oa_poly", 10, 18, "utf-8"),
+    ("bois.geojson",       "bois",      8,  17, "utf-8"),
+    ("n2.geojson",         "n2",        6,  14, None),      # auto-detect utf-8/cp1252
+    ("old.geojson",        "old",       7,  15, "utf-8"),
+    ("mc.geojson",         "mc",        8,  16, "utf-8"),
+    ("eco.geojson",        "eco",       8,  14, "utf-8"),
+    ("oa_poly.geojson",    "oa_poly",  10,  18, "utf-8"),
+    ("pk_metric.geojson",  "pk_metric",17,  21, "utf-8"),   # PK métriques – zoom max
 ]
 
 
@@ -123,13 +124,13 @@ def convert_layer(geojson_file, layer_name, min_zoom, max_zoom, encoding):
                         continue
                     if clipped.is_empty:
                         continue
-                    # Skip degenerate results (points/lines from polygon intersection)
-                    if clipped.geom_type not in ("Polygon", "MultiPolygon"):
-                        # for line layers keep LineString too
-                        if clipped.geom_type not in ("LineString", "MultiLineString"):
-                            continue
-                    # Simplify at low zooms to reduce tile size
-                    if tol > 0:
+                    # Skip degenerate geometry types
+                    _ALLOWED = ("Polygon", "MultiPolygon", "LineString", "MultiLineString",
+                                "Point", "MultiPoint")
+                    if clipped.geom_type not in _ALLOWED:
+                        continue
+                    # Simplify at low zooms (polygons/lines only, not points)
+                    if tol > 0 and clipped.geom_type not in ("Point", "MultiPoint"):
                         try:
                             simplified = clipped.simplify(tol, preserve_topology=True)
                             if not simplified.is_empty:

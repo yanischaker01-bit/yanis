@@ -66,10 +66,7 @@ button,a,[onclick]{touch-action:manipulation}
 #layers-btn{position:absolute;top:60px;left:0;z-index:799;background:#1a1a2e;color:white;
   border:none;border-radius:0 6px 6px 0;padding:8px 10px;cursor:pointer;font-size:18px;
   box-shadow:2px 2px 8px rgba(0,0,0,.3)}
-/* Bouton localiser */
-#locate-btn{position:absolute;top:10px;right:50px;z-index:800;background:white;border:none;
-  border-radius:6px;width:34px;height:34px;cursor:pointer;font-size:18px;
-  box-shadow:0 2px 8px rgba(0,0,0,.3);display:flex;align-items:center;justify-content:center}
+/* Bouton localiser – dans la FAB bar */
 /* Barre recherche */
 #search-wrap{position:absolute;top:10px;left:50%;transform:translateX(-50%);z-index:1000;
   width:320px;max-width:90vw}
@@ -185,7 +182,6 @@ button,a,[onclick]{touch-action:manipulation}
   #layers-panel{width:min(290px,82vw)}
   .lp-item{padding:9px 4px;font-size:13.5px}
   .lp-item input[type=checkbox]{width:18px;height:18px}
-  #locate-btn{width:40px;height:40px;right:8px;top:8px;font-size:20px}
   .fab{width:50px;height:50px;font-size:22px}
   #fab-bar{bottom:max(28px,calc(env(safe-area-inset-bottom,0px)+12px));right:8px;gap:8px}
   #tbl-panel.open{height:52vh}
@@ -221,7 +217,6 @@ button,a,[onclick]{touch-action:manipulation}
   <div id="layers-panel-header" onclick="toggleLayersPanel()"><span>📑 Couches</span><span>✕</span></div>
   <div id="layers-panel-body"></div>
 </div>
-<button id="locate-btn" title="Me localiser" onclick="locateMe()">📍</button>
 <div id="ver-badge" style="position:absolute;bottom:max(8px,calc(env(safe-area-inset-bottom,0px)+4px));right:8px;z-index:800;
   background:rgba(26,26,46,.75);color:rgba(255,255,255,.55);font-size:9.5px;
   padding:2px 6px;border-radius:8px;pointer-events:none;letter-spacing:.3px"></div>
@@ -230,6 +225,7 @@ button,a,[onclick]{touch-action:manipulation}
 <div id="fab-bar">
   <button id="install-btn" class="fab fab-white" style="display:none" title="Installer l'application" onclick="installApp()">📲</button>
   <button id="offline-btn" class="fab fab-white" title="Mettre en cache hors-ligne" onclick="warmOfflineCache()">📶</button>
+  <button class="fab fab-white" title="Me localiser" onclick="locateMe()">📍</button>
   <button class="fab fab-white" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
   <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
   <button class="fab fab-white" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
@@ -268,7 +264,7 @@ var APP_VER = 'v3-ml';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
-maplibregl.addProtocol('pmtiles', function(req) { return _pmProtocol.tile(req); });
+maplibregl.addProtocol('pmtiles', _pmProtocol.tile.bind(_pmProtocol));
 
 // ── Helpers ──
 function c(v){return(v===null||v===undefined||String(v).match(/^(nan|NaN|None|null|undefined)$/i))?"":String(v)}
@@ -321,7 +317,7 @@ var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
 
 // ── Visibilité couches (état utilisateur) ──
-var _vis={rail:true,pk:true,pkhecto:false,oa:true,oh:true,pam:true,acces:true,
+var _vis={rail:true,pk:true,pkhecto:false,pkmetric:false,oa:true,oh:true,pam:true,acces:true,
            oapoly:true,bois:true,n2:true,old:true,mc:true,eco:true};
 
 // ── IDs couches par clé ──
@@ -329,6 +325,7 @@ var LAYER_IDS = {
   rail:    ['rail-line'],
   pk:      ['pk50-c','pk50-lbl','pk10-c','pk10-lbl','pk1-c','pk1-lbl'],
   pkhecto: ['pkh-c','pkh-lbl'],
+  pkmetric:['pkm-c','pkm-lbl'],
   oa:      ['oa-cluster-fill','oa-cluster-lbl','oa-pt'],
   oh:      ['oh-line','oh-lbl'],
   pam:     ['pam-cluster-fill','pam-cluster-lbl','pam-pt'],
@@ -353,14 +350,15 @@ var _focusActive=false;
 function clearFocusGeom(){
   if(!_focusActive)return;
   ['focus-pt','focus-line'].forEach(function(id){if(map.getLayer(id))map.removeLayer(id);});
-  if(map.getSource('focus'))map.removeSource('focus');
   _focusActive=false;
 }
 function focusGeom(geom,opts){
   clearFocusGeom();
   if(!geom)return;
   opts=opts||{};
-  map.addSource('focus',{type:'geojson',data:{type:'Feature',geometry:geom,properties:{}}});
+  var data={type:'Feature',geometry:geom,properties:{}};
+  if(map.getSource('focus')){map.getSource('focus').setData(data);}
+  else{map.addSource('focus',{type:'geojson',data:data});}
   var isPoint=geom.type==='Point'||geom.type==='MultiPoint';
   if(isPoint){
     map.addLayer({id:'focus-pt',type:'circle',source:'focus',paint:{
@@ -418,10 +416,13 @@ if(location.protocol==='file:'){
 // COUCHES VECTORIELLES (PMTiles + GeoJSON)
 // ══════════════════════════════════════════════════════════
 function _initVectorLayers(){
-  // ── PMTiles sources (polygon lourds) ──
-  ['bois','n2','old','mc','eco'].forEach(function(name){
-    map.addSource(name,{type:'vector',url:'pmtiles://data/'+name+'.pmtiles'});
-  });
+  // ── PMTiles source (bois uniquement – trop lourd en GeoJSON) ──
+  map.addSource('bois',{type:'vector',url:'pmtiles://data/bois.pmtiles'});
+  // ── GeoJSON sources (polygones légers chargés dans _loadAllData) ──
+  map.addSource('n2',{type:'geojson',data:emptyFC()});
+  map.addSource('old',{type:'geojson',data:emptyFC()});
+  map.addSource('mc',{type:'geojson',data:emptyFC()});
+  map.addSource('eco',{type:'geojson',data:emptyFC()});
 
   // ── Boisements ──
   map.addLayer({id:'bois-fill',type:'fill',source:'bois','source-layer':'bois',minzoom:8,
@@ -432,28 +433,28 @@ function _initVectorLayers(){
     paint:{'line-color':'#FFEB3B','line-width':1.5,'line-dasharray':[4,2]}});
 
   // ── Natura 2000 ──
-  map.addLayer({id:'n2-fill',type:'fill',source:'n2','source-layer':'n2',minzoom:6,
+  map.addLayer({id:'n2-fill',type:'fill',source:'n2',minzoom:6,
     paint:{'fill-color':['match',['get','type_complet'],'ZPS','#ff9800','ZSC','#2e7d32','#4caf50'],
       'fill-opacity':0.28}});
-  map.addLayer({id:'n2-outline',type:'line',source:'n2','source-layer':'n2',minzoom:6,
+  map.addLayer({id:'n2-outline',type:'line',source:'n2',minzoom:6,
     paint:{'line-color':['match',['get','type_complet'],'ZPS','#e65100','ZSC','#1b5e20','#388e3c'],
       'line-width':1.5,'line-dasharray':[3,2]}});
 
   // ── Zones OLD (fond seul, pas de contour) ──
-  map.addLayer({id:'old-fill',type:'fill',source:'old','source-layer':'old',minzoom:7,
+  map.addLayer({id:'old-fill',type:'fill',source:'old',minzoom:7,
     paint:{'fill-color':'#4f83ff','fill-opacity':0.22}});
 
   // ── Mesures compensatoires ──
-  map.addLayer({id:'mc-fill',type:'fill',source:'mc','source-layer':'mc',minzoom:8,
+  map.addLayer({id:'mc-fill',type:'fill',source:'mc',minzoom:8,
     paint:{'fill-color':'#ab47bc','fill-opacity':0.18}});
-  map.addLayer({id:'mc-outline',type:'line',source:'mc','source-layer':'mc',minzoom:8,
+  map.addLayer({id:'mc-outline',type:'line',source:'mc',minzoom:8,
     paint:{'line-color':'#7b1fa2','line-width':1.8}});
 
   // ── Écopâturage ──
-  map.addLayer({id:'eco-fill',type:'fill',source:'eco','source-layer':'eco',minzoom:8,
+  map.addLayer({id:'eco-fill',type:'fill',source:'eco',minzoom:8,
     paint:{'fill-color':['case',['==',['upcase',['coalesce',['get','Occupation'],'']],
       'ACTIVE'],'#81c784','#e0e0e0'],'fill-opacity':0.45}});
-  map.addLayer({id:'eco-outline',type:'line',source:'eco','source-layer':'eco',minzoom:8,
+  map.addLayer({id:'eco-outline',type:'line',source:'eco',minzoom:8,
     paint:{'line-color':['case',['==',['upcase',['coalesce',['get','Occupation'],'']],
       'ACTIVE'],'#2e7d32','#999'],'line-width':1.5}});
 
@@ -491,7 +492,6 @@ function _initVectorLayers(){
   map.addSource('oa',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
   map.addSource('pam',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
   map.addSource('acces',{type:'geojson',data:emptyFC()});
-  map.addSource('focus',{type:'geojson',data:emptyFC()});
 
   // ── OA Emprises (polygones avec labels permanents) ──
   map.addLayer({id:'oapoly-fill',type:'fill',source:'oa_poly',minzoom:13,
@@ -545,6 +545,15 @@ function _initVectorLayers(){
   pkLabel('pk10-lbl',['has','_pk_label'],null,10,13,10);
   pkCircle('pk1-c',['has','_pk_label'],13,17,4,'#333');
   pkLabel('pk1-lbl',['has','_pk_label'],null,13,17,9.5);
+
+  // ── PK métriques (PMTiles, zoom max) ──
+  map.addSource('pk_metric',{type:'vector',url:'pmtiles://data/pk_metric.pmtiles'});
+  map.addLayer({id:'pkm-c',type:'circle',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
+    paint:{'circle-radius':2,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#9e9e9e'}});
+  map.addLayer({id:'pkm-lbl',type:'symbol',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
+    layout:{'text-field':['coalesce',['get','_pk_label'],['get','PK'],['get','pk'],''],
+      'text-size':8,'text-font':['Open Sans Regular'],'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
+    paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1}});
 
   // ── PK hectométriques ──
   map.addLayer({id:'pkh-c',type:'circle',source:'pk_hecto',minzoom:17,
@@ -711,6 +720,12 @@ function _loadAllData(){
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
   }).catch(function(){_loading.pam=false;_updateLoadStatus();});
 
+  // N2000, OLD, MC, Écopâturage (GeoJSON – légers)
+  loadJSONAutoEnc('n2').then(function(d){map.getSource('n2').setData(d);});
+  loadJSON('old').then(function(d){map.getSource('old').setData(d);});
+  loadJSON('mc').then(function(d){map.getSource('mc').setData(d);});
+  loadJSON('eco').then(function(d){map.getSource('eco').setData(d);});
+
   _restoreKMLLayers();
 }
 function _stripB64(p){var o=Object.assign({},p);delete o._ph_b64;return o;}
@@ -740,7 +755,8 @@ function _initLayersPanel(){
   var defs=[
     {key:'rail',  label:'Tracé LGV',         color:'#cc0000',type:'line'},
     {key:'pk',    label:'PK (zoom-adaptatif)',color:'#333',   type:'dot'},
-    {key:'pkhecto',label:'PK 100m',           color:'#666',   type:'dot', minZoom:17},
+    {key:'pkhecto', label:'PK 100m',            color:'#666',   type:'dot', minZoom:17},
+    {key:'pkmetric',label:'PK métriques (1m)',  color:'#9e9e9e',type:'dot', minZoom:18},
     {key:'n2',    label:'N2000',              color:'#1b5e20',type:'fill',minZoom:6},
     {key:'old',   label:'Zones OLD',          color:'#3366ff',type:'fill',minZoom:7},
     {key:'mc',    label:'Mesures comp.',      color:'#9c27b0',type:'fill',minZoom:8},
@@ -1083,7 +1099,7 @@ function openDetailOAPoly(p){
     dpSec('Caractéristiques',[['Type',p.TYPE||p.LIBELLE_FA],['Infrastructure portée',p.INFRA_PORTEE],
       ['Infrastructure franchie',p.INFRA_FRANCHIE],['Hauteur libre',p.HAUTEUR_LIBRE?(c(p.HAUTEUR_LIBRE)+' m'):''],
       ['Longueur biaisée',p.LONGUEUR_BIAISE?(c(p.LONGUEUR_BIAISE)+' m'):'']  ])+
-    dpSp(p)+dpPJWrap(code||featureKey('OA',p));
+    dpSp(p);
   openDetail('🏗 '+title,body);
 }
 function openDetailOA(p){
@@ -1091,7 +1107,7 @@ function openDetailOA(p){
   var body=dpHero('OA',code,lib,'#00bcd4')+dpPkBar(c(p._pk_fmt))+dpPhoto(p)+
     dpSec('Localisation',[['PK',p._pk_fmt],['Voie',p.VOIE],['Commune',p.COMMUNE],['Département',p.DEPARTEMEN]])+
     dpSec('Caractéristiques',[['Famille',p.LIBELLE_FA],['Type',p.LIBELLE_TY||p.TYPE_OBJ],['Dimensions',p.DIMENSIONS]])+
-    dpSp(p)+dpPJWrap(code||featureKey('OA',p));
+    dpSp(p);
   openDetail('🏗 '+(code?code+' – ':'')+lib,body);
 }
 function openDetailOH(p){
@@ -1100,7 +1116,7 @@ function openDetailOH(p){
     dpSec('Localisation',[['PK',p._pk_fmt],['Voie',p.voie],['Cours d\'eau',p.ecoul_nom]])+
     dpSec('Caractéristiques',[['Type',p.type_objet],['Structure',p.structure],
       ['Longueur',p.longueur?(c(p.longueur)+' m'):''],['Radier',p.radier],['Diamètre',p.diametre]])+
-    dpSp(p)+dpPJWrap(code||featureKey('OH',p));
+    dpSp(p);
   openDetail('💧 '+(code?code+' – ':'')+lib,body);
 }
 // PAM : JAMAIS de dpPJWrap (contrainte permanente)
