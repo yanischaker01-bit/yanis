@@ -812,6 +812,7 @@ window.toggleLayer=function(key,on){
 window.setAllLayers=function(on){
   Object.keys(LAYER_IDS).forEach(function(k){setVis(k,on);});
   document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){cb.checked=on;});
+  try{var s={};document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){var k=cb.id.replace('lp-chk-','');if(k)s[k]=cb.checked;});localStorage.setItem('lgv_layers_v3',JSON.stringify(s));}catch(e){}
 };
 window.switchBM=function(name){
   ['sat','osm','ign'].forEach(function(id){
@@ -822,6 +823,12 @@ window.switchBM=function(name){
 function _restoreLayerStates(defs){
   try{
     var s=JSON.parse(localStorage.getItem('lgv_layers_v3')||'{}');
+    // Si plus de la moitié des couches sont "off", ignorer l'état sauvegardé (état corrompu)
+    var keys=Object.keys(s);
+    if(keys.length>0&&keys.filter(function(k){return s[k]===false;}).length>keys.length/2){
+      localStorage.removeItem('lgv_layers_v3');
+      return;
+    }
     (defs||[]).forEach(function(d){
       if(!(d.key in s))return;
       var on=s[d.key];
