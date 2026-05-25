@@ -72,13 +72,24 @@ button,a,[onclick]{touch-action:manipulation}
 .tip-n2{background:rgba(27,94,32,.82);color:white;border:none;
   font-size:9.5px;font-weight:600;padding:1px 5px;border-radius:3px;white-space:nowrap;
   pointer-events:none;text-align:center}
-/* tip-pk/oh masqués par défaut, révélés par classe zoom sur #map */
-.leaflet-tooltip.tip-pk,.leaflet-tooltip.tip-oa,.leaflet-tooltip.tip-n2,.leaflet-tooltip.tip-oh{display:none}
+/* tip-pk/oh/pam/acc masqués par défaut, révélés par classe zoom sur #map */
+.leaflet-tooltip.tip-pk,.leaflet-tooltip.tip-oa,.leaflet-tooltip.tip-n2,
+.leaflet-tooltip.tip-oh,.leaflet-tooltip.tip-pam,.leaflet-tooltip.tip-acc{display:none}
 .lbl-pk50 .leaflet-tooltip.tip-pk50{display:block}
 .lbl-pk10 .leaflet-tooltip.tip-pk10{display:block}
 .lbl-pk1 .leaflet-tooltip.tip-pk1{display:block}
 .lbl-pkh .leaflet-tooltip.tip-pkh{display:block}
 .lbl-oh .leaflet-tooltip.tip-oh{display:block}
+.lbl-oa .leaflet-tooltip.tip-oa{display:block}
+.lbl-pam .leaflet-tooltip.tip-pam{display:block}
+.lbl-acc .leaflet-tooltip.tip-acc{display:block}
+/* Styles étiquettes PAM et Accès */
+.tip-pam{background:rgba(156,39,176,.9);color:white;border:none;
+  font-size:10px;font-weight:600;padding:1px 5px;border-radius:3px;white-space:nowrap;
+  box-shadow:0 1px 4px rgba(0,0,0,.3);pointer-events:none}
+.tip-acc{background:rgba(220,88,0,.9);color:white;border:none;
+  font-size:10px;font-weight:600;padding:1px 5px;border-radius:3px;white-space:nowrap;
+  box-shadow:0 1px 4px rgba(0,0,0,.3);pointer-events:none}
 /* Panneau liste des couches */
 #layers-panel{position:absolute;top:60px;left:0;z-index:800;
   background:white;border-radius:0 8px 8px 0;box-shadow:2px 2px 12px rgba(0,0,0,.25);
@@ -545,6 +556,7 @@ var boisVG=L.vectorGrid.protobuf('pmtiles://data/bois.pmtiles/{z}/{x}/{y}',{
   rendererFactory:L.canvas.tile,
   pane:'pane-bois',
   interactive:true,
+  updateWhenZooming:false,
   maxNativeZoom:17,
   vectorTileLayerStyles:{
     bois:function(p){
@@ -601,6 +613,7 @@ var mcVG=L.vectorGrid.protobuf('pmtiles://data/mc.pmtiles/{z}/{x}/{y}',{
   rendererFactory:L.canvas.tile,
   pane:'pane-mc',
   interactive:true,
+  updateWhenZooming:false,
   maxNativeZoom:16,
   vectorTileLayerStyles:{
     mc:{fill:true,fillColor:'#ab47bc',fillOpacity:.16,color:'#7b1fa2',weight:2.2}
@@ -633,21 +646,32 @@ ecoVG.on('click',function(e){
   openDetailGeneric('Eco','🐑 '+c(p.Appellation||p.Name||'Écopâturage'),p,'#2e7d32');
 });
 
-var oaPolyVG=L.vectorGrid.protobuf('pmtiles://data/oa_poly.pmtiles/{z}/{x}/{y}',{
-  rendererFactory:L.canvas.tile,
+// OA polygones : GeoJSON + canvas (comme v14) pour fluidité et labels permanents
+var _oaPolyCanvas=L.canvas({pane:'pane-oa-poly'});
+var oaPolyLayer=L.geoJSON(null,{
+  renderer:_oaPolyCanvas,
   pane:'pane-oa-poly',
-  interactive:true,
-  maxNativeZoom:18,
-  vectorTileLayerStyles:{
-    oa_poly:{fill:true,fillColor:'#00bcd4',fillOpacity:.18,color:'#00bcd4',weight:2}
+  style:{fill:true,fillColor:'#00bcd4',fillOpacity:.18,color:'#00bcd4',weight:2},
+  onEachFeature:function(f,l){
+    var p=f.properties;
+    var code=c(p.LIBELLE_COURT||p.CODE_OBJET||""),lib=c(p.LIBELLE||p.LIBELLE_LO||"");
+    var lbl=code||(lib?lib.slice(0,20):"OA");
+    l.bindTooltip(lbl,{permanent:true,direction:"center",className:"tip-oa",offset:[0,0]});
+    l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailOAPoly(l.feature.properties);});
   }
 });
-_setupVGHover(oaPolyVG,function(p){return c(p.LIBELLE_COURT||p.CODE_OBJET||p.LIBELLE||'OA');});
-oaPolyVG.on('click',function(e){
-  if(e.originalEvent)L.DomEvent.stopPropagation(e.originalEvent);
-  var p=(e.propagatedFrom||e.layer||{}).properties||{};
-  openDetailOAPoly(p);
-});
+var _oaPolyFeatsAll=[],_oaPolyVCReady=false,_oaPolyVCTimer=null;
+function _refreshOAPolyVC(){
+  clearTimeout(_oaPolyVCTimer);
+  _oaPolyVCTimer=setTimeout(function(){
+    if(!_oaPolyFeatsAll.length||!map.hasLayer(oaPolyLayer))return;
+    var feats=_oaPolyFeatsAll.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));});
+    oaPolyLayer.clearLayers();
+    feats.forEach(function(f){oaPolyLayer.addData(f);});
+  },150);
+}
+// OA poly : label CSS comme v14
+// (tip-oa révélé par .lbl-oa sur #map – ajouté dans updateVisibility)
 
 // ─── DONNÉES CHARGÉES (table + recherche) ───
 // Couches polygones lourdes retirées : mc/old/eco/bois/n2 → PMTiles (pas dans layerData)
@@ -744,7 +768,8 @@ if(location.protocol==="file:"){
 
 // Rail en premier → carte visible immédiatement
 var _railProm=loadJSONSafe("rail");
-// Phase 1 : pk + acces seulement (n2/old/mc/eco → PMTiles, oa_poly → PMTiles)
+// Phase 1 : pk + acces + oa_poly (oa_poly GeoJSON comme v14 – 0.3 MB)
+var _oaPolyProm=loadJSONSafe("oa_poly");
 var _restProm=Promise.all(["pk","acces"].map(loadJSONSafe));
 // Phase 2 pré-chargées dès le démarrage
 var _oaProm=loadJSONSafe("oa");
@@ -830,9 +855,10 @@ Promise.all([_railProm,_restProm]).then(function(results){
     pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🚧",20),pane:"pane-acces"})},
     onEachFeature:function(f,l){
       var p=f.properties;
-      l.bindTooltip(c(p.NOM_ACCES||p.Name||p.name||"Accès"),{sticky:true});
+      var lbl=c(p.NOM_ACCES||p.Name||p.name||"Accès");
+      l.bindTooltip(lbl,{permanent:true,direction:"top",className:"tip-acc",offset:[0,-12]});
       l.on("click",function(e){L.DomEvent.stopPropagation(e);
-        openDetailGeneric("Accès","🚧 "+c(p.NOM_ACCES||p.Name||p.name||"Accès"),p,"#ff6600");});
+        openDetailGeneric("Accès","🚧 "+lbl,p,"#ff6600");});
     }
   });
   layerData.acces=(acces.features||[]).map(function(f){return{props:f.properties,layer:null,bbox:null,geom:f.geometry};});
@@ -875,7 +901,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
   overlays["<span style=\"color:#1b5e20\">▬</span> ZSC / <span style=\"color:#4caf50\">▬</span> SIC / <span style=\"color:#ff9800\">▬</span> ZPS"]=n2VG;
   overlays["🐑 Écopâturage"]=ecoVG;
   overlays["🌳 Boisements"]=boisVG;
-  overlays["<span style=\"color:#00bcd4\">▬</span> OA – Emprises"]=oaPolyVG;
+  overlays["<span style=\"color:#00bcd4\">▬</span> OA – Emprises (<span id=\"cnt-oapoly\">…</span>)"]=oaPolyLayer;
   layerCtrl=L.control.layers(baseMaps,overlays,{position:"topright",collapsed:true}).addTo(map);
   layerObjs=overlays;
 
@@ -963,7 +989,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
       if(!_ecoOff&&z>=11)    layerOn(ecoVG);      else layerOff(ecoVG);
       if(!_boisOff&&z>=12)   layerOn(boisVG);     else layerOff(boisVG);
       if(!_accOff&&z>=12)    layerOn(accLayer);   else layerOff(accLayer);
-      if(!_oaPolyOff&&z>=13) layerOn(oaPolyVG);  else layerOff(oaPolyVG);
+      if(!_oaPolyOff&&z>=13) layerOn(oaPolyLayer); else layerOff(oaPolyLayer);
       if(!_pamOff&&z>=13)    layerOn(pamCluster); else layerOff(pamCluster);
       if(!_ohOff&&z>=16)     layerOn(ohLayer);    else layerOff(ohLayer);
       // ── Labels CSS permanents ──
@@ -973,6 +999,9 @@ Promise.all([_railProm,_restProm]).then(function(results){
       mapEl.classList.toggle("lbl-pk1", !_pkOff&&z>=13&&z<17);
       mapEl.classList.toggle("lbl-pkh", !_pkHectoOff&&z>=17);
       mapEl.classList.toggle("lbl-oh",  !_ohOff&&z>=16);
+      mapEl.classList.toggle("lbl-oa",  !_oaPolyOff&&z>=13);
+      mapEl.classList.toggle("lbl-pam", !_pamOff&&z>=15);
+      mapEl.classList.toggle("lbl-acc", !_accOff&&z>=14);
       // ── Badge zoom panel couches ──
       document.querySelectorAll('.lp-mz[data-minzoom]').forEach(function(el){
         var needed=z<parseInt(el.dataset.minzoom);
@@ -994,14 +1023,15 @@ Promise.all([_railProm,_restProm]).then(function(results){
     },200);
   }
 
-  // moveend : OH culling seulement
+  // moveend : OH + OAPoly culling
   map.on('moveend',function(){
     var z=map.getZoom();
     if(_ohVCReady&&!_ohOff&&z>=16)_refreshOHVC();
+    if(_oaPolyVCReady&&!_oaPolyOff&&z>=13)_refreshOAPolyVC();
   });
 
-  // Fluidité zoom : masquer panes lourds pendant l'animation
-  var _zpanes=['pane-bois','pane-old','pane-eco','pane-mc','pane-n2','pane-oa-poly','pane-oh'];
+  // Fluidité zoom : masquer panes lourds pendant l'animation (oa-poly retiré → GeoJSON)
+  var _zpanes=['pane-bois','pane-old','pane-eco','pane-mc','pane-n2','pane-oh'];
   map.on('zoomstart',function(){
     _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='hidden';});
   });
@@ -1009,6 +1039,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
     _zpanes.forEach(function(p){var el=map.getPane(p);if(el)el.style.visibility='';});
     updateVisibility();
     if(_ohVCReady&&!_ohOff)_refreshOHVC();
+    if(_oaPolyVCReady&&!_oaPolyOff)_refreshOAPolyVC();
   });
   updateVisibility();
 
@@ -1027,7 +1058,7 @@ Promise.all([_railProm,_restProm]).then(function(results){
         offFn:function(v){_oldOff=v;}, getOn:function(){return !_oldOff;}},
       {label:"Mesures comp.",         lsKey:"mc",      layer:mcVG,        color:"#9c27b0",type:"fill",  minZoom:10,
         offFn:function(v){_mcOff=v;},  getOn:function(){return !_mcOff;}},
-      {label:"OA Emprises",           lsKey:"oapoly",  layer:oaPolyVG,    color:"#00bcd4",type:"fill",  minZoom:13,
+      {label:"OA Emprises",           lsKey:"oapoly",  layer:oaPolyLayer, color:"#00bcd4",type:"fill",  minZoom:13,lpId:"lp-oapoly",
         offFn:function(v){_oaPolyOff=v;},getOn:function(){return !_oaPolyOff;}},
       {label:"OA Ouvrages d'Art",     lsKey:"oa",      layer:oaCluster,   emoji:"🏗",lpId:"lp-oa",     minZoom:11,
         offFn:function(v){_oaOff=v;},   getOn:function(){return !_oaOff;}},
@@ -1104,6 +1135,21 @@ Promise.all([_railProm,_restProm]).then(function(results){
     };
   }
   initLayersPanel();
+  // Expose force-layer-on pour goToResult (hors closure)
+  window._forceLayerOn=function(type){
+    var changed=false;
+    if(type==="OA"){if(_oaOff){_oaOff=false;changed=true;}if(_oaPolyOff){_oaPolyOff=false;changed=true;}}
+    else if(type==="OH"){if(_ohOff){_ohOff=false;changed=true;}}
+    else if(type==="PAM"){if(_pamOff){_pamOff=false;changed=true;}}
+    else if(type==="Accès"){if(_accOff){_accOff=false;changed=true;}}
+    if(changed){
+      updateVisibility();_saveLayerStates();
+      if(_lpDefs){var pb=document.getElementById("layers-panel-body");
+        if(pb)pb.querySelectorAll(".lp-item input").forEach(function(cb,i){
+          if(_lpDefs[i])cb.checked=_lpDefs[i].getOn?_lpDefs[i].getOn():map.hasLayer(_lpDefs[i].layer);
+        });}
+    }
+  };
   window._updateLpCount=function(key,n){
     var el=document.getElementById("lp-"+key);
     if(!el)return;
@@ -1185,7 +1231,8 @@ Promise.all([_railProm,_restProm]).then(function(results){
       pointToLayer:function(f,ll){return L.marker(ll,{icon:mkIcon("🌱",20),pane:"pane-oa"})},
       onEachFeature:function(f,l){
         var p=f.properties;
-        l.bindTooltip(c(p.libelle||p.axe||"PAM"),{sticky:true});
+        var lbl=c(p.libelle||p.axe||"PAM");
+        l.bindTooltip(lbl,{permanent:true,direction:"top",className:"tip-pam",offset:[0,-12]});
         l.on("click",function(e){L.DomEvent.stopPropagation(e);openDetailPAM(l.feature.properties);});
       }};
     addMarkersChunked(pamFeats,pamOpts,pamCluster,50,function(){
@@ -1205,6 +1252,21 @@ Promise.all([_railProm,_restProm]).then(function(results){
     refreshTableIfOpen();
     console.error("PAM erreur:",e);
   });
+
+  // OA polygones (GeoJSON, comme v14)
+  _oaPolyProm.then(function(oaPoly){
+    var feats=oaPoly.features||[];
+    _oaPolyFeatsAll=feats;
+    _oaPolyFeatsAll.forEach(_featBbox);
+    var z=map.getZoom();
+    var initFeats=z>=13?feats.filter(function(f){return _inBounds(f,map.getBounds().pad(.5));})
+                       :feats;
+    initFeats.forEach(function(f){oaPolyLayer.addData(f);});
+    _oaPolyVCReady=true;
+    var cnt=feats.length;
+    window._updateLpCount&&window._updateLpCount("oapoly",cnt);
+    updateVisibility();
+  }).catch(function(e){console.warn("OAPoly erreur:",e);});
 
   restoreKMLLayers(layerCtrl);
 
@@ -1227,19 +1289,19 @@ function focusGeom(geom,opts){
     _focusLayer=L.geoJSON({type:"Feature",properties:{},geometry:geom},{
       pane:"pane-focus",
       pointToLayer:function(f,ll){
-        return L.circleMarker(ll,{radius:10,color:"#ff1744",weight:3,
+        return L.circleMarker(ll,{radius:12,color:"#ff1744",weight:3,
           fillColor:"#fff176",fillOpacity:.95,pane:"pane-focus"});
       },
-      style:{color:"#ff1744",weight:6,opacity:.95,fillColor:"#fff176",fillOpacity:.18,dashArray:"8 4"}
+      style:{color:"#ff1744",weight:6,opacity:.95,fillColor:"#fff176",fillOpacity:.25,dashArray:"8 4"}
     }).addTo(map);
     if(geom.type==="Point"){
       var coords=geom.coordinates;
-      map.setView([coords[1],coords[0]],opts.zoom||17,{animate:true});
+      map.setView([coords[1],coords[0]],opts.zoom||18,{animate:true});
     } else {
       var bounds=_focusLayer.getBounds();
-      if(bounds&&bounds.isValid())map.fitBounds(bounds.pad(.15),{animate:true,maxZoom:opts.maxZoom||17});
+      if(bounds&&bounds.isValid())map.fitBounds(bounds.pad(.18),{animate:true,maxZoom:opts.maxZoom||19});
     }
-    setTimeout(clearFocusGeom,opts.ttl||8000);
+    setTimeout(clearFocusGeom,opts.ttl||10000);
   }catch(e){}
 }
 
@@ -1250,22 +1312,22 @@ function buildSearchIndex(){
   layerData.oa.forEach(function(f){
     var p=f.props;
     searchIndex.push({type:"OA",label:c(p.CODE_OBJET)+" – "+c(p.LIBELLE_LO),
-      sub:c(p._pk_fmt),geom:f.geom});
+      sub:c(p._pk_fmt),geom:f.geom,props:p});
   });
   layerData.oh.forEach(function(f){
     var p=f.props;
     searchIndex.push({type:"OH",label:c(p.code_objet)+" – "+c(p.libelle_ob),
-      sub:c(p._pk_fmt),geom:f.geom});
+      sub:c(p._pk_fmt),geom:f.geom,props:p});
   });
   layerData.acces.forEach(function(f){
     var p=f.props;
     searchIndex.push({type:"Accès",label:c(p.NOM_ACCES||p.Name||""),
-      sub:c(p.AXE)+" PK "+c(p.PK),geom:f.geom});
+      sub:c(p.AXE)+" PK "+c(p.PK),geom:f.geom,props:p});
   });
   layerData.pam.forEach(function(f){
     var p=f.props;
     searchIndex.push({type:"PAM",label:c(p.libelle||"PAM"),
-      sub:[c(p.axe),c(p.pk_ef||p.pk_gc)].filter(Boolean).join(" • "),geom:f.geom});
+      sub:[c(p.axe),c(p.pk_ef||p.pk_gc)].filter(Boolean).join(" • "),geom:f.geom,props:p});
   });
 }
 var _pkLoaded=false;
@@ -1318,10 +1380,24 @@ document.getElementById("search-input").addEventListener("keydown",function(e){
 document.addEventListener("click",function(e){
   if(!e.target.closest("#search-wrap"))document.getElementById("search-res").style.display="none";
 });
+function openDetailFromSearch(h){
+  if(!h.props)return;
+  var p=h.props;
+  if(h.type==="OA")openDetailOA(p);
+  else if(h.type==="OH")openDetailOH(p);
+  else if(h.type==="PAM")openDetailPAM(p);
+  else if(h.type==="Accès")openDetailGeneric("Accès","🚧 "+h.label,p,"#ff6600");
+}
 function goToResult(idx,el){
   var hits=document.getElementById("search-res")._hits||[];
   var h=hits[idx];if(!h||!h.geom)return;
-  focusGeom(h.geom,{zoom:17,maxZoom:17});
+  // Force la couche visible si elle était désactivée
+  if(window._forceLayerOn)window._forceLayerOn(h.type);
+  // Zoom fort : z18 pour points, z19 max pour polygones/lignes
+  var isPoint=(h.geom.type==="Point"||h.geom.type==="MultiPoint");
+  focusGeom(h.geom,{zoom:isPoint?18:undefined,maxZoom:19});
+  // Ouvre le panneau de détail automatiquement
+  if(h.props)setTimeout(function(){openDetailFromSearch(h);},250);
   document.getElementById("search-res").style.display="none";
   document.getElementById("search-input").value=h.label;
 }
@@ -1386,7 +1462,16 @@ function filterTable(){fillTable();}
 function zoomToFeature(idx){
   var data=(document.getElementById("tbl-scroll")._data)||[];
   var f=data[idx];if(!f||!f.geom)return;
-  focusGeom(f.geom,{zoom:17,maxZoom:17});
+  var isPoint=(f.geom.type==="Point"||f.geom.type==="MultiPoint");
+  focusGeom(f.geom,{zoom:isPoint?18:undefined,maxZoom:19});
+  // Ouvre le détail depuis la table
+  var layer=document.getElementById("tbl-layer-sel").value;
+  if(f.props){
+    var h={type:layer==="oa"?"OA":layer==="oh"?"OH":layer==="pam"?"PAM":"Accès",
+           label:"",props:f.props,geom:f.geom};
+    if(window._forceLayerOn)window._forceLayerOn(h.type);
+    setTimeout(function(){openDetailFromSearch(h);},250);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
