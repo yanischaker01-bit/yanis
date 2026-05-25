@@ -56,13 +56,14 @@
     steps.push('✓ localStorage nettoyé : ' + (removed.length ? removed.join(', ') : 'rien à supprimer'));
   } catch(e) { steps.push('⚠ localStorage : ' + e.message); }
 
-  // Affichage résultat
+  // Affichage résultat + auto-redirect vers index_v3.html
   document.getElementById('spin').style.display = 'none';
   msg.innerHTML = '<div class="done">' +
     steps.map(function(s){return '<p>'+s+'</p>';}).join('') +
     '<p style="margin-top:12px;font-size:1.1em">✅ Terminé !</p>' +
-    '<p style="margin-top:16px"><a href="./">→ Ouvrir la carte (version fraîche)</a></p>' +
+    '<p style="margin-top:16px"><a href="./index_v3.html">→ Ouvrir la carte (version fraîche)</a></p>' +
     '</div>';
+  setTimeout(function(){ location.replace('./index_v3.html?_cb='+Date.now()); }, 2000);
 })();
 </script>
 </body>
