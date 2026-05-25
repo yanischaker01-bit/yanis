@@ -446,7 +446,7 @@ function _initVectorLayers(){
 
   // ── Zones OLD (fond seul, pas de contour) ──
   map.addLayer({id:'old-fill',type:'fill',source:'old',minzoom:7,
-    paint:{'fill-color':'#4f83ff','fill-opacity':0.22}});
+    paint:{'fill-color':'#4f83ff','fill-opacity':0.10}});
 
   // ── Mesures compensatoires ──
   map.addLayer({id:'mc-fill',type:'fill',source:'mc',minzoom:8,
@@ -1302,7 +1302,8 @@ async function warmOfflineCache(){
   var files=[
     'data/rail.geojson','data/pk.geojson','data/pk_hecto.geojson',
     'data/oa.geojson','data/oh.geojson','data/pam.geojson','data/acces.geojson','data/oa_poly.geojson',
-    'data/bois.pmtiles','data/n2.pmtiles','data/old.pmtiles','data/mc.pmtiles','data/eco.pmtiles',
+    'data/bois.pmtiles','data/oa_poly.pmtiles',
+    'data/n2.geojson','data/old.geojson','data/mc.geojson','data/eco.geojson',
     'index_v3.html','sw.js','manifest.json','icons/icon-192.png','icons/icon-512.png'
   ];
   if(btn){btn.textContent='⏳';btn.disabled=true;btn.dataset.state='';}

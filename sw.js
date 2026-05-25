@@ -1,11 +1,10 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v2';
+const CACHE = 'lgv-sea-v3';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 const PRECACHE = [
   './',
-  './index.html',
-  './index_v2.html',
+  './index_v3.html',
   './sw.js',
   './manifest.json',
   './icons/icon-192.png',
@@ -22,16 +21,8 @@ const PRECACHE = [
   './data/mc.geojson',
   './data/n2.geojson',
   './data/eco.geojson',
-  './data/bois.geojson',
-  'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
-  'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js',
-  'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css',
-  'https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css',
-  'https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js',
-  'https://unpkg.com/pmtiles@3.2.0/dist/pmtiles.js',
-  'https://unpkg.com/leaflet.vectorgrid@1.3.0/dist/Leaflet.VectorGrid.bundled.min.js',
-  'https://cdn.jsdelivr.net/npm/@tmcw/togeojson@5.8.0/dist/togeojson.umd.js',
-  'https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js'
+  './data/bois.pmtiles',
+  './data/oa_poly.pmtiles',
 ];
 
 /* Réception du message SKIP_WAITING depuis la page → activation immédiate */
