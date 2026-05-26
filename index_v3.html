@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.6';
+  var V='v3.7';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -271,11 +271,12 @@ button,a,[onclick]{touch-action:manipulation}
     if(s&&s!==V){location.replace(location.pathname+'?reset=1');}
   }catch(e){}
 })();
-/* ── Force-reset via ?reset=1 : vide caches + désinscrit SW + recharge ── */
+/* ── Force-reset via ?reset=1 : vide caches + SW + localStorage lgv_* ── */
 if(location.search.indexOf('reset=1')!==-1){
   (async function(){
     try{var keys=await caches.keys();await Promise.all(keys.map(function(k){return caches.delete(k);}));}catch(e){}
     try{var regs=await navigator.serviceWorker.getRegistrations();await Promise.all(regs.map(function(r){return r.unregister();}));}catch(e){}
+    try{Object.keys(localStorage).filter(function(k){return k.startsWith('lgv_');}).forEach(function(k){localStorage.removeItem(k);});}catch(e){}
     location.replace(location.pathname+'?_cb='+Date.now());
   })();
 }
@@ -284,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.6';
+var APP_VER = 'v3.7';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -322,7 +323,7 @@ var map = new maplibregl.Map({
     ]
   },
   center: [-0.2, 46.3],
-  zoom: 8,
+  zoom: 10,
   maxZoom: 21,
   attributionControl: {compact:true}
 });
@@ -330,7 +331,7 @@ var map = new maplibregl.Map({
 map.addControl(new maplibregl.NavigationControl({showCompass:false}), 'bottom-left');
 map.addControl(new maplibregl.ScaleControl({unit:'metric'}), 'bottom-left');
 
-var HOME_CENTER=[-0.2,46.3], HOME_ZOOM=8;
+var HOME_CENTER=[-0.2,46.3], HOME_ZOOM=10;
 function resetView(){map.flyTo({center:HOME_CENTER,zoom:HOME_ZOOM});}
 window.resetView=resetView;
 window.toggleLayersPanel=function(){document.getElementById('layers-panel').classList.toggle('open');};
@@ -355,7 +356,7 @@ var LAYER_IDS = {
   oa:      ['oa-cluster-fill','oa-cluster-lbl','oa-pt'],
   oh:      ['oh-line','oh-lbl'],
   pam:     ['pam-cluster-fill','pam-cluster-lbl','pam-pt','pam-lbl'],
-  acces:   ['acc-pt','acc-lbl'],
+  acces:   ['acc-cluster-fill','acc-cluster-lbl','acc-pt','acc-lbl'],
   oapoly:  ['oapoly-fill','oapoly-outline','oapoly-lbl'],
   bois:    ['bois-fill','bois-outline'],
   n2:      ['n2-fill','n2-outline'],
@@ -521,7 +522,7 @@ function _initVectorLayers(){
   map.addSource('pk_hecto',{type:'geojson',data:emptyFC()});
   map.addSource('oa',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
   map.addSource('pam',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
-  map.addSource('acces',{type:'geojson',data:emptyFC()});
+  map.addSource('acces',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:11,clusterRadius:60});
 
   // ── OA Emprises (polygones avec labels permanents) ──
   map.addLayer({id:'oapoly-fill',type:'fill',source:'oa_poly',minzoom:13,
@@ -623,13 +624,13 @@ function _initVectorLayers(){
   map.on('mouseleave','oa-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
   // ── PAM clusters + points ──
-  map.addLayer({id:'pam-cluster-fill',type:'circle',source:'pam',filter:['has','point_count'],minzoom:13,
+  map.addLayer({id:'pam-cluster-fill',type:'circle',source:'pam',filter:['has','point_count'],minzoom:8,
     paint:{'circle-radius':['step',['get','point_count'],16,10,22,50,28],
       'circle-color':'#9c27b0','circle-stroke-width':2,'circle-stroke-color':'rgba(255,255,255,.6)'}});
-  map.addLayer({id:'pam-cluster-lbl',type:'symbol',source:'pam',filter:['has','point_count'],minzoom:13,
+  map.addLayer({id:'pam-cluster-lbl',type:'symbol',source:'pam',filter:['has','point_count'],minzoom:8,
     layout:{'text-field':['get','point_count_abbreviated'],'text-font':['Open Sans Regular'],'text-size':13},
     paint:{'text-color':'white'}});
-  map.addLayer({id:'pam-pt',type:'symbol',source:'pam',filter:['!',['has','point_count']],minzoom:13,
+  map.addLayer({id:'pam-pt',type:'symbol',source:'pam',filter:['!',['has','point_count']],minzoom:12,
     layout:{'text-field':'🌱','text-size':20,'text-allow-overlap':true,'text-ignore-placement':true}});
   map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',filter:['!',['has','point_count']],minzoom:15,
     layout:{'text-field':['get','libelle'],'text-size':10,
@@ -650,12 +651,26 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🌱 '+c(e.features[0].properties.libelle||'PAM'));});
   map.on('mouseleave','pam-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── Accès ──
-  map.addLayer({id:'acc-pt',type:'symbol',source:'acces',minzoom:12,
+  // ── Accès clusters (z8-11) + points individuels (z12+) ──
+  map.addLayer({id:'acc-cluster-fill',type:'circle',source:'acces',filter:['has','point_count'],minzoom:8,
+    paint:{'circle-radius':['step',['get','point_count'],14,10,20,50,26],
+      'circle-color':'#e65100','circle-stroke-width':2,'circle-stroke-color':'rgba(255,255,255,.6)'}});
+  map.addLayer({id:'acc-cluster-lbl',type:'symbol',source:'acces',filter:['has','point_count'],minzoom:8,
+    layout:{'text-field':['get','point_count_abbreviated'],'text-font':['Open Sans Regular'],'text-size':12},
+    paint:{'text-color':'white'}});
+  map.on('click','acc-cluster-fill',function(e){
+    var f=e.features[0];
+    map.getSource('acces').getClusterExpansionZoom(f.properties.cluster_id).then(function(z){
+      map.easeTo({center:f.geometry.coordinates,zoom:z+1});
+    });
+  });
+  map.on('mouseenter','acc-cluster-fill',function(){map.getCanvas().style.cursor='pointer';});
+  map.on('mouseleave','acc-cluster-fill',function(){map.getCanvas().style.cursor='';});
+  map.addLayer({id:'acc-pt',type:'symbol',source:'acces',filter:['!',['has','point_count']],minzoom:12,
     layout:{'text-field':'🚧','text-size':18,'text-allow-overlap':true,'text-ignore-placement':true,
       'text-offset':[0,0]},
     paint:{}});
-  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:14,
+  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',filter:['!',['has','point_count']],minzoom:14,
     layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
       'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.2],
