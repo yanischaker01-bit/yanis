@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.27';
+  var V='v3.28';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.27';
+var APP_VER = 'v3.28';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -318,49 +318,78 @@ function _addPkLabel(id,src,minz,maxz,size,offset){
     paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
 }
 
-// ── Création sources PK inline + couches (appelée quand données ET carte sont prêtes) ──
+// ── Création source PK unique + couches filtrées (MapLibre GL v4 – source inline garantie) ──
 function _setupPKLayers(d){
   var all=d.features||[];
   layerData.pk=all.map(function(f){return{props:f.properties,geom:f.geometry};});
 
-  function _pkMeters(f){
-    var props=f.properties||{};
-    var raw=props._pk_label||props.pk||props.PK||props.Name||'';
-    // Formats: "PK 123+456", "123+456", "123 456"
-    var m=String(raw).match(/(\d+)\s*[+]\s*(\d+)/);
-    if(m)return parseInt(m[1],10)*1000+parseInt(m[2],10);
-    // Format décimal: "123.456" → 123456 m
-    var asNum=parseFloat(String(raw).replace(/[^0-9.,]/g,'').replace(',','.'));
-    if(!isNaN(asNum)&&asNum>0)return Math.round(asNum*1000);
-    return -1;
+  function pkMeters(f){
+    var raw=(f.properties&&f.properties._pk_label)||'';
+    var m=String(raw).match(/(\d+)\s*\+\s*(\d+)/);
+    return m?parseInt(m[1],10)*1000+parseInt(m[2],10):-1;
   }
 
-  if(all.length) console.log('PK exemple propriétés:', JSON.stringify(all[0].properties));
+  // Calcule _pk_class pour chaque feature (filtre par couche → source unique)
+  var features=all.map(function(f){
+    var m=pkMeters(f), cls='';
+    if(m>=0&&m%50000===0)cls='50';
+    else if(m>=0&&m%10000===0)cls='10';
+    else if(m>=0&&m%1000===0)cls='1';
+    return{type:'Feature',geometry:f.geometry,properties:Object.assign({},f.properties,{_pk_class:cls})};
+  });
+  var fc={type:'FeatureCollection',features:features};
+  var n50=features.filter(function(f){return f.properties._pk_class==='50';}).length;
+  var n10=features.filter(function(f){return f.properties._pk_class==='10';}).length;
+  var n1 =features.filter(function(f){return f.properties._pk_class==='1';}).length;
+  console.log('PK v3.28: total='+all.length+' | 50km='+n50+' | 10km='+n10+' | 1km='+n1);
 
-  var f50={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%50000===0;})};
-  var f10={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%10000===0&&m%50000!==0;})};
-  var f1= {type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%1000===0&&m%10000!==0;})};
-  console.log('PK setupLayers: total='+all.length+' | 50km='+f50.features.length+' | 10km='+f10.features.length+' | 1km='+f1.features.length);
-
-  // Supprimer les couches et sources existantes avant de re-ajouter
+  // Supprimer couches et sources précédentes (y compris anciennes pk_s*)
   ['pk50-lbl','pk50-c','pk10-lbl','pk10-c','pk1-lbl','pk1-c'].forEach(function(id){
     try{if(map.getLayer(id))map.removeLayer(id);}catch(e){}
   });
-  ['pk_s50','pk_s10','pk_s1'].forEach(function(id){
+  ['pk_all','pk_s50','pk_s10','pk_s1'].forEach(function(id){
     try{if(map.getSource(id))map.removeSource(id);}catch(e){}
   });
 
-  map.addSource('pk_s50',{type:'geojson',data:f50});
-  map.addSource('pk_s10',{type:'geojson',data:f10});
-  map.addSource('pk_s1', {type:'geojson',data:f1});
-  /* minzoom:0 (mode diagnostic) – zooms normaux rétablis une fois PK visibles */
-  _addPkCircle('pk50-c','pk_s50', 0,22, 9,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 0,22, 12,-1.6);
-  _addPkCircle('pk10-c','pk_s10', 0,22, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10', 0,22, 10,-1.4);
-  _addPkCircle('pk1-c', 'pk_s1',  0,22, 4,'#333');   _addPkLabel('pk1-lbl', 'pk_s1',  0,22, 9,-1.3);
-  setVis('pk',true);
+  map.addSource('pk_all',{type:'geojson',data:fc});
+
+  // pk50 : z7→10, cercles rouges
+  map.addLayer({id:'pk50-c',type:'circle',source:'pk_all',minzoom:7,maxzoom:10,
+    filter:['==',['get','_pk_class'],'50'],
+    paint:{'circle-radius':9,'circle-color':'#cc0000','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
+  map.addLayer({id:'pk50-lbl',type:'symbol',source:'pk_all',minzoom:7,maxzoom:10,
+    filter:['==',['get','_pk_class'],'50'],
+    layout:{'text-field':['get','_pk_label'],'text-size':12,
+      'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-offset':[0,-1.6],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+    paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
+
+  // pk10 : z10→13, cercles gris foncé
+  map.addLayer({id:'pk10-c',type:'circle',source:'pk_all',minzoom:10,maxzoom:13,
+    filter:['==',['get','_pk_class'],'10'],
+    paint:{'circle-radius':6,'circle-color':'#555','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
+  map.addLayer({id:'pk10-lbl',type:'symbol',source:'pk_all',minzoom:10,maxzoom:13,
+    filter:['==',['get','_pk_class'],'10'],
+    layout:{'text-field':['get','_pk_label'],'text-size':10,
+      'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-offset':[0,-1.4],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+    paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
+
+  // pk1 : z13→15, cercles noirs fins
+  map.addLayer({id:'pk1-c',type:'circle',source:'pk_all',minzoom:13,maxzoom:15,
+    filter:['==',['get','_pk_class'],'1'],
+    paint:{'circle-radius':4,'circle-color':'#333','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
+  map.addLayer({id:'pk1-lbl',type:'symbol',source:'pk_all',minzoom:13,maxzoom:15,
+    filter:['==',['get','_pk_class'],'1'],
+    layout:{'text-field':['get','_pk_label'],'text-size':9,
+      'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-offset':[0,-1.3],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+    paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
+
+  setVis('pk',_vis.pk);
   _loading.pk=false;
   _updateLoadStatus();
-  addPKtoIndex(d);
+  addPKtoIndex({type:'FeatureCollection',features:features});
 }
 
 // ── Geometry helpers ──
@@ -512,22 +541,16 @@ if(location.protocol==='file:'){
     _restoreMapPos();
     /* Afficher état de chargement immédiatement */
     _updateLoadStatus();
-    /* Diagnostic v3.27 : vérifier sources et couches PK après 3s */
+    /* Diagnostic v3.28 : vérifier source PK et couches après 5s */
     setTimeout(function(){
-      ['pk_s50','pk_s10','pk_s1'].forEach(function(sid){
-        var src=map.getSource(sid);
-        if(src){var n=(src.serialize().data.features||[]).length;console.log('DIAG source '+sid+': '+n+' features');}
-        else console.error('DIAG source manquante: '+sid);
+      var src=map.getSource('pk_all');
+      if(src){console.log('DIAG pk_all: '+(src.serialize().data.features||[]).length+' features');}
+      else console.error('DIAG: pk_all source manquante – _setupPKLayers non appelé ?');
+      ['pk50-c','pk10-c','pk1-c','pam-dot','acc-dot'].forEach(function(lid){
+        if(map.getLayer(lid))console.log('DIAG '+lid+': '+map.getLayoutProperty(lid,'visibility'));
+        else console.warn('DIAG '+lid+': couche absente (données en cours de chargement ?)');
       });
-      ['pk50-c','pk10-c','pk1-c'].forEach(function(lid){
-        if(map.getLayer(lid))console.log('DIAG layer '+lid+': vis='+map.getLayoutProperty(lid,'visibility'));
-        else console.error('DIAG layer manquant: '+lid);
-      });
-      var pamSrc=map.getSource('pam');
-      if(pamSrc)console.log('DIAG pam features: '+(pamSrc.serialize().data.features||[]).length);
-      var accSrc=map.getSource('acces');
-      if(accSrc)console.log('DIAG acces features: '+(accSrc.serialize().data.features||[]).length);
-    },3000);
+    },5000);
   });
 }
 
@@ -603,16 +626,13 @@ function _initVectorLayers(){
   });
 
   // ── GeoJSON sources (données ponctuelles/lignes) ──
-  // Source non-vide pour garantir le rendu MapLibre GL v4 (setData sur source vide ne rend pas)
-  var _primeFC={type:'FeatureCollection',features:[{type:'Feature',geometry:{type:'Point',coordinates:[100,100]},properties:{}}]};
+  // rail/oa_poly/oh/oa/pk_hecto : setData fonctionne car pas de rendu initial (layers ajoutés après)
+  // pk_all/pam/acces : source créée lazily avec données inline (_setupPKLayers / _loadAllData)
   map.addSource('rail',{type:'geojson',data:emptyFC()});
   map.addSource('oa_poly',{type:'geojson',data:emptyFC()});
   map.addSource('oh',{type:'geojson',data:emptyFC()});
   map.addSource('oa',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
-  // pk_s50 / pk_s10 / pk_s1 créées dans _setupPKLayers (source inline, obligatoire pour MapLibre GL v4)
-  map.addSource('pk_hecto',{type:'geojson',data:_primeFC});
-  map.addSource('pam',{type:'geojson',data:_primeFC});
-  map.addSource('acces',{type:'geojson',data:_primeFC});
+  map.addSource('pk_hecto',{type:'geojson',data:emptyFC()});
 
   // ── OA Emprises (polygones avec labels permanents) ──
   map.addLayer({id:'oapoly-fill',type:'fill',source:'oa_poly',minzoom:13,
@@ -699,47 +719,7 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🏗 '+c(e.features[0].properties.LIBELLE_LO||e.features[0].properties.CODE_OBJET||'OA'));});
   map.on('mouseleave','oa-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── PAM : cercles violets (z12+, labels z14+) ──
-  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:12,
-    paint:{
-      'circle-radius':['interpolate',['linear'],['zoom'],12,3,15,6,18,10],
-      'circle-color':'#9c27b0',
-      'circle-stroke-width':1.5,
-      'circle-stroke-color':'rgba(255,255,255,0.85)',
-      'circle-opacity':0.9
-    }});
-  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:0,
-    layout:{'text-field':['get','libelle'],'text-size':11,
-      'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-anchor':'top','text-offset':[0,1.1],
-      'text-allow-overlap':true,'text-ignore-placement':true},
-    paint:{'text-color':'#4a148c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
-  map.on('click','pam-dot',function(e){if(e.features.length)openDetailPAM(e.features[0].properties);});
-  map.on('mouseenter','pam-dot',function(e){map.getCanvas().style.cursor='pointer';
-    showHover(e.lngLat,'🌱 '+c(e.features[0].properties.libelle||'PAM'));});
-  map.on('mouseleave','pam-dot',function(){map.getCanvas().style.cursor='';hideHover();});
-
-  // ── Accès : cercles orange (z12+, labels z14+) ──
-  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:12,
-    paint:{
-      'circle-radius':['interpolate',['linear'],['zoom'],12,2,15,5,18,9],
-      'circle-color':'#e65100',
-      'circle-stroke-width':1.5,
-      'circle-stroke-color':'rgba(255,255,255,0.85)',
-      'circle-opacity':0.9
-    }});
-  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:0,
-    layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
-      'text-size':11,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-anchor':'top','text-offset':[0,1.1],
-      'text-allow-overlap':true,'text-ignore-placement':true},
-    paint:{'text-color':'#bf360c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
-  map.on('click','acc-dot',function(e){
-    if(e.features.length)openDetailAcces(e.features[0].properties);
-  });
-  map.on('mouseenter','acc-dot',function(e){map.getCanvas().style.cursor='pointer';
-    showHover(e.lngLat,'🚧 '+c(e.features[0].properties.NOM_ACCES||e.features[0].properties.Name||'Accès'));});
-  map.on('mouseleave','acc-dot',function(){map.getCanvas().style.cursor='';hideHover();});
+  // ── PAM + Accès : initialisées lazily dans _loadAllData (source inline garantie MapLibre GL v4) ──
 
   // Fermer le détail sur clic vide
   map.on('click',function(e){
@@ -803,11 +783,26 @@ function _loadAllData(){
 
   // PK : chargement géré par _setupPKLayers (pré-fetch parallèle avant map init)
 
-  // Accès
+  // Accès – source créée inline (MapLibre GL v4 : pas de setData sur source vide)
   loadJSON('acces').then(function(d){
-    map.getSource('acces').setData(d);
     var cnt=(d.features||[]).length;
     layerData.acces=(d.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
+    map.addSource('acces',{type:'geojson',data:d});
+    map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:12,
+      paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,2,15,5,18,9],
+        'circle-color':'#e65100','circle-stroke-width':1.5,
+        'circle-stroke-color':'rgba(255,255,255,0.85)','circle-opacity':0.9}});
+    map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:14,
+      layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
+        'text-size':11,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+        'text-anchor':'top','text-offset':[0,1.1],
+        'text-allow-overlap':true,'text-ignore-placement':true},
+      paint:{'text-color':'#bf360c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
+    map.on('click','acc-dot',function(e){if(e.features.length)openDetailAcces(e.features[0].properties);});
+    map.on('mouseenter','acc-dot',function(e){map.getCanvas().style.cursor='pointer';
+      showHover(e.lngLat,'🚧 '+c(e.features[0].properties.NOM_ACCES||e.features[0].properties.Name||'Accès'));});
+    map.on('mouseleave','acc-dot',function(){map.getCanvas().style.cursor='';hideHover();});
+    setVis('acces',_vis.acces);
     _loading.acces=false;
     _updateLpCount('acces',cnt);
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
@@ -844,11 +839,26 @@ function _loadAllData(){
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
   }).catch(function(){_loading.oh=false;_updateLoadStatus();});
 
-  // PAM
+  // PAM – source créée inline (MapLibre GL v4 : pas de setData sur source vide)
   loadJSON('pam').then(function(d){
-    map.getSource('pam').setData(d);
     var cnt=(d.features||[]).length;
     layerData.pam=(d.features||[]).map(function(f){return{props:_stripB64(f.properties),geom:f.geometry};});
+    map.addSource('pam',{type:'geojson',data:d});
+    map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:12,
+      paint:{'circle-radius':['interpolate',['linear'],['zoom'],12,3,15,6,18,10],
+        'circle-color':'#9c27b0','circle-stroke-width':1.5,
+        'circle-stroke-color':'rgba(255,255,255,0.85)','circle-opacity':0.9}});
+    map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:14,
+      layout:{'text-field':['get','libelle'],'text-size':11,
+        'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+        'text-anchor':'top','text-offset':[0,1.1],
+        'text-allow-overlap':true,'text-ignore-placement':true},
+      paint:{'text-color':'#4a148c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
+    map.on('click','pam-dot',function(e){if(e.features.length)openDetailPAM(e.features[0].properties);});
+    map.on('mouseenter','pam-dot',function(e){map.getCanvas().style.cursor='pointer';
+      showHover(e.lngLat,'🌱 '+c(e.features[0].properties.libelle||'PAM'));});
+    map.on('mouseleave','pam-dot',function(){map.getCanvas().style.cursor='';hideHover();});
+    setVis('pam',_vis.pam);
     _loading.pam=false;
     _updateLpCount('pam',cnt);
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
