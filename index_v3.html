@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.28';
+  var V='v3.29';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.28';
+var APP_VER = 'v3.29';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -341,10 +341,10 @@ function _setupPKLayers(d){
   var n50=features.filter(function(f){return f.properties._pk_class==='50';}).length;
   var n10=features.filter(function(f){return f.properties._pk_class==='10';}).length;
   var n1 =features.filter(function(f){return f.properties._pk_class==='1';}).length;
-  console.log('PK v3.28: total='+all.length+' | 50km='+n50+' | 10km='+n10+' | 1km='+n1);
+  console.log('PK v3.29: total='+all.length+' | 50km='+n50+' | 10km='+n10+' | 1km='+n1);
 
-  // Supprimer couches et sources précédentes (y compris anciennes pk_s*)
-  ['pk50-lbl','pk50-c','pk10-lbl','pk10-c','pk1-lbl','pk1-c'].forEach(function(id){
+  // Supprimer couches et sources précédentes (y compris anciennes pk_s* et pk-debug)
+  ['pk-debug','pk50-lbl','pk50-c','pk10-lbl','pk10-c','pk1-lbl','pk1-c'].forEach(function(id){
     try{if(map.getLayer(id))map.removeLayer(id);}catch(e){}
   });
   ['pk_all','pk_s50','pk_s10','pk_s1'].forEach(function(id){
@@ -353,12 +353,16 @@ function _setupPKLayers(d){
 
   map.addSource('pk_all',{type:'geojson',data:fc});
 
-  // pk50 : z7→10, cercles rouges
+  // DEBUG : toutes les features sans filtre, orange, zoom 0→22 (à supprimer après validation)
+  map.addLayer({id:'pk-debug',type:'circle',source:'pk_all',
+    paint:{'circle-radius':5,'circle-color':'#ff6600','circle-stroke-width':1,'circle-stroke-color':'white','circle-opacity':0.7}});
+
+  // pk50 : z7→10, cercles rouges – filtre legacy (clé bare string, compatible MapLibre GL v4)
   map.addLayer({id:'pk50-c',type:'circle',source:'pk_all',minzoom:7,maxzoom:10,
-    filter:['==',['get','_pk_class'],'50'],
+    filter:['==','_pk_class','50'],
     paint:{'circle-radius':9,'circle-color':'#cc0000','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
   map.addLayer({id:'pk50-lbl',type:'symbol',source:'pk_all',minzoom:7,maxzoom:10,
-    filter:['==',['get','_pk_class'],'50'],
+    filter:['==','_pk_class','50'],
     layout:{'text-field':['get','_pk_label'],'text-size':12,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-offset':[0,-1.6],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
@@ -366,10 +370,10 @@ function _setupPKLayers(d){
 
   // pk10 : z10→13, cercles gris foncé
   map.addLayer({id:'pk10-c',type:'circle',source:'pk_all',minzoom:10,maxzoom:13,
-    filter:['==',['get','_pk_class'],'10'],
+    filter:['==','_pk_class','10'],
     paint:{'circle-radius':6,'circle-color':'#555','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
   map.addLayer({id:'pk10-lbl',type:'symbol',source:'pk_all',minzoom:10,maxzoom:13,
-    filter:['==',['get','_pk_class'],'10'],
+    filter:['==','_pk_class','10'],
     layout:{'text-field':['get','_pk_label'],'text-size':10,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-offset':[0,-1.4],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
@@ -377,10 +381,10 @@ function _setupPKLayers(d){
 
   // pk1 : z13→15, cercles noirs fins
   map.addLayer({id:'pk1-c',type:'circle',source:'pk_all',minzoom:13,maxzoom:15,
-    filter:['==',['get','_pk_class'],'1'],
+    filter:['==','_pk_class','1'],
     paint:{'circle-radius':4,'circle-color':'#333','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
   map.addLayer({id:'pk1-lbl',type:'symbol',source:'pk_all',minzoom:13,maxzoom:15,
-    filter:['==',['get','_pk_class'],'1'],
+    filter:['==','_pk_class','1'],
     layout:{'text-field':['get','_pk_label'],'text-size':9,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-offset':[0,-1.3],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
@@ -541,15 +545,22 @@ if(location.protocol==='file:'){
     _restoreMapPos();
     /* Afficher état de chargement immédiatement */
     _updateLoadStatus();
-    /* Diagnostic v3.28 : vérifier source PK et couches après 5s */
+    /* Diagnostic v3.29 : vérifier source PK, couches et rendu après 5s */
     setTimeout(function(){
       var src=map.getSource('pk_all');
-      if(src){console.log('DIAG pk_all: '+(src.serialize().data.features||[]).length+' features');}
-      else console.error('DIAG: pk_all source manquante – _setupPKLayers non appelé ?');
-      ['pk50-c','pk10-c','pk1-c','pam-dot','acc-dot'].forEach(function(lid){
-        if(map.getLayer(lid))console.log('DIAG '+lid+': '+map.getLayoutProperty(lid,'visibility'));
-        else console.warn('DIAG '+lid+': couche absente (données en cours de chargement ?)');
+      if(src){
+        var feats=src.serialize().data.features||[];
+        var cls={};feats.forEach(function(f){var k=f.properties._pk_class||'vide';cls[k]=(cls[k]||0)+1;});
+        console.log('DIAG pk_all: '+feats.length+' features classes='+JSON.stringify(cls));
+      } else console.error('DIAG: pk_all source manquante');
+      ['pk-debug','pk50-c','pk10-c','pk1-c','pam-dot','acc-dot'].forEach(function(lid){
+        if(map.getLayer(lid)){
+          var vis=map.getLayoutProperty(lid,'visibility');
+          var rendered=map.queryRenderedFeatures(undefined,{layers:[lid]}).length;
+          console.log('DIAG '+lid+': vis='+vis+' rendered='+rendered);
+        } else console.warn('DIAG '+lid+': couche absente');
       });
+      console.log('DIAG zoom:',map.getZoom().toFixed(1));
     },5000);
   });
 }
