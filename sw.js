@@ -1,11 +1,9 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v18';
+const CACHE = 'lgv-sea-v19';
 const TILE_CACHE = 'lgv-tiles-v1';
 
+/* Ne jamais pré-cacher le HTML : il doit toujours venir du réseau */
 const PRECACHE = [
-  './',
-  './index_v3.html',
-  './sw.js',
   './manifest.json',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -25,7 +23,6 @@ const PRECACHE = [
   './data/oa_poly.pmtiles',
 ];
 
-/* Réception du message SKIP_WAITING depuis la page → activation immédiate */
 self.addEventListener('message', e => {
   if (e.data && e.data.type === 'SKIP_WAITING') self.skipWaiting();
 });
@@ -34,7 +31,6 @@ self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE)
       .then(function(c) {
-        /* addAll() échoue si un fichier manque — précache individuellement */
         return Promise.all(
           PRECACHE.map(function(url) {
             return c.add(url).catch(function() {
@@ -60,8 +56,8 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = e.request.url;
 
-  /* reset.html → jamais mis en cache, toujours réseau */
-  if (url.includes('reset.html')) return;
+  /* Navigation HTML → jamais interceptée, toujours réseau direct */
+  if (e.request.mode === 'navigate') return;
 
   /* Tuiles OSM/Esri/IGN → réseau d'abord, cache en fallback */
   if (/openstreetmap\.org|arcgisonline\.com|geoportail/.test(url)) {
@@ -70,20 +66,6 @@ self.addEventListener('fetch', e => {
         .then(r => {
           const clone = r.clone();
           caches.open(TILE_CACHE).then(c => c.put(e.request, clone));
-          return r;
-        })
-        .catch(() => caches.match(e.request))
-    );
-    return;
-  }
-
-  /* Navigation (index*.html) → réseau d'abord pour toujours avoir la version fraîche */
-  if (e.request.mode === 'navigate') {
-    e.respondWith(
-      fetch(e.request, {cache: 'no-cache'})
-        .then(r => {
-          const clone = r.clone();
-          caches.open(CACHE).then(c => c.put(e.request, clone));
           return r;
         })
         .catch(() => caches.match(e.request))
