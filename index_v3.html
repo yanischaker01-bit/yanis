@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.7';
+  var V='v3.8';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.7';
+var APP_VER = 'v3.8';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -408,12 +408,12 @@ function hideHover(){_hoverPopup.remove();}
 
 // ── Data loading ──
 function loadJSON(name){
-  return fetch('data/'+name+'.geojson')
+  return fetch('data/'+name+'.geojson?_v='+APP_VER)
     .then(function(r){if(!r.ok)throw new Error(name+' HTTP '+r.status);return r.json();})
     .catch(function(e){console.warn('Couche '+name+':',e);return emptyFC();});
 }
 function loadJSONAutoEnc(name){
-  return fetch('data/'+name+'.geojson')
+  return fetch('data/'+name+'.geojson?_v='+APP_VER)
     .then(function(r){if(!r.ok)throw new Error(name+' HTTP '+r.status);return r.arrayBuffer();})
     .then(function(buf){
       try{return JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(buf));}
@@ -445,8 +445,8 @@ if(location.protocol==='file:'){
 // COUCHES VECTORIELLES (PMTiles + GeoJSON)
 // ══════════════════════════════════════════════════════════
 function _initVectorLayers(){
-  // ── PMTiles source (bois uniquement – trop lourd en GeoJSON) ──
-  map.addSource('bois',{type:'vector',url:'pmtiles://data/bois.pmtiles'});
+  // ── Boisements source (GeoJSON) ──
+  map.addSource('bois',{type:'geojson',data:emptyFC()});
   // ── GeoJSON sources (polygones légers chargés dans _loadAllData) ──
   map.addSource('n2',{type:'geojson',data:emptyFC()});
   map.addSource('old',{type:'geojson',data:emptyFC()});
@@ -454,11 +454,11 @@ function _initVectorLayers(){
   map.addSource('eco',{type:'geojson',data:emptyFC()});
 
   // ── Boisements ──
-  map.addLayer({id:'bois-fill',type:'fill',source:'bois','source-layer':'bois',minzoom:8,
+  map.addLayer({id:'bois-fill',type:'fill',source:'bois',minzoom:8,
     paint:{'fill-color':['match',['upcase',['coalesce',['get','TYPE_OBJET'],'']],
       'RIPISYLVE','#1b5e20','BOIS','#388e3c','HAIE','#558b2f','#33691e'],
       'fill-opacity':0.5}});
-  map.addLayer({id:'bois-outline',type:'line',source:'bois','source-layer':'bois',minzoom:8,
+  map.addLayer({id:'bois-outline',type:'line',source:'bois',minzoom:8,
     paint:{'line-color':'#FFEB3B','line-width':1.5,'line-dasharray':[4,2]}});
 
   // ── Natura 2000 ──
@@ -713,17 +713,9 @@ function _initVectorLayers(){
 // CHARGEMENT DONNÉES
 // ══════════════════════════════════════════════════════════
 function _loadAllData(){
-  // Rail (priorité maximale)
+  // Rail
   loadJSON('rail').then(function(d){
     map.getSource('rail').setData(d);
-    try{var b=new maplibregl.LngLatBounds();
-      (d.features||[]).forEach(function(f){
-        if(f.geometry&&f.geometry.coordinates)f.geometry.coordinates.forEach(function(c2){
-          if(Array.isArray(c2[0]))c2.forEach(function(p){b.extend(p);});
-          else b.extend(c2);
-        });
-      });
-      if(!b.isEmpty())map.fitBounds(b,{padding:40});}catch(e){}
   });
 
   // OA poly
@@ -798,6 +790,9 @@ function _loadAllData(){
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
   }).catch(function(){_loading.pam=false;_updateLoadStatus();});
 
+  // Boisements (GeoJSON)
+  loadJSONAutoEnc('bois').then(function(d){map.getSource('bois').setData(d);});
+
   // N2000, OLD, MC, Écopâturage (GeoJSON – légers)
   loadJSONAutoEnc('n2').then(function(d){map.getSource('n2').setData(d);});
   loadJSON('old').then(function(d){map.getSource('old').setData(d);});
@@ -843,8 +838,8 @@ function _initLayersPanel(){
     {key:'eco',   label:'Écopâturage',        color:'#81c784',type:'fill',minZoom:8},
     {key:'oh',    label:'OH Hydrauliques',    color:'#ff8c00',type:'line',minZoom:14,lpId:'lp-oh'},
     {key:'bois',  label:'Boisements',         color:'#388e3c',type:'fill',minZoom:8},
-    {key:'acces', label:'Accès',              emoji:'🚧',     minZoom:12},
-    {key:'pam',   label:'PAM',                emoji:'🌱',     minZoom:13, lpId:'lp-pam'},
+    {key:'acces', label:'Accès',              emoji:'🚧',     minZoom:8},
+    {key:'pam',   label:'PAM',                emoji:'🌱',     minZoom:8, lpId:'lp-pam'},
   ];
   var html=bmHtml+toolbar;
   defs.forEach(function(d){
@@ -948,64 +943,100 @@ function _nearestOf(lat,lng,features){
 function _dStr(m){return m<1000?Math.round(m)+' m':(m/1000).toFixed(2)+' km';}
 function findNearest(){
   if(!navigator.geolocation){alert('Géolocalisation non disponible.');return;}
+  openDetail('📍 Éléments LGV proches',
+    '<div style="padding:20px;text-align:center;color:#888"><p style="font-size:14px;margin:0">⏳ Localisation…</p><p style="font-size:10px;margin-top:6px">Zoom z18 pour précision PK 1m</p></div>');
   navigator.geolocation.getCurrentPosition(function(pos){
     var lat=pos.coords.latitude,lng=pos.coords.longitude,acc=pos.coords.accuracy;
-    map.flyTo({center:[lng,lat],zoom:Math.max(map.getZoom(),14)});
-
-    /* Précision 100m avec pk_hecto si chargé, sinon 1km */
-    var _pkPool=(_pkHData&&_pkHData.features&&_pkHData.features.length)?
-      _pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}):layerData.pk;
-    var npk=_nearestOf(lat,lng,_pkPool);
-    var nacc=_nearestOf(lat,lng,layerData.acces);
-    var npam=_nearestOf(lat,lng,layerData.pam);
-
-    function zoomBtn(coords,z,label){
-      var co=JSON.stringify(coords);
-      return '<button onclick="map.flyTo({center:'+co+',zoom:'+z+'});closeDetail()" '+
-        'style="font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;margin-top:4px">'+label+'</button>';
+    /* Zoom z18 pour charger les tuiles pk_metric (1m) */
+    map.flyTo({center:[lng,lat],zoom:Math.max(map.getZoom(),18),duration:800});
+    var done=false;
+    function onReady(){
+      if(done)return; done=true;
+      map.off('idle',onReady);
+      _finishFindNearest(lat,lng,acc);
     }
-
-    var html='<div style="padding:12px;display:flex;flex-direction:column;gap:10px">';
-    html+='<p style="font-size:11px;color:#888;margin:0">📍 Précision GPS : '+Math.round(acc)+' m</p>';
-
-    if(npk){
-      var p=npk.f.props,co=npk.f.geom.coordinates;
-      html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
-      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
-      html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+c(p._pk_label||p.Name||'')+'</div>';
-      html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+'</div>';
-      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
-      html+=zoomBtn(co,17,'→ Zoom sur ce PK');
-      html+='</div>';
-    } else {html+='<div style="padding:8px;color:#aaa">PK : données non chargées</div>';}
-
-    if(nacc){
-      var p=nacc.f.props,co=nacc.f.geom.coordinates;
-      html+='<div style="padding:10px;background:#fff8e1;border-radius:8px;border-left:4px solid #e65100">';
-      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">Accès le plus proche</div>';
-      html+='<div style="font-size:15px;font-weight:700;color:#e65100">🚧 '+c(p.NOM_ACCES||p.Name||'Accès')+'</div>';
-      if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
-      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
-      html+=zoomBtn(co,16,'→ Zoom sur cet accès');
-      html+='</div>';
-    } else {html+='<div style="padding:8px;color:#aaa">Accès : données non chargées</div>';}
-
-    if(npam){
-      var p=npam.f.props,co=npam.f.geom.coordinates;
-      html+='<div style="padding:10px;background:#f3e5f5;border-radius:8px;border-left:4px solid #9c27b0">';
-      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PAM la plus proche</div>';
-      html+='<div style="font-size:15px;font-weight:700;color:#9c27b0">🌱 '+c(p.libelle||'PAM')+'</div>';
-      if(p.axe)html+='<div style="font-size:12px;color:#555">Axe : '+c(p.axe)+'</div>';
-      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npam.d)+'</div>';
-      html+=zoomBtn(co,16,'→ Zoom sur cette PAM');
-      html+='</div>';
-    } else {html+='<div style="padding:8px;color:#aaa">PAM : données non chargées</div>';}
-
-    html+='</div>';
-    openDetail('📍 Éléments LGV proches',html);
-  },function(e){alert('Localisation impossible : '+e.message);},{enableHighAccuracy:true,timeout:10000});
+    map.on('idle',onReady);
+    /* Fallback si idle ne se déclenche pas dans 4s */
+    setTimeout(function(){if(!done){done=true;map.off('idle',onReady);_finishFindNearest(lat,lng,acc);}},4000);
+  },function(e){closeDetail();alert('Localisation impossible : '+e.message);},{enableHighAccuracy:true,timeout:10000});
 }
 window.findNearest=findNearest;
+
+function _finishFindNearest(lat,lng,acc){
+  /* PK 1m : queryRenderedFeatures sur pkm-c (pk_metric PMTiles, z18) */
+  var npk=null, pkPrec='100m';
+  try{
+    var pkWasOff=(map.getLayoutProperty('pkm-c','visibility')==='none');
+    if(pkWasOff)map.setLayoutProperty('pkm-c','visibility','visible');
+    var sp=map.project([lng,lat]);
+    var pkmF=map.queryRenderedFeatures(
+      [{x:sp.x-120,y:sp.y-120},{x:sp.x+120,y:sp.y+120}],
+      {layers:['pkm-c']});
+    if(pkWasOff)map.setLayoutProperty('pkm-c','visibility','none');
+    if(pkmF.length){
+      var bD=Infinity;
+      pkmF.forEach(function(f){
+        if(!f.geometry||f.geometry.type!=='Point')return;
+        var d=_haversine(lat,lng,f.geometry.coordinates[1],f.geometry.coordinates[0]);
+        if(d<bD){bD=d;npk={f:{props:f.properties,geom:f.geometry},d:d};}
+      });
+      if(npk)pkPrec='1m';
+    }
+  }catch(e){}
+  /* Fallback pk_hecto (100m) puis pk (1km) */
+  if(!npk){
+    var _pkPool=(_pkHData&&_pkHData.features&&_pkHData.features.length)?
+      _pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}):layerData.pk;
+    npk=_nearestOf(lat,lng,_pkPool);
+  }
+  var nacc=_nearestOf(lat,lng,layerData.acces);
+  var npam=_nearestOf(lat,lng,layerData.pam);
+
+  function zoomBtn(coords,z,label){
+    var co=JSON.stringify(coords);
+    return '<button onclick="map.flyTo({center:'+co+',zoom:'+z+'});closeDetail()" '+
+      'style="font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;margin-top:4px">'+label+'</button>';
+  }
+  var html='<div style="padding:12px;display:flex;flex-direction:column;gap:10px">';
+  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+'</p>';
+
+  if(npk){
+    var p=npk.f.props,co=npk.f.geom.coordinates;
+    var lbl=c(p._pk_label||(p.pk?'PK '+c(p.pk):'')||p.Name||'');
+    html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
+    html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
+    html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+lbl+'</div>';
+    html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+'</div>';
+    html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
+    html+=zoomBtn(co,18,'→ Zoom sur ce PK');
+    html+='</div>';
+  }else{html+='<div style="padding:8px;color:#aaa">PK : données non chargées</div>';}
+
+  if(nacc){
+    var p=nacc.f.props,co=nacc.f.geom.coordinates;
+    html+='<div style="padding:10px;background:#fff8e1;border-radius:8px;border-left:4px solid #e65100">';
+    html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">Accès le plus proche</div>';
+    html+='<div style="font-size:15px;font-weight:700;color:#e65100">🚧 '+c(p.NOM_ACCES||p.Name||'Accès')+'</div>';
+    if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
+    html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
+    html+=zoomBtn(co,16,'→ Zoom sur cet accès');
+    html+='</div>';
+  }else{html+='<div style="padding:8px;color:#aaa">Accès : données non chargées</div>';}
+
+  if(npam){
+    var p=npam.f.props,co=npam.f.geom.coordinates;
+    html+='<div style="padding:10px;background:#f3e5f5;border-radius:8px;border-left:4px solid #9c27b0">';
+    html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PAM la plus proche</div>';
+    html+='<div style="font-size:15px;font-weight:700;color:#9c27b0">🌱 '+c(p.libelle||'PAM')+'</div>';
+    if(p.axe)html+='<div style="font-size:12px;color:#555">Axe : '+c(p.axe)+'</div>';
+    html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npam.d)+'</div>';
+    html+=zoomBtn(co,16,'→ Zoom sur cette PAM');
+    html+='</div>';
+  }else{html+='<div style="padding:8px;color:#aaa">PAM : données non chargées</div>';}
+
+  html+='</div>';
+  openDetail('📍 Éléments LGV proches',html);
+}
 
 // ══════════════════════════════════════════════════════════
 // RECHERCHE
