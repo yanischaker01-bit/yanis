@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.15';
+  var V='v3.16';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.15';
+var APP_VER = 'v3.16';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -736,13 +736,13 @@ function _loadAllData(){
   loadJSON('pk').then(function(d){
     var all=d.features||[];
     layerData.pk=all.map(function(f){return{props:f.properties,geom:f.geometry};});
-    function _extractKm(f){
+    function _pkMeters(f){
       var lbl=(f.properties&&f.properties._pk_label)||'';
-      var p=lbl.indexOf('+');
-      return (p>3)?parseInt(lbl.slice(3,p),10):-1;
+      var m=lbl.match(/PK\s*(\d+)\+(\d+)/);
+      return m?parseInt(m[1],10)*1000+parseInt(m[2],10):-1;
     }
-    var f50={type:'FeatureCollection',features:all.filter(function(f){var k=_extractKm(f);return k>=0&&k%50===0;})};
-    var f10={type:'FeatureCollection',features:all.filter(function(f){var k=_extractKm(f);return k>=0&&k%10===0;})};
+    var f50={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%50000===0;})};
+    var f10={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%10000===0;})};
     map.getSource('pk_s50').setData(f50);
     map.getSource('pk_s10').setData(f10);
     map.getSource('pk_s1').setData(d);
