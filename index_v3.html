@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.30';
+  var V='v3.31';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.30';
+var APP_VER = 'v3.31';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -683,12 +683,18 @@ function _initVectorLayers(){
   // ── PK métriques (1 m via PMTiles, zoom max) – try/catch pour éviter cascade d'erreurs ──
   try{
     map.addSource('pk_metric',{type:'vector',url:'pmtiles://data/pk_metric.pmtiles'});
-    map.addLayer({id:'pkm-c',type:'circle',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
+    map.addLayer({id:'pkm-c',type:'circle',source:'pk_metric','source-layer':'pk_metric',minzoom:17,
       paint:{'circle-radius':1.8,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#777'}});
-    map.addLayer({id:'pkm-lbl',type:'symbol',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
-      layout:{'text-field':['coalesce',['get','_pk_label'],['get','pk'],''],
+    map.addLayer({id:'pkm-lbl',type:'symbol',source:'pk_metric','source-layer':'pk_metric',minzoom:17,
+      layout:{'text-field':['let','v',['to-number',['coalesce',['get','_pk_label'],['get','pk'],0],0],
+        ['case',['>=',['var','v'],1000],
+          ['concat','PK ',['to-string',['floor',['/',['var','v'],1000]]],'+',
+            ['case',['<',['%',['var','v'],1000],10],['concat','00',['to-string',['floor',['%',['var','v'],1000]]]],
+              ['<',['%',['var','v'],1000],100],['concat','0',['to-string',['floor',['%',['var','v'],1000]]]],
+              ['to-string',['floor',['%',['var','v'],1000]]]]],
+          ['concat','PK ',['to-string',['var','v']],'+000']]],
         'text-size':7.5,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-        'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
+        'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':true,'text-ignore-placement':true},
       paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1}});
   }catch(e){console.warn('pkm layers skipped:',e);}
 
@@ -1164,7 +1170,15 @@ function _finishFindNearest(lat,lng,acc){
 
   if(npk){
     var p=npk.f.props,co=npk.f.geom.coordinates;
-    var lbl=c(p._pk_label||(p.pk?'PK '+c(p.pk):'')||p.Name||'');
+    var rawLbl=p._pk_label!=null?p._pk_label:(p.pk!=null?p.pk:null);
+    var lbl;
+    if(rawLbl!==null&&rawLbl!==undefined&&rawLbl!==''){
+      var numV=parseFloat(rawLbl);
+      if(!isNaN(numV)&&String(rawLbl).indexOf('+')===-1){
+        if(numV>=1000){var km=Math.floor(numV/1000),m=Math.round(numV%1000);lbl='PK '+km+'+'+('000'+m).slice(-3);}
+        else{lbl='PK '+Math.round(numV)+'+000';}
+      }else{lbl=c(rawLbl);}
+    }else{lbl=c(p.Name||'?');}
     html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
     html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
     html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+lbl+'</div>';
