@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.24';
+  var V='v3.25';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.24';
+var APP_VER = 'v3.25';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -662,17 +662,17 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🏗 '+c(e.features[0].properties.LIBELLE_LO||e.features[0].properties.CODE_OBJET||'OA'));});
   map.on('mouseleave','oa-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── PAM : cercles violets (z8+, labels z11+) ──
-  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:8,
+  // ── PAM : cercles violets (z12+, labels z14+) ──
+  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:12,
     paint:{
-      'circle-radius':['interpolate',['linear'],['zoom'],8,2,15,6,18,10],
+      'circle-radius':['interpolate',['linear'],['zoom'],12,3,15,6,18,10],
       'circle-color':'#9c27b0',
       'circle-stroke-width':1.5,
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:11,
-    layout:{'text-field':['get','libelle'],'text-size':10,
+  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:14,
+    layout:{'text-field':['get','libelle'],'text-size':11,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
       'text-allow-overlap':false,'text-ignore-placement':false},
@@ -682,18 +682,18 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🌱 '+c(e.features[0].properties.libelle||'PAM'));});
   map.on('mouseleave','pam-dot',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── Accès : cercles orange (z8+, labels z11+) ──
-  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:8,
+  // ── Accès : cercles orange (z12+, labels z14+) ──
+  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:12,
     paint:{
-      'circle-radius':['interpolate',['linear'],['zoom'],8,2,15,5,18,9],
+      'circle-radius':['interpolate',['linear'],['zoom'],12,2,15,5,18,9],
       'circle-color':'#e65100',
       'circle-stroke-width':1.5,
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:11,
+  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:14,
     layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
-      'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-size':11,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
       'text-allow-overlap':false,'text-ignore-placement':false},
     paint:{'text-color':'#bf360c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
@@ -967,7 +967,8 @@ function _restoreMapPos(){
 function locateMe(){
   navigator.geolocation.getCurrentPosition(function(pos){
     var lng=pos.coords.longitude,lat=pos.coords.latitude,acc=pos.coords.accuracy;
-    map.flyTo({center:[lng,lat],zoom:16});
+    /* Zoom 18 pour charger pk_metric (1m) et afficher le PK le plus proche */
+    map.flyTo({center:[lng,lat],zoom:18,duration:800});
     if(map.getSource('_loc')){
       map.getSource('_loc').setData({type:'Feature',geometry:{type:'Point',coordinates:[lng,lat]},properties:{}});
     } else {
@@ -976,8 +977,11 @@ function locateMe(){
         'circle-radius':10,'circle-color':'#0078d4','circle-opacity':0.4,
         'circle-stroke-width':3,'circle-stroke-color':'#0078d4'}});
     }
-    new maplibregl.Popup().setLngLat([lng,lat])
-      .setHTML('<b>Votre position</b><br>Précision : '+Math.round(acc)+' m').addTo(map);
+    /* Attendre chargement des tuiles puis afficher le PK le plus proche */
+    var done=false;
+    function onIdle(){if(done)return;done=true;map.off('idle',onIdle);_finishFindNearest(lat,lng,acc);}
+    map.on('idle',onIdle);
+    setTimeout(function(){if(!done){done=true;map.off('idle',onIdle);_finishFindNearest(lat,lng,acc);}},4000);
   },function(e){alert('Localisation impossible : '+e.message);},{enableHighAccuracy:true,timeout:10000});
 }
 window.locateMe=locateMe;
@@ -1023,16 +1027,10 @@ function findNearest(){
 window.findNearest=findNearest;
 
 function _finishFindNearest(lat,lng,acc){
-  /* PK 1m : queryRenderedFeatures sur pkm-c (pk_metric PMTiles, z18) */
-  var npk=null, pkPrec='100m';
+  /* PK 1m : querySourceFeatures sur pk_metric (interroge toutes les tuiles chargées, pas seulement visibles) */
+  var npk=null, pkPrec='1km';
   try{
-    var pkWasOff=(map.getLayoutProperty('pkm-c','visibility')==='none');
-    if(pkWasOff)map.setLayoutProperty('pkm-c','visibility','visible');
-    var sp=map.project([lng,lat]);
-    var pkmF=map.queryRenderedFeatures(
-      [{x:sp.x-120,y:sp.y-120},{x:sp.x+120,y:sp.y+120}],
-      {layers:['pkm-c']});
-    if(pkWasOff)map.setLayoutProperty('pkm-c','visibility','none');
+    var pkmF=map.querySourceFeatures('pk_metric',{sourceLayer:'pk_metric'});
     if(pkmF.length){
       var bD=Infinity;
       pkmF.forEach(function(f){
@@ -1043,7 +1041,7 @@ function _finishFindNearest(lat,lng,acc){
       if(npk)pkPrec='1m';
     }
   }catch(e){}
-  /* Fallback pk_hecto (100m) puis pk (1km) */
+  /* Fallback pk_hecto (100m) puis pk (1km) si pk_metric non disponible */
   if(!npk){
     if(_pkHData&&_pkHData.features&&_pkHData.features.length){
       npk=_nearestOf(lat,lng,_pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}));
@@ -1051,7 +1049,6 @@ function _finishFindNearest(lat,lng,acc){
     }
     if(!npk&&layerData.pk.length){
       npk=_nearestOf(lat,lng,layerData.pk);
-      if(npk)pkPrec='1km';
     }
   }
 
@@ -1384,19 +1381,19 @@ function openDetailOH(p){
     dpSp(p);
   openDetail('💧 '+(code?code+' – ':'')+lib,body);
 }
-// PAM : JAMAIS de dpPJWrap, JAMAIS de dpSp (contraintes permanentes)
+// PAM : JAMAIS de dpPJWrap, dpSp, dpPhoto (contraintes permanentes)
 function openDetailPAM(p){
   var lib=c(p.libelle||p.axe||'PAM');
   var pkRef=c(p.pk_ef||p.pk_gc);
-  var body=dpHero('PAM',lib,'','#9c27b0')+dpPkBar(pkRef)+dpPhoto(p)+
+  var body=dpHero('PAM',lib,'','#9c27b0')+dpPkBar(pkRef)+
     dpSec('Localisation',[['Axe',p.axe],['PK EF',p.pk_ef],['PK GC',p.pk_gc],['Décalage',p.decalage]])+
     (c(p.commentair)?dpSec('Commentaire',[['Note',p.commentair]]):'');
   openDetail('🌱 '+lib,body);
 }
-// Accès : pas de dpPJWrap, pas de dpSp
+// Accès : pas de dpPJWrap, dpSp, dpPhoto
 function openDetailAcces(p){
   var name=c(p.NOM_ACCES||p.Name||'Accès');
-  openDetail('🚧 '+name,dpHero('Accès','🚧 '+name,'','#e65100')+dpPhoto(p)+dpAllFields(p));
+  openDetail('🚧 '+name,dpHero('Accès','🚧 '+name,'','#e65100')+dpAllFields(p));
 }
 // Swipe-down mobile
 (function(){
