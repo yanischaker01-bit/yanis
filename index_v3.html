@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.20';
+  var V='v3.21';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.20';
+var APP_VER = 'v3.21';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -526,8 +526,8 @@ function _initVectorLayers(){
   map.addSource('pk_s1', {type:'geojson',data:emptyFC()});
   map.addSource('pk_hecto',{type:'geojson',data:emptyFC()});
   map.addSource('oa',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
-  map.addSource('pam',{type:'geojson',data:emptyFC()});
-  map.addSource('acces',{type:'geojson',data:emptyFC()});
+  map.addSource('pam',{type:'geojson',data:'data/pam.geojson?_v='+APP_VER});
+  map.addSource('acces',{type:'geojson',data:'data/acces.geojson?_v='+APP_VER});
 
   // ── OA Emprises (polygones avec labels permanents) ──
   map.addLayer({id:'oapoly-fill',type:'fill',source:'oa_poly',minzoom:13,
@@ -581,7 +581,7 @@ function _initVectorLayers(){
   }
   // PK hiérarchie : 50km(z6-10) 10km(z10-13) 1km(z13-15) 100m(z15-18) 1m(z18+)
   // pkh commence à z15 = même zoom que PAM/Accès → densité 100m garantit visibilité
-  _addPkCircle('pk50-c','pk_s50', 6,10, 9,'#ffffff'); _addPkLabel('pk50-lbl','pk_s50', 6,10, 12,-1.6);
+  _addPkCircle('pk50-c','pk_s50', 6,10, 9,'#1565c0'); _addPkLabel('pk50-lbl','pk_s50', 6,10, 12,-1.6);
   _addPkCircle('pk10-c','pk_s10',10,13, 7,'#e65100'); _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
   _addPkCircle('pk1-c', 'pk_s1', 13,15, 5,'#444');   _addPkLabel('pk1-lbl', 'pk_s1', 13,15, 9.5,-1.3);
 
@@ -755,14 +755,14 @@ function _loadAllData(){
     map.getSource('pk_s50').setData(f50);
     map.getSource('pk_s10').setData(f10);
     map.getSource('pk_s1').setData(d);
+    map.triggerRepaint();
     _loading.pk=false;
     _updateLoadStatus();
     addPKtoIndex(d);
   }).catch(function(){_loading.pk=false;_updateLoadStatus();});
 
-  // Accès
+  // Accès (source chargée directement depuis URL, pas de setData)
   loadJSON('acces').then(function(d){
-    map.getSource('acces').setData(d);
     var cnt=(d.features||[]).length;
     layerData.acces=(d.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
     _loading.acces=false;
@@ -801,9 +801,8 @@ function _loadAllData(){
     _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
   }).catch(function(){_loading.oh=false;_updateLoadStatus();});
 
-  // PAM
+  // PAM (source chargée directement depuis URL, pas de setData)
   loadJSON('pam').then(function(d){
-    map.getSource('pam').setData(d);
     var cnt=(d.features||[]).length;
     layerData.pam=(d.features||[]).map(function(f){return{props:_stripB64(f.properties),geom:f.geometry};});
     _loading.pam=false;
