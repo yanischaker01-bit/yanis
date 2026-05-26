@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.14';
+  var V='v3.15';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.14';
+var APP_VER = 'v3.15';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -565,10 +565,11 @@ function _initVectorLayers(){
   map.on('click','oh-line',function(e){if(e.features.length)openDetailOH(e.features[0].properties);});
 
   // ── PK (zoom-adaptatif) – sources pré-filtrées en JS (pk_s50/pk_s10/pk_s1) ──
+  // Cercles remplis (visibles sur fond clair et satellite)
   function _addPkCircle(id,src,minz,maxz,r,color){
     map.addLayer({id:id,type:'circle',source:src,minzoom:minz,maxzoom:maxz||22,
-      paint:{'circle-radius':r,'circle-color':'white','circle-stroke-width':2.5,'circle-stroke-color':color,
-        'circle-stroke-opacity':0.9}});
+      paint:{'circle-radius':r,'circle-color':color,'circle-stroke-width':2,
+        'circle-stroke-color':'white','circle-opacity':0.95}});
   }
   function _addPkLabel(id,src,minz,maxz,size,offset){
     map.addLayer({id:id,type:'symbol',source:src,minzoom:minz,maxzoom:maxz||22,
@@ -578,18 +579,19 @@ function _initVectorLayers(){
         'text-allow-overlap':false,'text-ignore-placement':false},
       paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
   }
-  // PK hiérarchie : 50km(z6-10) → 10km(z10-13) → 1km(z13-16) → 100m(z16-18) → 1m(z18+)
-  _addPkCircle('pk50-c','pk_s50', 6,10, 8,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 6,10, 12,-1.6);
-  _addPkCircle('pk10-c','pk_s10',10,13, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
-  _addPkCircle('pk1-c', 'pk_s1', 13,16, 5,'#333');    _addPkLabel('pk1-lbl', 'pk_s1', 13,16, 9.5,-1.3);
+  // PK hiérarchie : 50km(z6-10) 10km(z10-13) 1km(z13-15) 100m(z15-18) 1m(z18+)
+  // pkh commence à z15 = même zoom que PAM/Accès → densité 100m garantit visibilité
+  _addPkCircle('pk50-c','pk_s50', 6,10, 9,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 6,10, 12,-1.6);
+  _addPkCircle('pk10-c','pk_s10',10,13, 7,'#e65100'); _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
+  _addPkCircle('pk1-c', 'pk_s1', 13,15, 5,'#444');   _addPkLabel('pk1-lbl', 'pk_s1', 13,15, 9.5,-1.3);
 
-  // ── PK hectométriques (100 m) ──
-  map.addLayer({id:'pkh-c',type:'circle',source:'pk_hecto',minzoom:16,maxzoom:18,
-    paint:{'circle-radius':2.5,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#666'}});
-  map.addLayer({id:'pkh-lbl',type:'symbol',source:'pk_hecto',minzoom:16,maxzoom:18,
-    layout:{'text-field':['get','_pk_label'],'text-size':8.5,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
-    paint:{'text-color':'#444','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.3}});
+  // ── PK hectométriques (100 m) – z15 pour coïncider avec PAM/Accès ──
+  map.addLayer({id:'pkh-c',type:'circle',source:'pk_hecto',minzoom:15,maxzoom:18,
+    paint:{'circle-radius':3,'circle-color':'#555','circle-stroke-width':1.5,'circle-stroke-color':'white','circle-opacity':0.9}});
+  map.addLayer({id:'pkh-lbl',type:'symbol',source:'pk_hecto',minzoom:15,maxzoom:18,
+    layout:{'text-field':['get','_pk_label'],'text-size':9,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-offset':[0,-1.1],'text-anchor':'bottom','text-allow-overlap':false},
+    paint:{'text-color':'#222','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.4}});
 
   // ── PK métriques (1 m via PMTiles, zoom max) ──
   map.addSource('pk_metric',{type:'vector',url:'pmtiles://data/pk_metric.pmtiles'});
@@ -866,7 +868,7 @@ function _initLayersPanel(){
   var defs=[
     {key:'rail',  label:'Tracé LGV',         color:'#cc0000',type:'line'},
     {key:'pk',    label:'PK (zoom-adaptatif)',color:'#333',   type:'dot'},
-    {key:'pkhecto', label:'PK 100m (z≥16)',      color:'#666',   type:'dot', minZoom:16},
+    {key:'pkhecto', label:'PK 100m (z≥15)',      color:'#555',   type:'dot', minZoom:15},
     {key:'pkmetric',label:'PK 1m (z≥18)',        color:'#9e9e9e',type:'dot', minZoom:18},
     {key:'n2',    label:'N2000',              color:'#1b5e20',type:'fill',minZoom:6},
     {key:'old',   label:'Zones OLD',          color:'#3366ff',type:'fill',minZoom:7},
