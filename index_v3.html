@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.9';
+  var V='v3.10';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.9';
+var APP_VER = 'v3.10';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -815,7 +815,7 @@ function _updateLoadStatus(){
   if(!any){
     sl.style.background='rgba(27,94,32,.92)';
     sl.style.color='#fff';
-    sl.textContent='✅ v'+APP_VER+' | PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length+' | OA:'+layerData.oa.length;
+    sl.textContent='✅ v'+APP_VER+' | z'+Math.round(map.getZoom())+' | PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length+' | OA:'+layerData.oa.length;
     sl.style.display='block';
     setTimeout(function(){sl.style.display='none';},8000);
     var b=document.getElementById('ver-badge');
@@ -922,7 +922,8 @@ window._forceLayerOn=function(type){
 // ══════════════════════════════════════════════════════════
 function _restoreMapPos(){
   try{var p=JSON.parse(localStorage.getItem('lgv_map_pos')||'null');
-    if(p&&p.lat)map.jumpTo({center:[p.lng,p.lat],zoom:p.zoom});}catch(e){}
+    /* Cap z12 max : évite de restaurer un z18 (findNearest) sans données visibles */
+    if(p&&p.lat)map.jumpTo({center:[p.lng,p.lat],zoom:Math.min(p.zoom,12)});}catch(e){}
   map.on('moveend',function(){
     try{var c2=map.getCenter();
       localStorage.setItem('lgv_map_pos',JSON.stringify({lat:c2.lat,lng:c2.lng,zoom:map.getZoom()}));}catch(e){}
