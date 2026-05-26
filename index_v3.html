@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.11';
+  var V='v3.12';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.11';
+var APP_VER = 'v3.12';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -342,6 +342,9 @@ var _oaByCode={};
 var _loading={oa:true,oh:true,pam:true,acces:true,pk:true};
 var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
+// Position sauvegardée au moment du chargement (avant tout moveend)
+var _savedPosAtLoad=null;
+try{_savedPosAtLoad=JSON.parse(localStorage.getItem('lgv_map_pos')||'null');}catch(e){}
 
 // ── Visibilité couches (état utilisateur) ──
 var _vis={rail:true,pk:true,pkhecto:true,pkmetric:true,oa:true,oh:true,pam:true,acces:true,
@@ -687,12 +690,11 @@ function _initVectorLayers(){
 // CHARGEMENT DONNÉES
 // ══════════════════════════════════════════════════════════
 function _loadAllData(){
-  // Rail – fitBounds sur la LGV si pas de position sauvegardée ou position hors LGV
+  // Rail – fitBounds sur la LGV si pas de position sauvegardée au chargement
   loadJSON('rail').then(function(d){
     map.getSource('rail').setData(d);
-    var savedPos=null;
-    try{savedPos=JSON.parse(localStorage.getItem('lgv_map_pos')||'null');}catch(e){}
-    if(!savedPos||!_isOnLGV(savedPos.lat,savedPos.lng)){
+    var doFit=!_savedPosAtLoad||!_isOnLGV(_savedPosAtLoad.lat,_savedPosAtLoad.lng);
+    if(doFit){
       try{
         var coords=[];
         (d.features||[]).forEach(function(f){
@@ -805,11 +807,22 @@ function _updateLoadStatus(){
   if(!any){
     sl.style.background='rgba(27,94,32,.92)';
     sl.style.color='#fff';
-    sl.textContent='✅ v'+APP_VER+' | z'+Math.round(map.getZoom())+' | PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length+' | OA:'+layerData.oa.length;
+    var ctr=map.getCenter();
+    sl.textContent='✅ v'+APP_VER+' | z'+Math.round(map.getZoom())+
+      ' | lng'+ctr.lng.toFixed(2)+' lat'+ctr.lat.toFixed(2)+
+      ' | PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length;
     sl.style.display='block';
-    setTimeout(function(){sl.style.display='none';},8000);
+    setTimeout(function(){sl.style.display='none';},12000);
     var b=document.getElementById('ver-badge');
     if(b)b.title='PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length;
+    // Fallback : si le tracé LGV n'est pas dans le viewport, recentrer sur la LGV
+    setTimeout(function(){
+      if(!map.getLayer('rail-line'))return;
+      var feats=map.queryRenderedFeatures({layers:['rail-line']});
+      if(!feats.length){
+        map.flyTo({center:[0.06,46.11],zoom:8,duration:800});
+      }
+    },600);
     return;
   }
   sl.style.background='rgba(26,26,46,.9)';
