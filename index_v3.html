@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.23';
+  var V='v3.24';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,14 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.23';
+var APP_VER = 'v3.24';
+
+// ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
+var _pkPrefetch=null, _pkMapReady=false;
+fetch('data/pk.geojson?_v='+APP_VER)
+  .then(function(r){if(!r.ok)throw new Error('pk HTTP '+r.status);return r.json();})
+  .then(function(d){_pkPrefetch=d;if(_pkMapReady)_setupPKLayers(d);})
+  .catch(function(e){console.warn('PK prefetch:',e);_loading.pk=false;});
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -309,6 +316,30 @@ function _addPkLabel(id,src,minz,maxz,size,offset){
       'text-offset':[0,offset],'text-anchor':'bottom',
       'text-allow-overlap':false,'text-ignore-placement':false},
     paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
+}
+
+// ── Création sources PK inline + couches (appelée quand données ET carte sont prêtes) ──
+function _setupPKLayers(d){
+  var all=d.features||[];
+  layerData.pk=all.map(function(f){return{props:f.properties,geom:f.geometry};});
+  function _pkMeters(f){
+    var lbl=(f.properties&&f.properties._pk_label)||'';
+    var m=lbl.match(/PK\s*(\d+)\+(\d+)/);
+    return m?parseInt(m[1],10)*1000+parseInt(m[2],10):-1;
+  }
+  var f50={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%50000===0;})};
+  var f10={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%10000===0&&m%50000!==0;})};
+  var f1= {type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%1000===0&&m%10000!==0;})};
+  map.addSource('pk_s50',{type:'geojson',data:f50});
+  map.addSource('pk_s10',{type:'geojson',data:f10});
+  map.addSource('pk_s1', {type:'geojson',data:f1});
+  _addPkCircle('pk50-c','pk_s50', 7,10, 9,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 7,10, 12,-1.6);
+  _addPkCircle('pk10-c','pk_s10',10,13, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
+  _addPkCircle('pk1-c', 'pk_s1', 13,15, 4,'#333');   _addPkLabel('pk1-lbl', 'pk_s1', 13,15, 9,-1.3);
+  setVis('pk',_vis.pk);
+  _loading.pk=false;
+  _updateLoadStatus();
+  addPKtoIndex(d);
 }
 
 // ── Geometry helpers ──
@@ -450,6 +481,8 @@ if(location.protocol==='file:'){
   map.on('load', function(){
     document.getElementById('loader').remove();
     _initVectorLayers();
+    _pkMapReady=true;
+    if(_pkPrefetch)_setupPKLayers(_pkPrefetch);
     _loadAllData();
     _initLayersPanel();
     /* Force toutes les couches visibles */
@@ -489,8 +522,8 @@ function _initVectorLayers(){
     paint:{'line-color':['match',['get','type_complet'],'ZPS','#e65100','ZSC','#1b5e20','#388e3c'],
       'line-width':1.5,'line-dasharray':[3,2]}});
 
-  // ── Zones OLD (fond seul, pas de contour) ──
-  map.addLayer({id:'old-fill',type:'fill',source:'old',minzoom:7,
+  // ── Zones OLD (fond seul, pas de contour, masqué sous z15 ≈ 50m) ──
+  map.addLayer({id:'old-fill',type:'fill',source:'old',minzoom:7,maxzoom:15,
     paint:{'fill-color':'#4f83ff','fill-opacity':0.10}});
 
   // ── Mesures compensatoires ──
@@ -539,9 +572,7 @@ function _initVectorLayers(){
   map.addSource('oa_poly',{type:'geojson',data:emptyFC()});
   map.addSource('oh',{type:'geojson',data:emptyFC()});
   map.addSource('oa',{type:'geojson',data:emptyFC(),cluster:true,clusterMaxZoom:14,clusterRadius:55});
-  map.addSource('pk_s50',{type:'geojson',data:_primeFC});
-  map.addSource('pk_s10',{type:'geojson',data:_primeFC});
-  map.addSource('pk_s1', {type:'geojson',data:_primeFC});
+  // pk_s50 / pk_s10 / pk_s1 créées dans _setupPKLayers (source inline, obligatoire pour MapLibre GL v4)
   map.addSource('pk_hecto',{type:'geojson',data:_primeFC});
   map.addSource('pam',{type:'geojson',data:_primeFC});
   map.addSource('acces',{type:'geojson',data:_primeFC});
@@ -581,10 +612,7 @@ function _initVectorLayers(){
   map.on('mouseleave','oh-line',function(){map.getCanvas().style.cursor='';});
   map.on('click','oh-line',function(e){if(e.features.length)openDetailOH(e.features[0].properties);});
 
-  // ── PK (zoom-adaptatif) : 50km(z7-10) 10km(z10-13) 1km(z13-15) – logique v2 ──
-  _addPkCircle('pk50-c','pk_s50', 7,10, 9,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 7,10, 12,-1.6);
-  _addPkCircle('pk10-c','pk_s10',10,13, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
-  _addPkCircle('pk1-c', 'pk_s1', 13,15, 4,'#333');   _addPkLabel('pk1-lbl', 'pk_s1', 13,15, 9,-1.3);
+  // ── PK 50/10/1km : couches ajoutées dans _setupPKLayers une fois données prêtes ──
 
   // ── PK hectométriques (100 m) ──
   map.addLayer({id:'pkh-c',type:'circle',source:'pk_hecto',minzoom:15,maxzoom:18,
@@ -634,16 +662,16 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🏗 '+c(e.features[0].properties.LIBELLE_LO||e.features[0].properties.CODE_OBJET||'OA'));});
   map.on('mouseleave','oa-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── PAM : cercles violets (z10+, labels z13+) ──
-  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:10,
+  // ── PAM : cercles violets (z8+, labels z11+) ──
+  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:8,
     paint:{
-      'circle-radius':['interpolate',['linear'],['zoom'],10,3,15,6,18,10],
+      'circle-radius':['interpolate',['linear'],['zoom'],8,2,15,6,18,10],
       'circle-color':'#9c27b0',
       'circle-stroke-width':1.5,
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:13,
+  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:11,
     layout:{'text-field':['get','libelle'],'text-size':10,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
@@ -654,34 +682,27 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🌱 '+c(e.features[0].properties.libelle||'PAM'));});
   map.on('mouseleave','pam-dot',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── Accès : cercles orange (z10+, labels z13+) ──
-  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:10,
+  // ── Accès : cercles orange (z8+, labels z11+) ──
+  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:8,
     paint:{
-      'circle-radius':['interpolate',['linear'],['zoom'],10,2,15,5,18,9],
+      'circle-radius':['interpolate',['linear'],['zoom'],8,2,15,5,18,9],
       'circle-color':'#e65100',
       'circle-stroke-width':1.5,
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:13,
+  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:11,
     layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
       'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
       'text-allow-overlap':false,'text-ignore-placement':false},
     paint:{'text-color':'#bf360c','text-halo-color':'rgba(255,255,255,.9)','text-halo-width':1.2}});
   map.on('click','acc-dot',function(e){
-    if(e.features.length)openDetailGeneric('Accès','🚧 '+c(e.features[0].properties.NOM_ACCES||e.features[0].properties.Name||'Accès'),e.features[0].properties,'#ff6600');
+    if(e.features.length)openDetailAcces(e.features[0].properties);
   });
   map.on('mouseenter','acc-dot',function(e){map.getCanvas().style.cursor='pointer';
     showHover(e.lngLat,'🚧 '+c(e.features[0].properties.NOM_ACCES||e.features[0].properties.Name||'Accès'));});
   map.on('mouseleave','acc-dot',function(){map.getCanvas().style.cursor='';hideHover();});
-
-  // ── TEST DIAGNOSTIC : cercle jaune fixe à PK 100+000 (LGV1) ──
-  map.addSource('_test',{type:'geojson',data:{type:'FeatureCollection',features:[
-    {type:'Feature',geometry:{type:'Point',coordinates:[0.2657,46.5558]},properties:{}}
-  ]}});
-  map.addLayer({id:'_test-c',type:'circle',source:'_test',
-    paint:{'circle-radius':20,'circle-color':'#ffff00','circle-stroke-width':3,'circle-stroke-color':'#000','circle-opacity':1}});
 
   // Fermer le détail sur clic vide
   map.on('click',function(e){
@@ -743,27 +764,7 @@ function _loadAllData(){
     _updateLpCount('oapoly',cnt);
   });
 
-  // PK – pré-filtrage JS → 3 sources (pk_s50 / pk_s10 / pk_s1)
-  loadJSON('pk').then(function(d){
-    var all=d.features||[];
-    layerData.pk=all.map(function(f){return{props:f.properties,geom:f.geometry};});
-    function _pkMeters(f){
-      var lbl=(f.properties&&f.properties._pk_label)||'';
-      var m=lbl.match(/PK\s*(\d+)\+(\d+)/);
-      return m?parseInt(m[1],10)*1000+parseInt(m[2],10):-1;
-    }
-    // Filtres exclusifs comme v2 : pk10 n'inclut pas pk50, pk1 n'inclut pas pk10
-    var f50={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%50000===0;})};
-    var f10={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%10000===0&&m%50000!==0;})};
-    var f1= {type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%1000===0&&m%10000!==0;})};
-    map.getSource('pk_s50').setData(f50);
-    map.getSource('pk_s10').setData(f10);
-    map.getSource('pk_s1').setData(f1);
-    map.triggerRepaint();
-    _loading.pk=false;
-    _updateLoadStatus();
-    addPKtoIndex(d);
-  }).catch(function(){_loading.pk=false;_updateLoadStatus();});
+  // PK : chargement géré par _setupPKLayers (pré-fetch parallèle avant map init)
 
   // Accès
   loadJSON('acces').then(function(d){
@@ -1171,7 +1172,7 @@ function _openDetailFromSearch(h){
   if(h.type==='OA')openDetailOA(h.props);
   else if(h.type==='OH')openDetailOH(h.props);
   else if(h.type==='PAM')openDetailPAM(h.props);
-  else if(h.type==='Accès')openDetailGeneric('Accès','🚧 '+h.label,h.props,'#ff6600');
+  else if(h.type==='Accès')openDetailAcces(h.props);
 }
 var _pkLoaded=false;
 function addPKtoIndex(fc){
@@ -1232,7 +1233,6 @@ function fillTable(){
     cols.forEach(function(k){html+='<td title="'+esc(c(f.props[k]))+'">'+esc(c(f.props[k]))+'</td>';});
     html+='</tr>';
   });
-  if(data.length>300)html+='<tr><td colspan="'+(cols.length+1)+'" style="padding:8px;color:#888;text-align:center;font-size:11px">…'+(data.length-300)+' lignes supplémentaires</td></tr>';
   html+='</tbody></table>';
   document.getElementById('tbl-scroll').innerHTML=html;
   document.getElementById('tbl-scroll')._data=data;
@@ -1384,15 +1384,19 @@ function openDetailOH(p){
     dpSp(p);
   openDetail('💧 '+(code?code+' – ':'')+lib,body);
 }
-// PAM : JAMAIS de dpPJWrap (contrainte permanente)
+// PAM : JAMAIS de dpPJWrap, JAMAIS de dpSp (contraintes permanentes)
 function openDetailPAM(p){
   var lib=c(p.libelle||p.axe||'PAM');
   var pkRef=c(p.pk_ef||p.pk_gc);
   var body=dpHero('PAM',lib,'','#9c27b0')+dpPkBar(pkRef)+dpPhoto(p)+
     dpSec('Localisation',[['Axe',p.axe],['PK EF',p.pk_ef],['PK GC',p.pk_gc],['Décalage',p.decalage]])+
-    (c(p.commentair)?dpSec('Commentaire',[['Note',p.commentair]]):'  ')+
-    dpSp(p);
+    (c(p.commentair)?dpSec('Commentaire',[['Note',p.commentair]]):'');
   openDetail('🌱 '+lib,body);
+}
+// Accès : pas de dpPJWrap, pas de dpSp
+function openDetailAcces(p){
+  var name=c(p.NOM_ACCES||p.Name||'Accès');
+  openDetail('🚧 '+name,dpHero('Accès','🚧 '+name,'','#e65100')+dpPhoto(p)+dpAllFields(p));
 }
 // Swipe-down mobile
 (function(){
