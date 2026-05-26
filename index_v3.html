@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.16';
+  var V='v3.17';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.16';
+var APP_VER = 'v3.17';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -593,15 +593,17 @@ function _initVectorLayers(){
       'text-offset':[0,-1.1],'text-anchor':'bottom','text-allow-overlap':false},
     paint:{'text-color':'#222','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.4}});
 
-  // ── PK métriques (1 m via PMTiles, zoom max) ──
-  map.addSource('pk_metric',{type:'vector',url:'pmtiles://data/pk_metric.pmtiles'});
-  map.addLayer({id:'pkm-c',type:'circle',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
-    paint:{'circle-radius':1.8,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#777'}});
-  map.addLayer({id:'pkm-lbl',type:'symbol',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
-    layout:{'text-field':['coalesce',['get','_pk_label'],['get','pk'],''],
-      'text-size':7.5,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
-    paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1}});
+  // ── PK métriques (1 m via PMTiles, zoom max) – try/catch pour éviter cascade d'erreurs ──
+  try{
+    map.addSource('pk_metric',{type:'vector',url:'pmtiles://data/pk_metric.pmtiles'});
+    map.addLayer({id:'pkm-c',type:'circle',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
+      paint:{'circle-radius':1.8,'circle-color':'#fff','circle-stroke-width':1,'circle-stroke-color':'#777'}});
+    map.addLayer({id:'pkm-lbl',type:'symbol',source:'pk_metric','source-layer':'pk_metric',minzoom:18,
+      layout:{'text-field':['coalesce',['get','_pk_label'],['get','pk'],''],
+        'text-size':7.5,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+        'text-offset':[0,-1],'text-anchor':'bottom','text-allow-overlap':false},
+      paint:{'text-color':'#555','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1}});
+  }catch(e){console.warn('pkm layers skipped:',e);}
 
   // ── OA clusters + points ──
   map.addLayer({id:'oa-cluster-fill',type:'circle',source:'oa',filter:['has','point_count'],minzoom:11,
@@ -631,8 +633,8 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🏗 '+c(e.features[0].properties.LIBELLE_LO||e.features[0].properties.CODE_OBJET||'OA'));});
   map.on('mouseleave','oa-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── PAM : cercles violets (visible à partir de z15 ≈ 100m) ──
-  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:15,
+  // ── PAM : cercles violets (visible à partir de z10) ──
+  map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:10,
     paint:{
       'circle-radius':['interpolate',['linear'],['zoom'],15,5,18,9],
       'circle-color':'#9c27b0',
@@ -640,7 +642,7 @@ function _initVectorLayers(){
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:15,
+  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:10,
     layout:{'text-field':['get','libelle'],'text-size':10,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
@@ -651,8 +653,8 @@ function _initVectorLayers(){
     showHover(e.lngLat,'🌱 '+c(e.features[0].properties.libelle||'PAM'));});
   map.on('mouseleave','pam-dot',function(){map.getCanvas().style.cursor='';hideHover();});
 
-  // ── Accès : cercles orange (visible à partir de z15 ≈ 100m) ──
-  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:15,
+  // ── Accès : cercles orange (visible à partir de z10) ──
+  map.addLayer({id:'acc-dot',type:'circle',source:'acces',minzoom:10,
     paint:{
       'circle-radius':['interpolate',['linear'],['zoom'],15,4,18,8],
       'circle-color':'#e65100',
@@ -660,7 +662,7 @@ function _initVectorLayers(){
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:15,
+  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:10,
     layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
       'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
@@ -1030,9 +1032,14 @@ function _finishFindNearest(lat,lng,acc){
   }catch(e){}
   /* Fallback pk_hecto (100m) puis pk (1km) */
   if(!npk){
-    var _pkPool=(_pkHData&&_pkHData.features&&_pkHData.features.length)?
-      _pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}):layerData.pk;
-    npk=_nearestOf(lat,lng,_pkPool);
+    if(_pkHData&&_pkHData.features&&_pkHData.features.length){
+      npk=_nearestOf(lat,lng,_pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}));
+      if(npk)pkPrec='100m';
+    }
+    if(!npk&&layerData.pk.length){
+      npk=_nearestOf(lat,lng,layerData.pk);
+      if(npk)pkPrec='1km';
+    }
   }
 
   /* Détecter la voie (V1 ou V2) depuis le PK le plus proche */
