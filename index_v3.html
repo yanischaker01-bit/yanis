@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.8';
+  var V='v3.9';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.8';
+var APP_VER = 'v3.9';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -339,7 +339,7 @@ window.toggleLayersPanel=function(){document.getElementById('layers-panel').clas
 // ── Données chargées ──
 var layerData={oa:[],oh:[],acces:[],pam:[],pk:[]};
 var _oaByCode={};
-var _loading={oa:true,oh:true,pam:true};
+var _loading={oa:true,oh:true,pam:true,acces:true,pk:true};
 var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
 
@@ -434,10 +434,12 @@ if(location.protocol==='file:'){
     _initVectorLayers();
     _loadAllData();
     _initLayersPanel();
-    /* Force toutes les couches visibles — protection contre tout état résiduel */
+    /* Force toutes les couches visibles */
     Object.keys(LAYER_IDS).forEach(function(k){setVis(k,true);});
     _initSearch();
     _restoreMapPos();
+    /* Afficher état de chargement immédiatement */
+    _updateLoadStatus();
   });
 }
 
@@ -573,7 +575,7 @@ function _initVectorLayers(){
         'text-allow-overlap':false,'text-ignore-placement':false},
       paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
   }
-  _addPkCircle('pk50-c','pk_s50', 7,10, 8,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 7,10, 12,-1.6);
+  _addPkCircle('pk50-c','pk_s50', 6,10, 8,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 6,10, 12,-1.6);
   _addPkCircle('pk10-c','pk_s10',10,13, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
   _addPkCircle('pk1-c', 'pk_s1', 13,17, 5,'#333');    _addPkLabel('pk1-lbl', 'pk_s1', 13,17, 9.5,-1.3);
 
@@ -624,10 +626,10 @@ function _initVectorLayers(){
   map.on('mouseleave','oa-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
   // ── PAM clusters + points ──
-  map.addLayer({id:'pam-cluster-fill',type:'circle',source:'pam',filter:['has','point_count'],minzoom:8,
+  map.addLayer({id:'pam-cluster-fill',type:'circle',source:'pam',filter:['has','point_count'],minzoom:0,
     paint:{'circle-radius':['step',['get','point_count'],16,10,22,50,28],
       'circle-color':'#9c27b0','circle-stroke-width':2,'circle-stroke-color':'rgba(255,255,255,.6)'}});
-  map.addLayer({id:'pam-cluster-lbl',type:'symbol',source:'pam',filter:['has','point_count'],minzoom:8,
+  map.addLayer({id:'pam-cluster-lbl',type:'symbol',source:'pam',filter:['has','point_count'],minzoom:0,
     layout:{'text-field':['get','point_count_abbreviated'],'text-font':['Open Sans Regular'],'text-size':13},
     paint:{'text-color':'white'}});
   map.addLayer({id:'pam-pt',type:'symbol',source:'pam',filter:['!',['has','point_count']],minzoom:12,
@@ -652,10 +654,10 @@ function _initVectorLayers(){
   map.on('mouseleave','pam-pt',function(){map.getCanvas().style.cursor='';hideHover();});
 
   // ── Accès clusters (z8-11) + points individuels (z12+) ──
-  map.addLayer({id:'acc-cluster-fill',type:'circle',source:'acces',filter:['has','point_count'],minzoom:8,
+  map.addLayer({id:'acc-cluster-fill',type:'circle',source:'acces',filter:['has','point_count'],minzoom:0,
     paint:{'circle-radius':['step',['get','point_count'],14,10,20,50,26],
       'circle-color':'#e65100','circle-stroke-width':2,'circle-stroke-color':'rgba(255,255,255,.6)'}});
-  map.addLayer({id:'acc-cluster-lbl',type:'symbol',source:'acces',filter:['has','point_count'],minzoom:8,
+  map.addLayer({id:'acc-cluster-lbl',type:'symbol',source:'acces',filter:['has','point_count'],minzoom:0,
     layout:{'text-field':['get','point_count_abbreviated'],'text-font':['Open Sans Regular'],'text-size':12},
     paint:{'text-color':'white'}});
   map.on('click','acc-cluster-fill',function(e){
@@ -739,15 +741,20 @@ function _loadAllData(){
     map.getSource('pk_s50').setData(f50);
     map.getSource('pk_s10').setData(f10);
     map.getSource('pk_s1').setData(d);
+    _loading.pk=false;
+    _updateLoadStatus();
     addPKtoIndex(d);
-  });
+  }).catch(function(){_loading.pk=false;_updateLoadStatus();});
 
   // Accès
   loadJSON('acces').then(function(d){
     map.getSource('acces').setData(d);
+    var cnt=(d.features||[]).length;
     layerData.acces=(d.features||[]).map(function(f){return{props:f.properties,geom:f.geometry};});
-    buildSearchIndex();refreshTableIfOpen();
-  });
+    _loading.acces=false;
+    _updateLpCount('acces',cnt);
+    _updateLoadStatus();buildSearchIndex();refreshTableIfOpen();
+  }).catch(function(){_loading.acces=false;_updateLoadStatus();});
 
   // PK hectométriques
   loadJSON('pk_hecto').then(function(d){
@@ -804,9 +811,26 @@ function _loadAllData(){
 function _stripB64(p){var o=Object.assign({},p);delete o._ph_b64;return o;}
 function _updateLoadStatus(){
   var sl=document.getElementById('load-status');if(!sl)return;
-  var any=_loading.oa||_loading.oh||_loading.pam;
-  if(!any){sl.style.display='none';return;}
-  sl.textContent=(_loading.oa?'🏗 OA ⏳':'')+((!_loading.oa&&_loading.oh)?' 💧 OH ⏳':'')+((!_loading.oh&&_loading.pam)?' 🌱 PAM ⏳':'');
+  var any=_loading.oa||_loading.oh||_loading.pam||_loading.acces||_loading.pk;
+  if(!any){
+    sl.style.background='rgba(27,94,32,.92)';
+    sl.style.color='#fff';
+    sl.textContent='✅ v'+APP_VER+' | PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length+' | OA:'+layerData.oa.length;
+    sl.style.display='block';
+    setTimeout(function(){sl.style.display='none';},8000);
+    var b=document.getElementById('ver-badge');
+    if(b)b.title='PAM:'+layerData.pam.length+' | Accès:'+layerData.acces.length+' | PK:'+layerData.pk.length;
+    return;
+  }
+  sl.style.background='rgba(26,26,46,.9)';
+  sl.style.color='#fff';
+  var msg='';
+  if(_loading.pk)msg+='🔴 PK ';
+  if(_loading.pam)msg+='🔴 PAM ';
+  if(_loading.acces)msg+='🔴 Accès ';
+  if(_loading.oa)msg+='⏳ OA ';
+  if(_loading.oh)msg+='⏳ OH ';
+  sl.textContent=msg.trim()+' chargement…';
   sl.style.display='block';
 }
 
@@ -989,8 +1013,32 @@ function _finishFindNearest(lat,lng,acc){
       _pkHData.features.map(function(f){return{props:f.properties,geom:f.geometry};}):layerData.pk;
     npk=_nearestOf(lat,lng,_pkPool);
   }
-  var nacc=_nearestOf(lat,lng,layerData.acces);
-  var npam=_nearestOf(lat,lng,layerData.pam);
+
+  /* Détecter la voie (V1 ou V2) depuis le PK le plus proche */
+  var pkVoie=npk?String(npk.f.props._voie||npk.f.props.voie||''):'';
+  var voieN=pkVoie.match(/[12]$/)?pkVoie.slice(-1):'';  /* '1', '2', ou '' */
+
+  /* Accès : filtrer sur même voie si détectée (AXE finit par 1/2 ou contient V1/V2) */
+  var accPool=layerData.acces;
+  if(voieN){
+    var filtAcc=accPool.filter(function(f){
+      var ax=String(f.props.AXE||'');
+      return ax.endsWith(voieN)||ax.includes('V'+voieN);
+    });
+    if(filtAcc.length)accPool=filtAcc;
+  }
+  var nacc=_nearestOf(lat,lng,accPool);
+
+  /* PAM : filtrer sur même voie, mais garder les PAM génériques "LGV" */
+  var pamPool=layerData.pam;
+  if(voieN){
+    var filtPam=pamPool.filter(function(f){
+      var ax=String(f.props.axe||'');
+      return ax==='LGV'||ax.endsWith(voieN);
+    });
+    if(filtPam.length)pamPool=filtPam;
+  }
+  var npam=_nearestOf(lat,lng,pamPool);
 
   function zoomBtn(coords,z,label){
     var co=JSON.stringify(coords);
@@ -998,7 +1046,7 @@ function _finishFindNearest(lat,lng,acc){
       'style="font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;margin-top:4px">'+label+'</button>';
   }
   var html='<div style="padding:12px;display:flex;flex-direction:column;gap:10px">';
-  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+'</p>';
+  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+(voieN?' · Voie V'+voieN+' détectée':'')+'</p>';
 
   if(npk){
     var p=npk.f.props,co=npk.f.geom.coordinates;
@@ -1006,7 +1054,7 @@ function _finishFindNearest(lat,lng,acc){
     html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
     html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
     html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+lbl+'</div>';
-    html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+'</div>';
+    html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+(voieN?' → filtre V'+voieN+' appliqué':'')+'</div>';
     html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
     html+=zoomBtn(co,18,'→ Zoom sur ce PK');
     html+='</div>';
