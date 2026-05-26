@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.26';
+  var V='v3.27';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.26';
+var APP_VER = 'v3.27';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -335,6 +335,8 @@ function _setupPKLayers(d){
     return -1;
   }
 
+  if(all.length) console.log('PK exemple propriétés:', JSON.stringify(all[0].properties));
+
   var f50={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%50000===0;})};
   var f10={type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%10000===0&&m%50000!==0;})};
   var f1= {type:'FeatureCollection',features:all.filter(function(f){var m=_pkMeters(f);return m>=0&&m%1000===0&&m%10000!==0;})};
@@ -351,9 +353,10 @@ function _setupPKLayers(d){
   map.addSource('pk_s50',{type:'geojson',data:f50});
   map.addSource('pk_s10',{type:'geojson',data:f10});
   map.addSource('pk_s1', {type:'geojson',data:f1});
-  _addPkCircle('pk50-c','pk_s50', 7,10, 9,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 7,10, 12,-1.6);
-  _addPkCircle('pk10-c','pk_s10',10,13, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10',10,13, 10,-1.4);
-  _addPkCircle('pk1-c', 'pk_s1', 13,15, 4,'#333');   _addPkLabel('pk1-lbl', 'pk_s1', 13,15, 9,-1.3);
+  /* minzoom:0 (mode diagnostic) – zooms normaux rétablis une fois PK visibles */
+  _addPkCircle('pk50-c','pk_s50', 0,22, 9,'#cc0000'); _addPkLabel('pk50-lbl','pk_s50', 0,22, 12,-1.6);
+  _addPkCircle('pk10-c','pk_s10', 0,22, 6,'#555');    _addPkLabel('pk10-lbl','pk_s10', 0,22, 10,-1.4);
+  _addPkCircle('pk1-c', 'pk_s1',  0,22, 4,'#333');   _addPkLabel('pk1-lbl', 'pk_s1',  0,22, 9,-1.3);
   setVis('pk',true);
   _loading.pk=false;
   _updateLoadStatus();
@@ -509,6 +512,22 @@ if(location.protocol==='file:'){
     _restoreMapPos();
     /* Afficher état de chargement immédiatement */
     _updateLoadStatus();
+    /* Diagnostic v3.27 : vérifier sources et couches PK après 3s */
+    setTimeout(function(){
+      ['pk_s50','pk_s10','pk_s1'].forEach(function(sid){
+        var src=map.getSource(sid);
+        if(src){var n=(src.serialize().data.features||[]).length;console.log('DIAG source '+sid+': '+n+' features');}
+        else console.error('DIAG source manquante: '+sid);
+      });
+      ['pk50-c','pk10-c','pk1-c'].forEach(function(lid){
+        if(map.getLayer(lid))console.log('DIAG layer '+lid+': vis='+map.getLayoutProperty(lid,'visibility'));
+        else console.error('DIAG layer manquant: '+lid);
+      });
+      var pamSrc=map.getSource('pam');
+      if(pamSrc)console.log('DIAG pam features: '+(pamSrc.serialize().data.features||[]).length);
+      var accSrc=map.getSource('acces');
+      if(accSrc)console.log('DIAG acces features: '+(accSrc.serialize().data.features||[]).length);
+    },3000);
   });
 }
 
@@ -689,7 +708,7 @@ function _initVectorLayers(){
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:14,
+  map.addLayer({id:'pam-lbl',type:'symbol',source:'pam',minzoom:0,
     layout:{'text-field':['get','libelle'],'text-size':11,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
@@ -709,7 +728,7 @@ function _initVectorLayers(){
       'circle-stroke-color':'rgba(255,255,255,0.85)',
       'circle-opacity':0.9
     }});
-  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:14,
+  map.addLayer({id:'acc-lbl',type:'symbol',source:'acces',minzoom:0,
     layout:{'text-field':['coalesce',['get','NOM_ACCES'],['get','Name'],''],
       'text-size':11,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
       'text-anchor':'top','text-offset':[0,1.1],
@@ -1045,7 +1064,10 @@ function findNearest(){
 window.findNearest=findNearest;
 
 function _finishFindNearest(lat,lng,acc){
+  /* Attendre 2s que les tuiles pk_metric soient bien chargées avant de chercher */
+  setTimeout(function(){
   var npk=null, pkPrec='?';
+  console.log('_finishFindNearest: lat='+lat.toFixed(5)+' lng='+lng.toFixed(5)+' layerData.pk='+layerData.pk.length);
 
   /* Niveau 1 : querySourceFeatures sur pk_metric (toutes tuiles chargées) */
   try{
@@ -1165,6 +1187,7 @@ function _finishFindNearest(lat,lng,acc){
 
   html+='</div>';
   openDetail('📍 Éléments LGV proches',html);
+  }, 2000); /* fin setTimeout 2s */
 }
 
 // ══════════════════════════════════════════════════════════
