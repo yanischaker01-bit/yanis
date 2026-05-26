@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.29';
+  var V='v3.30';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.29';
+var APP_VER = 'v3.30';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -341,10 +341,10 @@ function _setupPKLayers(d){
   var n50=features.filter(function(f){return f.properties._pk_class==='50';}).length;
   var n10=features.filter(function(f){return f.properties._pk_class==='10';}).length;
   var n1 =features.filter(function(f){return f.properties._pk_class==='1';}).length;
-  console.log('PK v3.29: total='+all.length+' | 50km='+n50+' | 10km='+n10+' | 1km='+n1);
+  console.log('PK v3.30: total='+all.length+' | 50km='+n50+' | 10km='+n10+' | 1km='+n1);
 
-  // Supprimer couches et sources précédentes (y compris anciennes pk_s* et pk-debug)
-  ['pk-debug','pk50-lbl','pk50-c','pk10-lbl','pk10-c','pk1-lbl','pk1-c'].forEach(function(id){
+  // Supprimer couches et sources précédentes
+  ['pk50-lbl','pk50-c','pk10-lbl','pk10-c','pk1-lbl','pk1-c'].forEach(function(id){
     try{if(map.getLayer(id))map.removeLayer(id);}catch(e){}
   });
   ['pk_all','pk_s50','pk_s10','pk_s1'].forEach(function(id){
@@ -353,11 +353,7 @@ function _setupPKLayers(d){
 
   map.addSource('pk_all',{type:'geojson',data:fc});
 
-  // DEBUG : toutes les features sans filtre, orange, zoom 0→22 (à supprimer après validation)
-  map.addLayer({id:'pk-debug',type:'circle',source:'pk_all',
-    paint:{'circle-radius':5,'circle-color':'#ff6600','circle-stroke-width':1,'circle-stroke-color':'white','circle-opacity':0.7}});
-
-  // pk50 : z7→10, cercles rouges – filtre legacy (clé bare string, compatible MapLibre GL v4)
+  // pk50 : z7→10, cercles rouges
   map.addLayer({id:'pk50-c',type:'circle',source:'pk_all',minzoom:7,maxzoom:10,
     filter:['==','_pk_class','50'],
     paint:{'circle-radius':9,'circle-color':'#cc0000','circle-stroke-width':2,'circle-stroke-color':'white','circle-opacity':0.95}});
@@ -365,7 +361,7 @@ function _setupPKLayers(d){
     filter:['==','_pk_class','50'],
     layout:{'text-field':['get','_pk_label'],'text-size':12,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-offset':[0,-1.6],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+      'text-offset':[0,-1.6],'text-anchor':'bottom','text-allow-overlap':true,'text-ignore-placement':true},
     paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
 
   // pk10 : z10→13, cercles gris foncé
@@ -376,7 +372,7 @@ function _setupPKLayers(d){
     filter:['==','_pk_class','10'],
     layout:{'text-field':['get','_pk_label'],'text-size':10,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-offset':[0,-1.4],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+      'text-offset':[0,-1.4],'text-anchor':'bottom','text-allow-overlap':true,'text-ignore-placement':true},
     paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
 
   // pk1 : z13→15, cercles noirs fins
@@ -387,7 +383,7 @@ function _setupPKLayers(d){
     filter:['==','_pk_class','1'],
     layout:{'text-field':['get','_pk_label'],'text-size':9,
       'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
-      'text-offset':[0,-1.3],'text-anchor':'bottom','text-allow-overlap':false,'text-ignore-placement':false},
+      'text-offset':[0,-1.3],'text-anchor':'bottom','text-allow-overlap':true,'text-ignore-placement':true},
     paint:{'text-color':'#111','text-halo-color':'rgba(255,255,255,.97)','text-halo-width':1.5}});
 
   setVis('pk',_vis.pk);
@@ -410,7 +406,7 @@ var map = new maplibregl.Map({
   container: 'map',
   style: {
     version: 8,
-    glyphs: 'https://fonts.openmaptiles.org/{fontstack}/{range}.pbf',
+    glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
       'bm-sat': {type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'© Esri World Imagery',maxzoom:19},
       'bm-osm': {type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap',maxzoom:19},
@@ -545,20 +541,14 @@ if(location.protocol==='file:'){
     _restoreMapPos();
     /* Afficher état de chargement immédiatement */
     _updateLoadStatus();
-    /* Diagnostic v3.29 : vérifier source PK, couches et rendu après 5s */
+    /* Diagnostic v3.30 */
     setTimeout(function(){
       var src=map.getSource('pk_all');
-      if(src){
-        var feats=src.serialize().data.features||[];
-        var cls={};feats.forEach(function(f){var k=f.properties._pk_class||'vide';cls[k]=(cls[k]||0)+1;});
-        console.log('DIAG pk_all: '+feats.length+' features classes='+JSON.stringify(cls));
-      } else console.error('DIAG: pk_all source manquante');
-      ['pk-debug','pk50-c','pk10-c','pk1-c','pam-dot','acc-dot'].forEach(function(lid){
-        if(map.getLayer(lid)){
-          var vis=map.getLayoutProperty(lid,'visibility');
-          var rendered=map.queryRenderedFeatures(undefined,{layers:[lid]}).length;
-          console.log('DIAG '+lid+': vis='+vis+' rendered='+rendered);
-        } else console.warn('DIAG '+lid+': couche absente');
+      if(src){var feats=src.serialize().data.features||[];console.log('DIAG pk_all: '+feats.length+' features');}
+      else console.error('DIAG: pk_all source manquante');
+      ['pk50-c','pk10-c','pk1-c','pam-dot','acc-dot'].forEach(function(lid){
+        if(map.getLayer(lid)){console.log('DIAG '+lid+': vis='+map.getLayoutProperty(lid,'visibility')+' rendered='+map.queryRenderedFeatures(undefined,{layers:[lid]}).length);}
+        else console.warn('DIAG '+lid+': absent');
       });
       console.log('DIAG zoom:',map.getZoom().toFixed(1));
     },5000);
