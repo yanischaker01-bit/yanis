@@ -263,7 +263,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.18';
+  var V='v3.19';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +285,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.18';
+var APP_VER = 'v3.19';
 
 // ── PMTiles protocol ──
 var _pmProtocol = new pmtiles.Protocol();
@@ -674,6 +674,13 @@ function _initVectorLayers(){
   map.on('mouseenter','acc-dot',function(e){map.getCanvas().style.cursor='pointer';
     showHover(e.lngLat,'🚧 '+c(e.features[0].properties.NOM_ACCES||e.features[0].properties.Name||'Accès'));});
   map.on('mouseleave','acc-dot',function(){map.getCanvas().style.cursor='';hideHover();});
+
+  // ── TEST DIAGNOSTIC : cercle jaune fixe à PK 100+000 (LGV1) ──
+  map.addSource('_test',{type:'geojson',data:{type:'FeatureCollection',features:[
+    {type:'Feature',geometry:{type:'Point',coordinates:[0.2657,46.5558]},properties:{}}
+  ]}});
+  map.addLayer({id:'_test-c',type:'circle',source:'_test',
+    paint:{'circle-radius':20,'circle-color':'#ffff00','circle-stroke-width':3,'circle-stroke-color':'#000','circle-opacity':1}});
 
   // Fermer le détail sur clic vide
   map.on('click',function(e){
