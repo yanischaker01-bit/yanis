@@ -284,7 +284,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.34';
+  var V='v3.35';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -306,7 +306,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.34';
+var APP_VER = 'v3.35';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -690,7 +690,9 @@ function _initVectorLayers(){
     paint:{'line-color':'#ef6c00','line-width':7,'line-opacity':0.9}});
   map.addLayer({id:'oh-lbl',type:'symbol',source:'oh',minzoom:16,
     layout:{'text-field':['coalesce',['get','libelle_ob'],['get','code_objet'],'OH'],
-      'text-size':10,'text-font':['Open Sans Regular'],'symbol-placement':'line','text-max-angle':45},
+      'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'symbol-placement':'line','text-max-angle':45,
+      'text-allow-overlap':true,'text-ignore-placement':true},
     paint:{'text-color':'white','text-halo-color':'#bf360c','text-halo-width':1.2}});
   map.on('mouseenter','oh-line',function(e){map.getCanvas().style.cursor='pointer';});
   map.on('mouseleave','oh-line',function(){map.getCanvas().style.cursor='';});
