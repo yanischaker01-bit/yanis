@@ -301,7 +301,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.40';
+  var V='v3.41';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -323,7 +323,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.40';
+var APP_VER = 'v3.41';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -447,7 +447,7 @@ var map = new maplibregl.Map({
     glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
       'bm-sat': {type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'© Esri World Imagery',maxzoom:19},
-      'bm-sat-ref': {type:'raster',tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Reference_Overlay/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'',maxzoom:19},
+      'bm-sat-ref': {type:'raster',tiles:['https://a.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png','https://b.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png','https://c.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png'],tileSize:512,attribution:'© CARTO',maxzoom:20},
       'bm-osm': {type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap',maxzoom:19},
       'bm-ign': {type:'raster',tiles:['https://wxs.ign.fr/decouverte/geoportail/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/png&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}'],tileSize:256,attribution:'© IGN Géoportail',maxzoom:18}
     },
@@ -1131,9 +1131,29 @@ function findNearest(){
 }
 window.findNearest=findNearest;
 
-/* Extrait le côté (1 ou 2) depuis un nom de voie/axe quelle que soit la position du chiffre
-   Ex : V1→'1', RMS1→'1', R1MS→'1', RFN2→'2', LGV→'' */
+/* Extrait le côté (1 ou 2) depuis n'importe quel nom de voie/axe */
 function _sideNum(v){var m=String(v||'').match(/[12]/);return m?m[0]:'';}
+
+/* Normalise un nom de voie/axe en {b:branche, s:côté}
+   Gère les 3 conventions : PK (RMS1/LGV1), Accès (MS1/LGV V1), PAM (MS1/LGV)
+   Alias branches : PK RJ→JU, PK RV→VN (noms différents entre PK et Accès/PAM) */
+function _parseVoie(v){
+  var raw=String(v||'').trim().toUpperCase();
+  if(!raw)return{b:'',s:''};
+  /* LGV avec côté */
+  if(raw==='LGV1'||raw==='LGV V1')return{b:'lgv',s:'1'};
+  if(raw==='LGV2'||raw==='LGV V2')return{b:'lgv',s:'2'};
+  /* LGV générique (PAM axe='LGV' ou Accès LGV BMC etc.) */
+  if(raw==='LGV'||/^LGV[\s\/\-_]/.test(raw))return{b:'lgv',s:''};
+  /* Pattern : préfixe R optionnel, puis <LETTRES><CHIFFRE> ou <CHIFFRE><LETTRES> */
+  var m=raw.match(/^R?([A-Z]+?)([12])$/)||raw.match(/^R?([12])([A-Z]+)$/);
+  if(!m)return{b:raw.toLowerCase(),s:''};
+  var letters,digit;
+  if(/^[12]$/.test(m[1])){digit=m[1];letters=m[2];}else{letters=m[1];digit=m[2];}
+  /* Aliases : dans les données Accès/PAM, RJ→JU et RV→VN */
+  var ALIAS={J:'JU',V:'VN'};
+  return{b:(ALIAS[letters]||letters).toLowerCase(),s:digit};
+}
 
 function _finishFindNearest(lat,lng,acc){
   var npk=null, pkPrec='?';
@@ -1187,25 +1207,40 @@ function _finishFindNearest(lat,lng,acc){
 
   console.log('_finishFindNearest: résultat prec='+pkPrec+' npk='+(npk?'oui':'non'));
 
-  /* Détecter le côté depuis la voie du PK le plus proche */
+  /* Détecter branche + côté depuis la voie du PK le plus proche */
   var pkVoie=npk?String(npk.f.props._voie||npk.f.props.voie||''):'';
-  var voieN=_sideNum(pkVoie);  /* '1', '2', ou '' */
+  var voieN=_sideNum(pkVoie);     /* '1' ou '2' – pour affichage */
+  var pkP=_parseVoie(pkVoie);     /* {b, s} – pour filtrage précis */
 
-  /* Accès : même côté strict → sinon générique (pas de chiffre dans AXE) → sinon tout */
+  /* Accès : même branche + même côté → sinon même côté seul → sinon tout
+     Exemple : RMS1 (b=ms,s=1) → MS1 ; LGV1 (b=lgv,s=1) → LGV V1 */
   var accPool=layerData.acces;
-  if(voieN){
-    var accSide=accPool.filter(function(f){return _sideNum(String(f.props.AXE||f.props.axe||''))===voieN;});
-    if(accSide.length){accPool=accSide;}
-    else{var accGen=accPool.filter(function(f){return!_sideNum(String(f.props.AXE||f.props.axe||''));});if(accGen.length)accPool=accGen;}
+  if(pkP.b){
+    var accBest=accPool.filter(function(f){
+      var a=_parseVoie(String(f.props.AXE||f.props.axe||''));
+      return a.b===pkP.b&&(a.s===pkP.s||!a.s);
+    });
+    if(accBest.length){accPool=accBest;}
+    else if(pkP.s){
+      var accSide=accPool.filter(function(f){return _sideNum(String(f.props.AXE||f.props.axe||''))===pkP.s;});
+      if(accSide.length)accPool=accSide;
+    }
   }
   var nacc=_nearestOf(lat,lng,accPool);
 
-  /* PAM : même côté strict → sinon générique (pas de chiffre dans axe) → sinon tout */
+  /* PAM : même branche + même côté (ou branche sans côté, ex. LGV) → sinon même côté → sinon tout
+     Exemple : RMS1 → MS1 ; LGV1 → LGV (axe générique LGV accepté pour LGV1/2) */
   var pamPool=layerData.pam;
-  if(voieN){
-    var pamSide=pamPool.filter(function(f){return _sideNum(String(f.props.axe||f.props.AXE||''))===voieN;});
-    if(pamSide.length){pamPool=pamSide;}
-    else{var pamGen=pamPool.filter(function(f){return!_sideNum(String(f.props.axe||f.props.AXE||''));});if(pamGen.length)pamPool=pamGen;}
+  if(pkP.b){
+    var pamBest=pamPool.filter(function(f){
+      var a=_parseVoie(String(f.props.axe||f.props.AXE||''));
+      return a.b===pkP.b&&(a.s===pkP.s||!a.s);
+    });
+    if(pamBest.length){pamPool=pamBest;}
+    else if(pkP.s){
+      var pamSide=pamPool.filter(function(f){return _sideNum(String(f.props.axe||f.props.AXE||''))===pkP.s;});
+      if(pamSide.length)pamPool=pamSide;
+    }
   }
   var npam=_nearestOf(lat,lng,pamPool);
 
@@ -1215,7 +1250,8 @@ function _finishFindNearest(lat,lng,acc){
       'style="font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;margin-top:4px">'+label+'</button>';
   }
   var html='<div style="padding:12px;display:flex;flex-direction:column;gap:10px">';
-  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+(pkVoie?' · Voie <b>'+c(pkVoie)+'</b> → côté '+voieN:'')+'</p>';
+  var voieInfo=pkVoie?(pkP.b?(' · Voie <b>'+c(pkVoie)+'</b> → branche <b>'+pkP.b.toUpperCase()+'</b> côté <b>'+pkP.s+'</b>'):''):'' ;
+  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+voieInfo+'</p>';
 
   if(npk){
     var p=npk.f.props,co=npk.f.geom.coordinates;
@@ -1231,7 +1267,7 @@ function _finishFindNearest(lat,lng,acc){
     html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
     html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
     html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+lbl+'</div>';
-    html+='<div style="font-size:12px;color:#555">Voie : <b>'+c(p._voie||p.voie||'—')+'</b>'+(voieN?' → côté '+voieN+' (Accès+PAM filtrés)':'')+'</div>';
+    html+='<div style="font-size:12px;color:#555">Voie : <b>'+c(p._voie||p.voie||'—')+'</b>'+(pkP.b?' (branche '+pkP.b.toUpperCase()+', côté '+pkP.s+'  — Accès+PAM filtrés)':'')+'</div>';
     html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
     html+=zoomBtn(co,18,'→ Zoom sur ce PK');
     html+='</div>';
@@ -1242,6 +1278,7 @@ function _finishFindNearest(lat,lng,acc){
     html+='<div style="padding:10px;background:#fff8e1;border-radius:8px;border-left:4px solid #e65100">';
     html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">Accès le plus proche</div>';
     html+='<div style="font-size:15px;font-weight:700;color:#e65100">🚧 '+c(p.NOM_ACCES||p.Name||'Accès')+'</div>';
+    if(p.AXE||p.axe)html+='<div style="font-size:12px;color:#555">Axe : <b>'+c(p.AXE||p.axe)+'</b></div>';
     if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
     html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
     html+=zoomBtn(co,16,'→ Zoom sur cet accès');

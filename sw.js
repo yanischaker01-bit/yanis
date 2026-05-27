@@ -1,5 +1,5 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v41';
+const CACHE = 'lgv-sea-v42';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 /* Ne jamais pré-cacher le HTML : il doit toujours venir du réseau */
@@ -67,7 +67,7 @@ self.addEventListener('fetch', e => {
   }
 
   /* Tuiles OSM/Esri/IGN → réseau d'abord, cache en fallback */
-  if (/openstreetmap\.org|arcgisonline\.com|geoportail/.test(url)) {
+  if (/openstreetmap\.org|arcgisonline\.com|geoportail|cartocdn\.com/.test(url)) {
     e.respondWith(
       fetch(e.request)
         .then(r => {
