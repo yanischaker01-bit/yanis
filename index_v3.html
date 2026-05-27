@@ -172,12 +172,19 @@ button,a,[onclick]{touch-action:manipulation}
 .li{display:flex;align-items:center;gap:7px;margin:3px 0;line-height:1.3}
 .lc{width:13px;height:13px;border-radius:3px;flex-shrink:0;border:1px solid rgba(0,0,0,.15)}
 .ll{width:20px;height:3px;flex-shrink:0;border-radius:2px}
+/* Drag handle detail panel */
+#dp-drag-handle{display:none;height:22px;background:#1a1a2e;flex-shrink:0;
+  align-items:center;justify-content:center;cursor:grab}
+#dp-drag-handle::after{content:'';width:36px;height:4px;border-radius:2px;background:rgba(255,255,255,.35)}
+/* FAB secondary (masqués sur mobile) */
+#fab-toggle{display:none}
 /* Mobile */
 @media(max-width:768px){
-  #detail-panel{position:fixed;width:100%;max-width:100%;top:auto;height:70vh;
+  #detail-panel{position:fixed;width:100%;max-width:100%;top:auto;height:72vh;
     transform:translateY(100%);box-shadow:0 -4px 20px rgba(0,0,0,.2);
     transition:transform .25s cubic-bezier(.4,0,.2,1)}
   #detail-panel.open{transform:translateY(0)}
+  #dp-drag-handle{display:flex}
   #dp-backdrop.open{background:rgba(0,0,0,.25)}
   #search-wrap{left:44px;width:calc(100vw - 110px);transform:none;top:8px}
   #search-input{font-size:14px;padding:9px 12px}
@@ -185,9 +192,14 @@ button,a,[onclick]{touch-action:manipulation}
   #layers-panel{width:min(290px,82vw)}
   .lp-item{padding:9px 4px;font-size:13.5px}
   .lp-item input[type=checkbox]{width:18px;height:18px}
-  .fab{width:50px;height:50px;font-size:22px}
-  #fab-bar{bottom:max(28px,calc(env(safe-area-inset-bottom,0px)+12px));right:8px;gap:8px}
+  .fab{width:48px;height:48px;font-size:20px}
+  #fab-bar{bottom:max(24px,calc(env(safe-area-inset-bottom,0px)+8px));right:8px;gap:6px}
   #tbl-panel.open{height:52vh}
+  /* FAB secondaires masqués – affichés via toggle */
+  .fab-secondary{display:none}
+  #fab-toggle{display:flex}
+  #fab-bar.expanded .fab-secondary{display:flex}
+  #fab-toggle.active{background:#1a1a2e;color:white}
 }
 @media(max-width:420px){
   #search-wrap{left:40px;width:calc(100vw - 100px)}
@@ -227,16 +239,18 @@ button,a,[onclick]{touch-action:manipulation}
 <div id="load-status"></div>
 <div id="fab-bar">
   <button id="install-btn" class="fab fab-white" style="display:none" title="Installer l'application" onclick="installApp()">📲</button>
-  <button id="offline-btn" class="fab fab-white" title="Mettre en cache hors-ligne" onclick="warmOfflineCache()">📶</button>
+  <button id="offline-btn" class="fab fab-white fab-secondary" title="Mettre en cache hors-ligne" onclick="warmOfflineCache()">📶</button>
   <button class="fab fab-white" title="Me localiser" onclick="locateMe()">📍</button>
   <button class="fab fab-white" title="PK / Accès / PAM le plus proche" onclick="findNearest()" style="background:#cc0000;color:white;font-size:14px;font-weight:700">PK?</button>
   <button class="fab fab-white" title="Vue d'ensemble LGV SEA" onclick="resetView()">🏠</button>
-  <button class="fab fab-white" title="Table attributaire" onclick="toggleTable()">📋</button>
-  <button class="fab fab-white" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
+  <button class="fab fab-white fab-secondary" title="Table attributaire" onclick="toggleTable()">📋</button>
+  <button class="fab fab-white fab-secondary" title="Importer KML/KMZ" onclick="document.getElementById('kml-input').click()">📎</button>
+  <button id="fab-toggle" class="fab fab-white" title="Plus d'outils" onclick="toggleFabBar()">⋯</button>
   <input type="file" id="kml-input" accept=".kml,.kmz" style="display:none" onchange="importKML(this)"/>
 </div>
 <div id="dp-backdrop" onclick="closeDetail()"></div>
 <div id="detail-panel">
+  <div id="dp-drag-handle"></div>
   <div id="detail-header">
     <span id="detail-title" style="flex:1;font-size:12.5px;font-weight:700;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
     <button onclick="closeDetail()" style="background:none;border:none;color:white;font-size:20px;cursor:pointer;line-height:1;flex-shrink:0;padding:0 2px">✕</button>
@@ -263,7 +277,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.32';
+  var V='v3.33';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -285,7 +299,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.32';
+var APP_VER = 'v3.33';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -637,12 +651,13 @@ function _initVectorLayers(){
 
   // ── OA Emprises (polygones avec labels permanents) ──
   map.addLayer({id:'oapoly-fill',type:'fill',source:'oa_poly',minzoom:13,
-    paint:{'fill-color':'#00bcd4','fill-opacity':0.18}});
+    paint:{'fill-color':'#00bcd4','fill-opacity':0.30}});
   map.addLayer({id:'oapoly-outline',type:'line',source:'oa_poly',minzoom:13,
-    paint:{'line-color':'#00bcd4','line-width':1.8}});
-  map.addLayer({id:'oapoly-lbl',type:'symbol',source:'oa_poly',minzoom:13,
-    layout:{'text-field':['coalesce',['get','LIBELLE_COURT'],['get','CODE_OBJET'],'OA'],
-      'text-size':10,'text-font':['Open Sans Regular'],'text-allow-overlap':false,'text-ignore-placement':false},
+    paint:{'line-color':'#00bcd4','line-width':2.5,'line-opacity':0.9}});
+  map.addLayer({id:'oapoly-lbl',type:'symbol',source:'oa_poly',minzoom:15,
+    layout:{'text-field':['coalesce',['get','LIBELLE_COURT'],['get','name'],'OA'],
+      'text-size':10,'text-font':['Open Sans Regular','Arial Unicode MS Regular'],
+      'text-allow-overlap':true,'text-ignore-placement':true},
     paint:{'text-color':'white','text-halo-color':'#008fa3','text-halo-width':1.2}});
   map.on('mouseenter','oapoly-fill',function(e){map.getCanvas().style.cursor='pointer';});
   map.on('mouseleave','oapoly-fill',function(){map.getCanvas().style.cursor='';});
@@ -1479,6 +1494,13 @@ function openDetailPAM(p){
 function openDetailAcces(p){
   var name=c(p.NOM_ACCES||p.Name||'Accès');
   openDetail('🚧 '+name,dpHero('Accès','🚧 '+name,'','#e65100')+dpAllFields(p));
+}
+// FAB toggle (mobile)
+function toggleFabBar(){
+  var bar=document.getElementById('fab-bar');
+  var btn=document.getElementById('fab-toggle');
+  bar.classList.toggle('expanded');
+  btn.classList.toggle('active');
 }
 // Swipe-down mobile
 (function(){

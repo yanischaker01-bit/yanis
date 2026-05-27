@@ -1,5 +1,5 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v33';
+const CACHE = 'lgv-sea-v34';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 /* Ne jamais pré-cacher le HTML : il doit toujours venir du réseau */
