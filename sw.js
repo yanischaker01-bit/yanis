@@ -1,5 +1,5 @@
 /* Service Worker – Carte LGV SEA */
-const CACHE = 'lgv-sea-v37';
+const CACHE = 'lgv-sea-v38';
 const TILE_CACHE = 'lgv-tiles-v1';
 
 /* Ne jamais pré-cacher le HTML : il doit toujours venir du réseau */
@@ -20,7 +20,8 @@ const PRECACHE = [
   './data/n2.geojson',
   './data/eco.geojson',
   './data/bois.geojson',
-  './data/oa_poly.pmtiles',
+  /* oa_poly.pmtiles retiré : le protocole PMTiles utilise des requêtes Range
+     incompatibles avec la mise en cache SW (réponse 206 non cacheable) */
 ];
 
 self.addEventListener('message', e => {
@@ -58,6 +59,12 @@ self.addEventListener('fetch', e => {
 
   /* Navigation HTML → jamais interceptée, toujours réseau direct */
   if (e.request.mode === 'navigate') return;
+
+  /* PMTiles (.pmtiles) → réseau direct obligatoire (requêtes Range / 206) */
+  if (/\.pmtiles(\?|$)/.test(url)) {
+    e.respondWith(fetch(e.request));
+    return;
+  }
 
   /* Tuiles OSM/Esri/IGN → réseau d'abord, cache en fallback */
   if (/openstreetmap\.org|arcgisonline\.com|geoportail/.test(url)) {
