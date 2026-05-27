@@ -292,7 +292,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.37';
+  var V='v3.38';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -314,7 +314,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.37';
+var APP_VER = 'v3.38';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -1168,27 +1168,33 @@ function _finishFindNearest(lat,lng,acc){
 
   console.log('_finishFindNearest: résultat prec='+pkPrec+' npk='+(npk?'oui':'non'));
 
-  /* Détecter la voie (V1 ou V2) depuis le PK le plus proche */
-  var pkVoie=npk?String(npk.f.props._voie||npk.f.props.voie||''):'';
-  var voieN=pkVoie.match(/[12]$/)?pkVoie.slice(-1):'';  /* '1', '2', ou '' */
+  /* Extrait le côté (1 ou 2) depuis un nom de voie/axe quelle que soit la position du chiffre
+     Ex : V1→'1', RMS1→'1', R1MS→'1', RFN2→'2', LGV→'' */
+  function _sideNum(v){var m=String(v||'').match(/[12]/);return m?m[0]:'';}
 
-  /* Accès : filtrer sur même voie si détectée (AXE finit par 1/2 ou contient V1/V2) */
+  /* Détecter le côté depuis la voie du PK le plus proche */
+  var pkVoie=npk?String(npk.f.props._voie||npk.f.props.voie||''):'';
+  var voieN=_sideNum(pkVoie);  /* '1', '2', ou '' */
+
+  /* Accès : même côté OU générique (AXE sans chiffre) */
   var accPool=layerData.acces;
   if(voieN){
     var filtAcc=accPool.filter(function(f){
-      var ax=String(f.props.AXE||'');
-      return ax.endsWith(voieN)||ax.includes('V'+voieN);
+      var ax=String(f.props.AXE||f.props.axe||'');
+      var s=_sideNum(ax);
+      return !s||s===voieN;  /* générique ou même côté */
     });
     if(filtAcc.length)accPool=filtAcc;
   }
   var nacc=_nearestOf(lat,lng,accPool);
 
-  /* PAM : filtrer sur même voie, mais garder les PAM génériques "LGV" */
+  /* PAM : même côté OU axe 'LGV' (générique) OU pas de chiffre dans l'axe */
   var pamPool=layerData.pam;
   if(voieN){
     var filtPam=pamPool.filter(function(f){
-      var ax=String(f.props.axe||'');
-      return ax==='LGV'||ax.endsWith(voieN);
+      var ax=String(f.props.axe||f.props.AXE||'');
+      var s=_sideNum(ax);
+      return ax.toUpperCase()==='LGV'||!s||s===voieN;
     });
     if(filtPam.length)pamPool=filtPam;
   }
@@ -1200,7 +1206,7 @@ function _finishFindNearest(lat,lng,acc){
       'style="font-size:10px;padding:2px 8px;border-radius:4px;border:1px solid #ccc;cursor:pointer;margin-top:4px">'+label+'</button>';
   }
   var html='<div style="padding:12px;display:flex;flex-direction:column;gap:10px">';
-  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+(voieN?' · Voie V'+voieN+' détectée':'')+'</p>';
+  html+='<p style="font-size:11px;color:#888;margin:0">📍 GPS : ±'+Math.round(acc)+' m · PK : précision '+pkPrec+(pkVoie?' · Voie <b>'+c(pkVoie)+'</b> → côté '+voieN:'')+'</p>';
 
   if(npk){
     var p=npk.f.props,co=npk.f.geom.coordinates;
@@ -1216,7 +1222,7 @@ function _finishFindNearest(lat,lng,acc){
     html+='<div style="padding:10px;background:#fff3e0;border-radius:8px;border-left:4px solid #cc0000">';
     html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PK le plus proche</div>';
     html+='<div style="font-size:18px;font-weight:700;color:#cc0000">'+lbl+'</div>';
-    html+='<div style="font-size:12px;color:#555">Voie : '+c(p._voie||p.voie||'—')+(voieN?' → filtre V'+voieN+' appliqué':'')+'</div>';
+    html+='<div style="font-size:12px;color:#555">Voie : <b>'+c(p._voie||p.voie||'—')+'</b>'+(voieN?' → côté '+voieN+' (Accès+PAM filtrés)':'')+'</div>';
     html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npk.d)+'</div>';
     html+=zoomBtn(co,18,'→ Zoom sur ce PK');
     html+='</div>';
