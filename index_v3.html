@@ -301,7 +301,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.43';
+  var V='v3.44';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -323,7 +323,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.43';
+var APP_VER = 'v3.44';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -1116,6 +1116,16 @@ function _nearestOf(lat,lng,features){
   });
   return best;
 }
+function _nearestN(lat,lng,features,n){
+  var scored=[];
+  features.forEach(function(f){
+    if(!f.geom||f.geom.type!=='Point')return;
+    var d=_haversine(lat,lng,f.geom.coordinates[1],f.geom.coordinates[0]);
+    scored.push({f:f,d:d});
+  });
+  scored.sort(function(a,b){return a.d-b.d;});
+  return scored.slice(0,n);
+}
 function _dStr(m){return m<1000?Math.round(m)+' m':(m/1000).toFixed(2)+' km';}
 function findNearest(){
   if(!navigator.geolocation){showNetToast('📍 Géolocalisation non disponible.');return;}
@@ -1260,7 +1270,7 @@ function _finishFindNearest(lat,lng,acc){
     });
     if(accFiltered.length)accPool=accFiltered;
   }
-  var nacc=_nearestOf(lat,lng,accPool);
+  var naccs=_nearestN(lat,lng,accPool,3);
 
   /* PAM : même règle ; LGV générique (a.s==='') accepté pour LGV1 et LGV2 */
   var pamPool=layerData.pam;
@@ -1271,7 +1281,7 @@ function _finishFindNearest(lat,lng,acc){
     });
     if(pamFiltered.length)pamPool=pamFiltered;
   }
-  var npam=_nearestOf(lat,lng,pamPool);
+  var npams=_nearestN(lat,lng,pamPool,3);
 
   function zoomBtn(coords,z,label){
     var co=JSON.stringify(coords);
@@ -1302,35 +1312,39 @@ function _finishFindNearest(lat,lng,acc){
     html+='</div>';
   }else{html+='<div style="padding:8px;color:#aaa">PK : données non chargées</div>';}
 
-  if(nacc){
-    var p=nacc.f.props,co=nacc.f.geom.coordinates;
-    html+='<div style="padding:10px;background:#fff8e1;border-radius:8px;border-left:4px solid #e65100">';
-    html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">Accès le plus proche</div>';
-    html+='<div style="font-size:15px;font-weight:700;color:#e65100">🚧 '+c(p.NOM_ACCES||p.Name||'Accès')+'</div>';
-    if(p.AXE||p.axe)html+='<div style="font-size:12px;color:#555">Axe : <b>'+c(p.AXE||p.axe)+'</b></div>';
-    if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
-    html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
-    html+=zoomBtn(co,16,'→ Zoom sur cet accès');
-    html+='<div style="display:flex;gap:6px;margin-top:6px">'+
-      '<a href="https://www.google.com/maps/dir/?api=1&destination='+co[1]+','+co[0]+'" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e8f5e9;color:#2e7d32;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🗺 Maps</a>'+
-      '<a href="https://waze.com/ul?ll='+co[1]+','+co[0]+'&navigate=yes" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e3f2fd;color:#1565c0;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🚗 Waze</a>'+
-      '</div>';
-    html+='</div>';
+  if(naccs.length){
+    naccs.forEach(function(nacc,i){
+      var p=nacc.f.props,co=nacc.f.geom.coordinates;
+      html+='<div style="padding:10px;background:#fff8e1;border-radius:8px;border-left:4px solid #e65100">';
+      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">'+(i===0?'Accès le plus proche':'Accès #'+(i+1))+'</div>';
+      html+='<div style="font-size:15px;font-weight:700;color:#e65100">🚧 '+c(p.NOM_ACCES||p.Name||'Accès')+'</div>';
+      if(p.AXE||p.axe)html+='<div style="font-size:12px;color:#555">Axe : <b>'+c(p.AXE||p.axe)+'</b></div>';
+      if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
+      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
+      html+=zoomBtn(co,16,'→ Zoom sur cet accès');
+      html+='<div style="display:flex;gap:6px;margin-top:6px">'+
+        '<a href="https://www.google.com/maps/dir/?api=1&destination='+co[1]+','+co[0]+'" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e8f5e9;color:#2e7d32;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🗺 Maps</a>'+
+        '<a href="https://waze.com/ul?ll='+co[1]+','+co[0]+'&navigate=yes" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e3f2fd;color:#1565c0;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🚗 Waze</a>'+
+        '</div>';
+      html+='</div>';
+    });
   }else{html+='<div style="padding:8px;color:#aaa">Accès : données non chargées</div>';}
 
-  if(npam){
-    var p=npam.f.props,co=npam.f.geom.coordinates;
-    html+='<div style="padding:10px;background:#f3e5f5;border-radius:8px;border-left:4px solid #9c27b0">';
-    html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">PAM la plus proche</div>';
-    html+='<div style="font-size:15px;font-weight:700;color:#9c27b0">🌱 '+c(p.libelle||'PAM')+'</div>';
-    if(p.axe)html+='<div style="font-size:12px;color:#555">Axe : '+c(p.axe)+'</div>';
-    html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npam.d)+'</div>';
-    html+=zoomBtn(co,16,'→ Zoom sur cette PAM');
-    html+='<div style="display:flex;gap:6px;margin-top:6px">'+
-      '<a href="https://www.google.com/maps/dir/?api=1&destination='+co[1]+','+co[0]+'" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e8f5e9;color:#2e7d32;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🗺 Maps</a>'+
-      '<a href="https://waze.com/ul?ll='+co[1]+','+co[0]+'&navigate=yes" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e3f2fd;color:#1565c0;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🚗 Waze</a>'+
-      '</div>';
-    html+='</div>';
+  if(npams.length){
+    npams.forEach(function(npam,i){
+      var p=npam.f.props,co=npam.f.geom.coordinates;
+      html+='<div style="padding:10px;background:#f3e5f5;border-radius:8px;border-left:4px solid #9c27b0">';
+      html+='<div style="font-size:11px;color:#888;font-weight:600;text-transform:uppercase;margin-bottom:4px">'+(i===0?'PAM la plus proche':'PAM #'+(i+1))+'</div>';
+      html+='<div style="font-size:15px;font-weight:700;color:#9c27b0">🌱 '+c(p.libelle||'PAM')+'</div>';
+      if(p.axe)html+='<div style="font-size:12px;color:#555">Axe : '+c(p.axe)+'</div>';
+      html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npam.d)+'</div>';
+      html+=zoomBtn(co,16,'→ Zoom sur cette PAM');
+      html+='<div style="display:flex;gap:6px;margin-top:6px">'+
+        '<a href="https://www.google.com/maps/dir/?api=1&destination='+co[1]+','+co[0]+'" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e8f5e9;color:#2e7d32;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🗺 Maps</a>'+
+        '<a href="https://waze.com/ul?ll='+co[1]+','+co[0]+'&navigate=yes" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e3f2fd;color:#1565c0;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🚗 Waze</a>'+
+        '</div>';
+      html+='</div>';
+    });
   }else{html+='<div style="padding:8px;color:#aaa">PAM : données non chargées</div>';}
 
   html+='</div>';
