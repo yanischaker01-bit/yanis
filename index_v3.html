@@ -301,7 +301,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.41';
+  var V='v3.42';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -323,7 +323,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.41';
+var APP_VER = 'v3.42';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -1134,25 +1134,55 @@ window.findNearest=findNearest;
 /* Extrait le côté (1 ou 2) depuis n'importe quel nom de voie/axe */
 function _sideNum(v){var m=String(v||'').match(/[12]/);return m?m[0]:'';}
 
-/* Normalise un nom de voie/axe en {b:branche, s:côté}
-   Gère les 3 conventions : PK (RMS1/LGV1), Accès (MS1/LGV V1), PAM (MS1/LGV)
-   Alias branches : PK RJ→JU, PK RV→VN (noms différents entre PK et Accès/PAM) */
+/* Normalise un nom de voie/axe en {b:branche_canonique, s:côté}
+ *
+ * Conventions dans les données :
+ *   PK (_voie)  : LGV1, V1, RMS1, R1MS, RJ2, RV1 …
+ *   Accès (AXE) : LGV V1, MS1, JU2, VN1 …      (sans préfixe R)
+ *   PAM  (axe)  : LGV (générique), MS1, JU2, VN1…
+ *
+ * Règles :
+ *  1. LGV1 / V1 / LGV V1          → {b:'lgv', s:'1'}
+ *     LGV2 / V2 / LGV V2          → {b:'lgv', s:'2'}
+ *     LGV / LGV BMC / LGV V5 …   → {b:'lgv', s:''} générique
+ *
+ *  2. Avec préfixe R (format PK) :
+ *     R<LETTRES><CHIFFRE> ou R<CHIFFRE><LETTRES>
+ *     Aliases R-only : RJ→JU, RV→VN (noms différents côté Accès/PAM)
+ *
+ *  3. Sans préfixe R (format Accès/PAM) :
+ *     <LETTRES><CHIFFRE> ou <CHIFFRE><LETTRES>  →  branche = lettres telles quelles
+ *     PAS d'alias ici : V sans R = LGV (déjà géré en #1), VN = Villeneuve
+ */
 function _parseVoie(v){
   var raw=String(v||'').trim().toUpperCase();
   if(!raw)return{b:'',s:''};
-  /* LGV avec côté */
-  if(raw==='LGV1'||raw==='LGV V1')return{b:'lgv',s:'1'};
-  if(raw==='LGV2'||raw==='LGV V2')return{b:'lgv',s:'2'};
-  /* LGV générique (PAM axe='LGV' ou Accès LGV BMC etc.) */
-  if(raw==='LGV'||/^LGV[\s\/\-_]/.test(raw))return{b:'lgv',s:''};
-  /* Pattern : préfixe R optionnel, puis <LETTRES><CHIFFRE> ou <CHIFFRE><LETTRES> */
-  var m=raw.match(/^R?([A-Z]+?)([12])$/)||raw.match(/^R?([12])([A-Z]+)$/);
+
+  /* 1 — LGV main line (toutes variantes connues) */
+  if(raw==='LGV1'||raw==='V1')          return{b:'lgv',s:'1'};
+  if(raw==='LGV2'||raw==='V2')          return{b:'lgv',s:'2'};
+  if(raw==='LGV V1')                    return{b:'lgv',s:'1'};
+  if(raw==='LGV V2')                    return{b:'lgv',s:'2'};
+  if(raw==='LGV'||/^LGV[\s]/.test(raw))return{b:'lgv',s:''};
+
+  /* 2 — Format PK avec R (ex: RMS1, R1MS, RJ2, RV1) */
+  var mR =raw.match(/^R([A-Z]+?)([12])$/);   /* R + lettres + chiffre */
+  var mRi=raw.match(/^R([12])([A-Z]+)$/);    /* R + chiffre + lettres */
+  if(mR||mRi){
+    var letters2,digit2;
+    if(mR){letters2=mR[1];digit2=mR[2];}
+    else  {letters2=mRi[2];digit2=mRi[1];}
+    var RMAP={J:'JU',V:'VN'};              /* alias uniquement avec R */
+    return{b:(RMAP[letters2]||letters2).toLowerCase(),s:digit2};
+  }
+
+  /* 3 — Format Accès/PAM sans R (ex: MS1, VN1, JU2, CA2) */
+  var m=raw.match(/^([A-Z]+?)([12])$/)||raw.match(/^([12])([A-Z]+)$/);
   if(!m)return{b:raw.toLowerCase(),s:''};
-  var letters,digit;
-  if(/^[12]$/.test(m[1])){digit=m[1];letters=m[2];}else{letters=m[1];digit=m[2];}
-  /* Aliases : dans les données Accès/PAM, RJ→JU et RV→VN */
-  var ALIAS={J:'JU',V:'VN'};
-  return{b:(ALIAS[letters]||letters).toLowerCase(),s:digit};
+  var letters3,digit3;
+  if(/^[12]$/.test(m[1])){digit3=m[1];letters3=m[2];}
+  else                    {letters3=m[1];digit3=m[2];}
+  return{b:letters3.toLowerCase(),s:digit3};
 }
 
 function _finishFindNearest(lat,lng,acc){
@@ -1212,35 +1242,27 @@ function _finishFindNearest(lat,lng,acc){
   var voieN=_sideNum(pkVoie);     /* '1' ou '2' – pour affichage */
   var pkP=_parseVoie(pkVoie);     /* {b, s} – pour filtrage précis */
 
-  /* Accès : même branche + même côté → sinon même côté seul → sinon tout
-     Exemple : RMS1 (b=ms,s=1) → MS1 ; LGV1 (b=lgv,s=1) → LGV V1 */
+  /* Accès : branche + côté identiques (a.s==='' = générique, accepté)
+     Pas de fallback cross-voie — si pas de match, on garde tout le pool
+     RMS1→MS1, LGV1→LGV V1, RJ2→JU2, RV1→VN1 */
   var accPool=layerData.acces;
   if(pkP.b){
-    var accBest=accPool.filter(function(f){
+    var accFiltered=accPool.filter(function(f){
       var a=_parseVoie(String(f.props.AXE||f.props.axe||''));
-      return a.b===pkP.b&&(a.s===pkP.s||!a.s);
+      return a.b===pkP.b&&(a.s===pkP.s||a.s==='');
     });
-    if(accBest.length){accPool=accBest;}
-    else if(pkP.s){
-      var accSide=accPool.filter(function(f){return _sideNum(String(f.props.AXE||f.props.axe||''))===pkP.s;});
-      if(accSide.length)accPool=accSide;
-    }
+    if(accFiltered.length)accPool=accFiltered;
   }
   var nacc=_nearestOf(lat,lng,accPool);
 
-  /* PAM : même branche + même côté (ou branche sans côté, ex. LGV) → sinon même côté → sinon tout
-     Exemple : RMS1 → MS1 ; LGV1 → LGV (axe générique LGV accepté pour LGV1/2) */
+  /* PAM : même règle ; LGV générique (a.s==='') accepté pour LGV1 et LGV2 */
   var pamPool=layerData.pam;
   if(pkP.b){
-    var pamBest=pamPool.filter(function(f){
+    var pamFiltered=pamPool.filter(function(f){
       var a=_parseVoie(String(f.props.axe||f.props.AXE||''));
-      return a.b===pkP.b&&(a.s===pkP.s||!a.s);
+      return a.b===pkP.b&&(a.s===pkP.s||a.s==='');
     });
-    if(pamBest.length){pamPool=pamBest;}
-    else if(pkP.s){
-      var pamSide=pamPool.filter(function(f){return _sideNum(String(f.props.axe||f.props.AXE||''))===pkP.s;});
-      if(pamSide.length)pamPool=pamSide;
-    }
+    if(pamFiltered.length)pamPool=pamFiltered;
   }
   var npam=_nearestOf(lat,lng,pamPool);
 
