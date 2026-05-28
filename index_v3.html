@@ -301,7 +301,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Cache-bust automatique sur changement de version ── */
 (function(){
-  var V='v3.42';
+  var V='v3.43';
   try{
     if(location.search.indexOf('reset=1')!==-1)return;
     var s=localStorage.getItem('lgv_app_ver');
@@ -323,7 +323,7 @@ if(location.search.indexOf('reset=1')!==-1){
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.42';
+var APP_VER = 'v3.43';
 
 // ── Pré-chargement PK avant init map (source inline → rendu MapLibre GL v4 garanti) ──
 var _pkPrefetch=null, _pkMapReady=false;
@@ -894,6 +894,13 @@ function _loadAllData(){
   // PAM – source créée inline (MapLibre GL v4 : pas de setData sur source vide)
   loadJSON('pam').then(function(d){
     var cnt=(d.features||[]).length;
+    /* Injecter _lat/_lng dans les propriétés pour les liens de navigation */
+    (d.features||[]).forEach(function(f){
+      if(f.geometry&&f.geometry.type==='Point'){
+        f.properties._lat=f.geometry.coordinates[1];
+        f.properties._lng=f.geometry.coordinates[0];
+      }
+    });
     layerData.pam=(d.features||[]).map(function(f){return{props:_stripB64(f.properties),geom:f.geometry};});
     map.addSource('pam',{type:'geojson',data:d});
     map.addLayer({id:'pam-dot',type:'circle',source:'pam',minzoom:12,
@@ -1304,6 +1311,10 @@ function _finishFindNearest(lat,lng,acc){
     if(p.PK)html+='<div style="font-size:12px;color:#555">PK : '+c(p.PK)+'</div>';
     html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(nacc.d)+'</div>';
     html+=zoomBtn(co,16,'→ Zoom sur cet accès');
+    html+='<div style="display:flex;gap:6px;margin-top:6px">'+
+      '<a href="https://www.google.com/maps/dir/?api=1&destination='+co[1]+','+co[0]+'" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e8f5e9;color:#2e7d32;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🗺 Maps</a>'+
+      '<a href="https://waze.com/ul?ll='+co[1]+','+co[0]+'&navigate=yes" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e3f2fd;color:#1565c0;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🚗 Waze</a>'+
+      '</div>';
     html+='</div>';
   }else{html+='<div style="padding:8px;color:#aaa">Accès : données non chargées</div>';}
 
@@ -1315,6 +1326,10 @@ function _finishFindNearest(lat,lng,acc){
     if(p.axe)html+='<div style="font-size:12px;color:#555">Axe : '+c(p.axe)+'</div>';
     html+='<div style="font-size:13px;font-weight:600;margin-top:4px">'+_dStr(npam.d)+'</div>';
     html+=zoomBtn(co,16,'→ Zoom sur cette PAM');
+    html+='<div style="display:flex;gap:6px;margin-top:6px">'+
+      '<a href="https://www.google.com/maps/dir/?api=1&destination='+co[1]+','+co[0]+'" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e8f5e9;color:#2e7d32;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🗺 Maps</a>'+
+      '<a href="https://waze.com/ul?ll='+co[1]+','+co[0]+'&navigate=yes" target="_blank" rel="noopener" style="flex:1;text-align:center;background:#e3f2fd;color:#1565c0;border-radius:5px;padding:6px;text-decoration:none;font-size:11.5px;font-weight:700">🚗 Waze</a>'+
+      '</div>';
     html+='</div>';
   }else{html+='<div style="padding:8px;color:#aaa">PAM : données non chargées</div>';}
 
@@ -1585,10 +1600,23 @@ function openDetailOH(p){
   openDetail('💧 '+(code?code+' – ':'')+lib,body);
 }
 // PAM : JAMAIS de dpPJWrap, dpSp, dpPhoto (contraintes permanentes)
+/* Boutons navigation Google Maps + Waze vers un point */
+function _navLinks(lat,lng){
+  var la=parseFloat(lat),lo=parseFloat(lng);
+  if(isNaN(la)||isNaN(lo))return'';
+  var gm='https://www.google.com/maps/dir/?api=1&destination='+la+','+lo;
+  var wz='https://waze.com/ul?ll='+la+','+lo+'&navigate=yes';
+  return'<div style="display:flex;gap:8px;padding:7px 14px 8px;border-bottom:1px solid #f0f0f0">'+
+    '<a href="'+gm+'" target="_blank" rel="noopener" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;background:#e8f5e9;color:#2e7d32;border-radius:6px;padding:8px 6px;text-decoration:none;font-size:12.5px;font-weight:700">'+
+    '🗺 Google Maps</a>'+
+    '<a href="'+wz+'" target="_blank" rel="noopener" style="flex:1;display:flex;align-items:center;justify-content:center;gap:5px;background:#e3f2fd;color:#1565c0;border-radius:6px;padding:8px 6px;text-decoration:none;font-size:12.5px;font-weight:700">'+
+    '🚗 Waze</a>'+
+    '</div>';
+}
 function openDetailPAM(p){
   var lib=c(p.libelle||p.axe||'PAM');
   var pkRef=c(p.pk_ef||p.pk_gc);
-  var body=dpHero('PAM',lib,'','#9c27b0')+dpPkBar(pkRef)+
+  var body=dpHero('PAM',lib,'','#9c27b0')+_navLinks(p._lat,p._lng)+dpPkBar(pkRef)+
     dpSec('Localisation',[['Axe',p.axe],['PK EF',p.pk_ef],['PK GC',p.pk_gc],['Décalage',p.decalage]])+
     (c(p.commentair)?dpSec('Commentaire',[['Note',p.commentair]]):'');
   openDetail('🌱 '+lib,body);
@@ -1596,7 +1624,8 @@ function openDetailPAM(p){
 // Accès : pas de dpPJWrap, dpSp, dpPhoto
 function openDetailAcces(p){
   var name=c(p.NOM_ACCES||p.Name||'Accès');
-  openDetail('🚧 '+name,dpHero('Accès','🚧 '+name,'','#e65100')+dpAllFields(p));
+  var lat=p._lat||p.LAT_DD, lng=p._lng||p.LONG_DD;
+  openDetail('🚧 '+name,dpHero('Accès','🚧 '+name,'','#e65100')+_navLinks(lat,lng)+dpAllFields(p));
 }
 // FAB toggle (mobile)
 function toggleFabBar(){
