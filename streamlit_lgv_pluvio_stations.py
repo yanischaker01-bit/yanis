@@ -3810,14 +3810,82 @@ reliability_class = filtered_stations.get("reliability_class", pd.Series("A_VERI
 incoherence_count = int(filtered_stations.get("incoherence_flag", pd.Series(False, index=filtered_stations.index)).fillna(False).sum())
 
 k1, k2, k3, k4, k5, k6, k7, k8 = st.columns(8)
-k1.metric("Points carte LGV", map_points_count)
-k2.metric("Communes", int(len(commune_pluvio_df)) if not commune_pluvio_df.empty else int(filtered_stations["station_commune_name"].astype(str).nunique()))
-k3.metric(f"Max {metric_label}", f"{float(map_metric_series.max()):.1f} mm" if map_metric_series.notna().any() else "N/A")
-k4.metric(f"Moyenne {metric_label}", f"{float(map_metric_series.mean()):.1f} mm" if map_metric_series.notna().any() else "N/A")
-k5.metric("Distance max filtre", f"{float(max_distance_km):.1f} km")
-k6.metric("Fiabilite moyenne", f"{float(map_reliability_series.mean()):.1f}/100" if not map_reliability_series.empty else "N/A")
-k7.metric("Points FIABLE", int((map_reliability_class == "FIABLE").sum()))
-k8.metric("Incoherences proximite", incoherence_count)
+k1.metric("Points carte LGV", map_points_count, help="Nombre de points (communes ou stations) affiches sur la carte.")
+k2.metric(
+    "Communes",
+    int(len(commune_pluvio_df)) if not commune_pluvio_df.empty else int(filtered_stations["station_commune_name"].astype(str).nunique()),
+    help="Nombre de communes LGV distinctes couvertes par les donnees actuelles.",
+)
+k3.metric(
+    f"Max {metric_label}",
+    f"{float(map_metric_series.max()):.1f} mm" if map_metric_series.notna().any() else "N/A",
+    help=f"Plus forte valeur de {metric_label.lower()} observee parmi les points affiches.",
+)
+k4.metric(
+    f"Moyenne {metric_label}",
+    f"{float(map_metric_series.mean()):.1f} mm" if map_metric_series.notna().any() else "N/A",
+    help=f"Valeur moyenne de {metric_label.lower()} sur l'ensemble des points affiches.",
+)
+k5.metric("Distance max filtre", f"{float(max_distance_km):.1f} km", help="Rayon de filtrage applique autour de la LGV pour les stations InfoClimat.")
+k6.metric(
+    "Fiabilite moyenne",
+    f"{float(map_reliability_series.mean()):.1f}/100" if not map_reliability_series.empty else "N/A",
+    help="Score moyen de fiabilite des donnees (source + fraicheur + coherence locale), sur 100.",
+)
+k7.metric("Points FIABLE", int((map_reliability_class == "FIABLE").sum()), help="Nombre de points juges pleinement fiables (voir detail plus bas).")
+k8.metric("Incoherences proximite", incoherence_count, help="Stations dont la mesure s'ecarte fortement de leurs voisines proches (a verifier en priorite).")
+
+st.subheader("Alertes pluviometrie - communes LGV SEA")
+_rain_alert_rank = {"CRITIQUE": 3, "ELEVE": 2, "MODERE": 1, "FAIBLE": 0, "INCONNU": -1}
+rain_watch_df = map_points_df.copy()
+rain_watch_df["monthly_alert_level"] = pd.to_numeric(rain_watch_df.get("rain_month_mm"), errors="coerce").map(
+    _monthly_alert_level
+)
+rain_watch_df["_alert_rank"] = rain_watch_df["monthly_alert_level"].map(_rain_alert_rank).fillna(-1)
+rain_watch_df = rain_watch_df[rain_watch_df["_alert_rank"] >= 2].sort_values(
+    ["_alert_rank", "rain_month_mm"], ascending=[False, False]
+)
+if rain_watch_df.empty:
+    st.success(
+        "Aucune commune LGV en alerte pluie ELEVE ou CRITIQUE ce mois-ci "
+        "(seuils: ELEVE >=120 mm, CRITIQUE >=180 mm cumules dans le mois)."
+    )
+else:
+    st.error(f"{len(rain_watch_df)} commune(s) LGV en alerte pluie ELEVE ou CRITIQUE ce mois-ci.")
+    rain_watch_display = pd.DataFrame(
+        {
+            "Commune": rain_watch_df["station_commune_name"].astype(str),
+            "Cumul mensuel": rain_watch_df.get("rain_month_mm").map(lambda v: _format_num(v, 1, " mm")),
+            "Niveau": rain_watch_df["monthly_alert_level"],
+            "Fiabilite": rain_watch_df.get("reliability_class", pd.Series("", index=rain_watch_df.index)).astype(str),
+        }
+    )
+    st.dataframe(rain_watch_display, use_container_width=True, hide_index=True)
+
+stale_count = int(
+    (pd.to_numeric(filtered_stations.get("obs_age_h"), errors="coerce").fillna(0.0) > float(WEATHER_STALE_ALERT_H)).sum()
+)
+unreliable_count = int(
+    (filtered_stations.get("reliability_class", pd.Series("", index=filtered_stations.index)).astype(str) == "A_VERIFIER").sum()
+)
+if stale_count or unreliable_count:
+    st.warning(
+        f"Suivi qualite des donnees: {stale_count} station(s) avec observation vieille de plus de "
+        f"{int(WEATHER_STALE_ALERT_H)}h, {unreliable_count} station(s) en fiabilite 'A verifier'. "
+        "Voir le detail dans 'Fiabilite & Metadonnees sources' ci-dessous."
+    )
+
+with st.expander("Comment lire la carte et les alertes", expanded=False):
+    st.markdown(
+        "- **Couleur de remplissage des points sur la carte** = niveau de pluie du mois en cours "
+        "(vert = faible, olive = modere, orange = eleve, rouge = critique).\n"
+        "- **Couleur du contour des points** = fiabilite de la donnee "
+        "(bleu-vert = fiable, marron = a surveiller, rouge fonce = a verifier).\n"
+        "- **Taille du point** = proportionnelle au cumul mensuel de pluie.\n"
+        "- **Alerte pluie** ci-dessus = communes dont le cumul mensuel depasse 120 mm (eleve) ou 180 mm (critique).\n"
+        "- **Vigilance Meteo-France** en haut de page = risques meteo officiels par departement "
+        "(orages/foudre, crues, vent, canicule, etc.), independants du niveau de pluie mesure."
+    )
 
 if snapshot_ts is not None and not pd.isna(snapshot_ts):
     st.caption(f"Snapshot: {snapshot_source} | timestamp_utc={snapshot_ts.isoformat()}")
