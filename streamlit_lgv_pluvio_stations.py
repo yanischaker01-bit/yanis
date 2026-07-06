@@ -32,6 +32,10 @@ OPEN_METEO_ARCHIVE_UNITARY_FALLBACK_MAX_BATCH = 3
 METEO_FRANCE_TOKEN_URL_DEFAULT = "https://portail-api.meteofrance.fr/token"
 METEO_FRANCE_DP_OBS_BASE_URL = "https://public-api.meteofrance.fr/public/DPObs"
 METEO_FRANCE_VIGILANCE_URL = "https://public-api.meteofrance.fr/public/DPVigilance/v1/cartevigilance/encours"
+PUBLIC_VIGILANCE_DEPARTEMENT_URL = (
+    "https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/"
+    "weatherref-france-vigilance-meteo-departement/records"
+)
 METEO_FRANCE_SOURCE_LABEL = "Meteo-France Portail API"
 LGV_VIGILANCE_DEPARTMENTS = {
     "16": "Charente",
@@ -1423,6 +1427,63 @@ def _fetch_meteo_france_vigilance(token: str) -> Tuple[pd.DataFrame, str]:
         f"Meteo-France Vigilance: {out['domain_id'].nunique()} departement(s) LGV, "
         f"niveau max {VIGILANCE_COLOR_LABELS.get(str(max_color_id), '?')}."
     )
+    return out, notice
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def _fetch_public_vigilance_departemental() -> Tuple[pd.DataFrame, str]:
+    dept_clause = ",".join(f'"{d}"' for d in LGV_VIGILANCE_DEPARTMENTS)
+    params = {"where": f'echeance="J" and domain_id in ({dept_clause})', "limit": 100}
+    try:
+        resp = _http_get_with_retry(PUBLIC_VIGILANCE_DEPARTEMENT_URL, params=params, timeout=20)
+    except Exception as exc:
+        return pd.DataFrame(), f"Vigilance (source publique): erreur reseau ({exc})."
+    if resp.status_code != 200:
+        return pd.DataFrame(), f"Vigilance (source publique): HTTP {resp.status_code}."
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        return pd.DataFrame(), f"Vigilance (source publique): reponse invalide ({exc})."
+
+    records = payload.get("results", []) if isinstance(payload, dict) else []
+    if not records and isinstance(payload, dict):
+        records = [r.get("fields", r) for r in payload.get("records", []) if isinstance(r, dict)]
+
+    rows: List[Dict[str, object]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        domain_id = str(rec.get("domain_id") or "").strip()
+        if domain_id not in LGV_VIGILANCE_DEPARTMENTS:
+            continue
+        phen_id = str(rec.get("phenomenon_id") or "").strip()
+        color_id = str(rec.get("color_id") or "").strip()
+        if not phen_id or not color_id:
+            continue
+        rows.append(
+            {
+                "domain_id": domain_id,
+                "department_name": LGV_VIGILANCE_DEPARTMENTS.get(domain_id, domain_id),
+                "phenomenon_id": phen_id,
+                "phenomenon_name": VIGILANCE_PHENOMENON_LABELS.get(phen_id, f"Phenomene {phen_id}"),
+                "color_id": color_id,
+                "color_name": VIGILANCE_COLOR_LABELS.get(color_id, "Inconnu"),
+                "color_hex": VIGILANCE_COLOR_HEX.get(color_id, "#94a3b8"),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(), "Vigilance (source publique): aucune donnee exploitable."
+
+    out = pd.DataFrame(rows)
+    out["_color_num"] = pd.to_numeric(out["color_id"], errors="coerce")
+    out = (
+        out.sort_values("_color_num", ascending=False)
+        .drop_duplicates(subset=["domain_id", "phenomenon_id"], keep="first")
+        .drop(columns=["_color_num"])
+        .reset_index(drop=True)
+    )
+    notice = f"Vigilance (source publique Opendatasoft, sans cle): {out['domain_id'].nunique()} departement(s) LGV."
     return out, notice
 
 
@@ -3203,46 +3264,54 @@ st.caption(
 st.caption("Rendu graphique actif: Plotly (compatible Streamlit Cloud).")
 
 st.subheader("Vigilance Meteo-France - departements LGV SEA")
-if not _meteo_france_portal_is_configured():
-    st.caption(
-        "Vigilance Meteo-France non affichee: configure METEOFRANCE_CLIENT_ID/METEOFRANCE_CLIENT_SECRET "
-        "(ou METEOFRANCE_ACCESS_TOKEN) et abonne l'application a l'API Vigilance sur le portail "
-        "pour activer ce module (orages/foudre, crues, pluie-inondation, vent, etc.)."
-    )
-else:
+public_vigilance_df, public_vigilance_notice = _fetch_public_vigilance_departemental()
+official_vigilance_df, official_vigilance_notice = pd.DataFrame(), ""
+if _meteo_france_portal_is_configured():
     vigilance_token, vigilance_token_note = _request_meteo_france_portal_token()
-    vigilance_df, vigilance_notice = _fetch_meteo_france_vigilance(vigilance_token)
-    if vigilance_df.empty:
-        st.caption(f"{vigilance_token_note} | {vigilance_notice}")
-    else:
-        vigilance_alerts = vigilance_df[pd.to_numeric(vigilance_df["color_id"], errors="coerce") >= 3]
-        if not vigilance_alerts.empty:
-            alert_lines = [
-                f"- {row['department_name']}: {row['phenomenon_name']} - {row['color_name']}"
-                for _, row in vigilance_alerts.sort_values(
-                    ["color_id", "department_name"], ascending=[False, True]
-                ).iterrows()
-            ]
-            st.error("Vigilance active (orange/rouge) sur le trace LGV:\n\n" + "\n".join(alert_lines))
-        else:
-            st.success("Aucune vigilance orange/rouge en cours sur les departements traverses par la LGV SEA.")
+    official_vigilance_df, official_vigilance_notice = _fetch_meteo_france_vigilance(vigilance_token)
+    official_vigilance_notice = f"{vigilance_token_note} | {official_vigilance_notice}"
 
-        vigilance_col_order = [
-            VIGILANCE_PHENOMENON_LABELS[k] for k in sorted(VIGILANCE_PHENOMENON_LABELS, key=int)
+vigilance_df = pd.concat([official_vigilance_df, public_vigilance_df], ignore_index=True)
+if not vigilance_df.empty:
+    vigilance_df = vigilance_df.drop_duplicates(subset=["domain_id", "phenomenon_id"], keep="first")
+vigilance_notice = " | ".join([n for n in [official_vigilance_notice, public_vigilance_notice] if n])
+
+if vigilance_df.empty:
+    st.caption(f"Vigilance indisponible pour le moment. {vigilance_notice}")
+else:
+    vigilance_alerts = vigilance_df[pd.to_numeric(vigilance_df["color_id"], errors="coerce") >= 3]
+    if not vigilance_alerts.empty:
+        alert_lines = [
+            f"- {row['department_name']}: {row['phenomenon_name']} - {row['color_name']}"
+            for _, row in vigilance_alerts.sort_values(
+                ["color_id", "department_name"], ascending=[False, True]
+            ).iterrows()
         ]
-        vigilance_pivot = vigilance_df.pivot_table(
-            index="department_name", columns="phenomenon_name", values="color_name", aggfunc="first"
-        ).reindex(columns=vigilance_col_order)
-        vigilance_color_by_label = {v: k for k, v in VIGILANCE_COLOR_LABELS.items()}
+        st.error("Vigilance active (orange/rouge) sur le trace LGV:\n\n" + "\n".join(alert_lines))
+    else:
+        st.success("Aucune vigilance orange/rouge en cours sur les departements traverses par la LGV SEA.")
 
-        def _style_vigilance_cell(val: object) -> str:
-            color_id = vigilance_color_by_label.get(str(val), "")
-            hex_color = VIGILANCE_COLOR_HEX.get(color_id, "#e2e8f0")
-            text_color = "#1f2937" if color_id in ("1", "2", "") else "#ffffff"
-            return f"background-color: {hex_color}; color: {text_color}; text-align: center;"
+    vigilance_col_order = [
+        VIGILANCE_PHENOMENON_LABELS[k] for k in sorted(VIGILANCE_PHENOMENON_LABELS, key=int)
+    ]
+    vigilance_pivot = vigilance_df.pivot_table(
+        index="department_name", columns="phenomenon_name", values="color_name", aggfunc="first"
+    ).reindex(columns=vigilance_col_order)
+    vigilance_color_by_label = {v: k for k, v in VIGILANCE_COLOR_LABELS.items()}
 
-        st.dataframe(vigilance_pivot.style.map(_style_vigilance_cell), use_container_width=True)
-        st.caption(vigilance_notice)
+    def _style_vigilance_cell(val: object) -> str:
+        color_id = vigilance_color_by_label.get(str(val), "")
+        hex_color = VIGILANCE_COLOR_HEX.get(color_id, "#e2e8f0")
+        text_color = "#1f2937" if color_id in ("1", "2", "") else "#ffffff"
+        return f"background-color: {hex_color}; color: {text_color}; text-align: center;"
+
+    st.dataframe(vigilance_pivot.style.map(_style_vigilance_cell), use_container_width=True)
+    if "Crues" not in vigilance_df["phenomenon_name"].unique().tolist():
+        st.caption(
+            "Crues non affichees: cette donnee n'est disponible que via l'API officielle "
+            "Meteo-France Vigilance (abonnement DPVigilance requis sur portail-api.meteofrance.fr)."
+        )
+    st.caption(vigilance_notice)
 
 source_mode_options = [SOURCE_MODE_METEOFRANCE, SOURCE_MODE_OPEN, SOURCE_MODE_MIX]
 default_source_mode = SOURCE_MODE_METEOFRANCE if _meteo_france_portal_is_configured() else SOURCE_MODE_OPEN
