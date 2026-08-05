@@ -108,6 +108,19 @@ def factor_tags(factors) -> str:
     return "".join(f'<span class="factor-tag">{FACTOR_LABELS.get(f, f)}</span>' for f in factors)
 
 
+def humanize_alert_message(message: str, lookup: dict) -> str:
+    if ":" not in message:
+        return message
+    sid, rest = message.split(":", 1)
+    info = lookup.get(sid.strip())
+    if not info:
+        return message
+    pk = info.get("pk_km")
+    pk_label = f"PK {pk:.1f} km" if isinstance(pk, (int, float)) and pk == pk else "PK n/a"
+    commune = info.get("commune_name") or "commune inconnue"
+    return f"{pk_label} — {commune} ·{rest}"
+
+
 def data_age_minutes(timestamp_utc: str) -> float | None:
     try:
         dt = datetime.fromisoformat(timestamp_utc.replace("Z", "+00:00"))
@@ -146,9 +159,6 @@ if ts:
     if age_min is not None:
         caption += f" (il y a {age_min:.0f} min)" if age_min < 120 else f" (il y a {age_min / 60:.1f} h)"
     st.caption(caption)
-if age_min is not None and age_min > STALE_MINUTES:
-    st.warning(f"⏱ Ces données ont plus de {age_min / 60:.1f} h — la collecte automatique a peut-être échoué. "
-               "Les niveaux de risque affichés peuvent être dépassés.")
 
 sectors_payload = safe_dict(snapshot.get("sectors"))
 sectors_df = safe_df(sectors_payload.get("sectors", []))
@@ -166,6 +176,10 @@ for col in ["weather_max_24h_mm", "weather_max_7d_mm", "weather_max_30d_mm",
             "ai_pred_probability", "ai_confidence", "ai_soil_fragility"]:
     if col in sectors_df.columns:
         sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
+
+sector_lookup: dict = {}
+if {"sector_id", "pk_km", "commune_name"}.issubset(sectors_df.columns):
+    sector_lookup = sectors_df.set_index("sector_id")[["pk_km", "commune_name"]].to_dict("index")
 
 # ── Vue d'ensemble (toujours visible) ────────────────────────────────────
 st.subheader("Vue d'ensemble")
@@ -186,9 +200,10 @@ else:
         level = a.get("level", "")
         color = RISK_COLOR.get(level, "#6b7280")
         kind = "🤖 Prédiction IA" if a.get("type") == "SECTEUR_IA" else "📏 Mesure"
+        msg = humanize_alert_message(a.get("message", ""), sector_lookup)
         st.markdown(
             f'<div class="alert-card" style="border-left-color:{color};background:{color}12">'
-            f'<b>[{level}]</b> {kind} — {a.get("message", "")}</div>',
+            f'<b>[{level}]</b> {kind} — {msg}</div>',
             unsafe_allow_html=True)
 
 st.divider()
@@ -261,7 +276,7 @@ with tab_carte:
                     f"Sol dominant : {getattr(row, 'ai_dominant_pedology', '—')}"
                 )
                 folium.CircleMarker(
-                    [float(row.latitude), float(row.longitude)],
+                    [safe_float(row.latitude), safe_float(row.longitude)],
                     radius=6 + 6 * proba_row, color=color_map, fill=True, fill_opacity=0.8, weight=1.5,
                     tooltip=f"{getattr(row, 'sector_id', '')} — IA {ai_lvl_row}",
                     popup=folium.Popup(popup, max_width=280),
