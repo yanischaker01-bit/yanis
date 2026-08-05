@@ -255,27 +255,25 @@ def load_vigicrue_rivers() -> list:
 
 @st.cache_data(ttl=3600)
 def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
-    """Cumul de pluie réel (Open-Meteo archive) pour la période donnée."""
+    """Cumul pluie réel via Open-Meteo forecast (past_days) — lag ~6h, fiable."""
     today = datetime.now(timezone.utc).date()
     if periode == "24h":
-        start = today - timedelta(days=2)
-        end   = today - timedelta(days=1)
+        past_days = 1                          # hier uniquement
     elif periode == "7 jours":
-        start = today - timedelta(days=7)
-        end   = today - timedelta(days=1)
+        past_days = 7
     elif periode == "30 jours":
-        start = today - timedelta(days=30)
-        end   = today - timedelta(days=1)
-    else:  # Mois courant
-        start = today.replace(day=1)
-        end   = today - timedelta(days=1)
-    if start > end:
+        past_days = 30
+    else:                                      # Mois courant
+        past_days = today.day - 1             # jours écoulés depuis le 1er
+    if past_days <= 0:
         return 0.0
     try:
-        r = requests.get(ARCHIVE_URL, params={
+        r = requests.get(FORECAST_URL, params={
             "latitude": round(lat, 4), "longitude": round(lon, 4),
-            "start_date": str(start), "end_date": str(end),
-            "daily": "precipitation_sum", "timezone": "Europe/Paris",
+            "daily": "precipitation_sum",
+            "past_days": past_days,
+            "forecast_days": 0,
+            "timezone": "Europe/Paris",
         }, timeout=15)
         r.raise_for_status()
         vals = r.json()["daily"]["precipitation_sum"]
@@ -430,8 +428,8 @@ RAIN_LABELS = {
     "ORANGE": ("Pluies fortes",   "#ea580c", "🟠"),
     "ROUGE":  ("Pluies très fortes","#dc2626","🔴"),
 }
-dep_rain_data: dict = {}   # dep -> {max_mm, total, lvl, color}
-for _dep, _info in DEPS.items():
+dep_rain_data: dict = {}   # dep -> {max, total, lvl, color, emoji}
+for _dep in DEPS:
     _fc    = load_forecast_dep(_dep)
     _rains = [v for v in _fc.get("daily", {}).get("precipitation_sum", []) if v is not None]
     _max   = max(_rains) if _rains else 0.0
@@ -465,12 +463,6 @@ for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
 
 # ── 2. INDICATEURS MÉTÉO ─────────────────────────────────────────────────────
 st.subheader("📊 Indicateurs météo — 7 prochains jours")
-st.info(
-    "⚠️ **Ces indicateurs sont calculés automatiquement** à partir des prévisions Open-Meteo "
-    "(seuils paramétrés) et **ne remplacent pas les alertes officielles** Météo-France ou Vigicrue. "
-    "En cas de doute, consulter [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/).",
-    icon=None,
-)
 
 met_alerts = load_weather_alerts_all()
 vc_alerts  = load_vigicrue_rivers()
