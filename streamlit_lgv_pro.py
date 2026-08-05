@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import unicodedata
@@ -19,10 +20,19 @@ from streamlit_folium import st_folium
 
 SNAPSHOT_LATEST = Path("reports/streamlit_snapshot_latest.json")
 SNAPSHOT_GLOB = "streamlit_snapshot_*.json"
-REMOTE_SNAPSHOT_URLS = [
+DEFAULT_REMOTE_SNAPSHOT_URLS = [
     "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json",
     "https://raw.githubusercontent.com/yanischaker01-bit/yanis/main/reports/streamlit_snapshot_latest.json",
 ]
+REMOTE_SNAPSHOT_URLS = [
+    str(os.getenv("LGV_SNAPSHOT_URL_PRIMARY", "")).strip(),
+    str(os.getenv("LGV_SNAPSHOT_URL_SECONDARY", "")).strip(),
+]
+REMOTE_SNAPSHOT_URLS = [u for u in REMOTE_SNAPSHOT_URLS if u] or DEFAULT_REMOTE_SNAPSHOT_URLS.copy()
+
+PRO_APP_ACCESS_URL = str(os.getenv("LGV_PRO_APP_URL", "https://lgv-sea-rapport-streamlit-pro.streamlit.app/")).strip()
+PRO_PORTAL_ACCESS_URL = str(os.getenv("LGV_PRO_PORTAL_URL", "https://yanischaker01-bit.github.io/yanis")).strip()
+
 OPEN_METEO_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_MODEL = "meteofrance_seamless"
 
@@ -732,6 +742,157 @@ def _normalize_text_for_match(value: object) -> str:
     txt = "".join(ch for ch in txt if not unicodedata.combining(ch))
     txt = re.sub(r"[^a-z0-9]+", " ", txt).strip()
     return txt
+
+
+def _normalized_text_set(values: List[object]) -> set[str]:
+    out: set[str] = set()
+    for value in values:
+        norm = _normalize_text_for_match(value)
+        if norm:
+            out.add(norm)
+    return out
+
+
+def _selection_covers_all(selected_values: List[object], all_values: List[object]) -> bool:
+    all_norm = _normalized_text_set(all_values)
+    if not all_norm:
+        return True
+    selected_norm = _normalized_text_set(selected_values)
+    return selected_norm == all_norm
+
+
+def _filter_df_by_communes(
+    df: pd.DataFrame,
+    selected_communes: List[object],
+    commune_col: str = "commune_name",
+    enabled: bool = True,
+) -> pd.DataFrame:
+    if df.empty or not enabled or commune_col not in df.columns:
+        return df.copy()
+    selected_norm = _normalized_text_set(selected_communes)
+    if not selected_norm:
+        return df.copy()
+    out = df.copy()
+    row_norm = out[commune_col].map(_normalize_text_for_match)
+    return out[row_norm.isin(selected_norm)].copy()
+
+
+def _apply_min_risk_filter(df: pd.DataFrame, min_risk: str, risk_cols: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    target_level = str(min_risk or "").upper()
+    if target_level == "TOUT":
+        return df.copy()
+    chosen_col = next((c for c in risk_cols if c in df.columns), "")
+    if not chosen_col:
+        return df.copy()
+    out = df.copy()
+    threshold_rank = _risk_rank(target_level)
+    return out[out[chosen_col].map(lambda x: _risk_rank(str(x))) >= threshold_rank].copy()
+
+
+def _attach_nearest_commune_from_sectors(
+    df: pd.DataFrame,
+    sectors_df: pd.DataFrame,
+    commune_col: str = "commune_name",
+    max_distance_km: float = 35.0,
+) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    out = df.copy()
+    if commune_col not in out.columns:
+        out[commune_col] = ""
+    out[commune_col] = out[commune_col].fillna("").astype(str)
+    if "latitude" not in out.columns or "longitude" not in out.columns:
+        return out
+
+    if sectors_df.empty or not {"latitude", "longitude", "commune_name"}.issubset(set(sectors_df.columns)):
+        return out
+    ref = sectors_df[["commune_name", "latitude", "longitude"]].copy()
+    ref["commune_name"] = ref["commune_name"].fillna("").astype(str)
+    ref["latitude"] = pd.to_numeric(ref["latitude"], errors="coerce")
+    ref["longitude"] = pd.to_numeric(ref["longitude"], errors="coerce")
+    ref = ref.dropna(subset=["latitude", "longitude"])
+    ref = ref[ref["commune_name"].map(_normalize_text_for_match) != ""].drop_duplicates(
+        subset=["commune_name", "latitude", "longitude"],
+        keep="first",
+    )
+    if ref.empty:
+        return out
+
+    ref_lat = ref["latitude"].astype(float).to_numpy()
+    ref_lon = ref["longitude"].astype(float).to_numpy()
+    ref_name = ref["commune_name"].astype(str).tolist()
+    max_dist = float(max_distance_km)
+
+    missing_mask = out[commune_col].map(_normalize_text_for_match) == ""
+    for idx in out.index[missing_mask]:
+        lat = pd.to_numeric(out.at[idx, "latitude"], errors="coerce")
+        lon = pd.to_numeric(out.at[idx, "longitude"], errors="coerce")
+        if pd.isna(lat) or pd.isna(lon):
+            continue
+        p1 = np.radians(float(lat))
+        p2 = np.radians(ref_lat)
+        dlat = np.radians(ref_lat - float(lat))
+        dlon = np.radians(ref_lon - float(lon))
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dlon / 2.0) ** 2
+        dist_km = 2.0 * 6371.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+        if dist_km.size == 0:
+            continue
+        best_idx = int(np.nanargmin(dist_km))
+        best_dist = float(dist_km[best_idx])
+        if best_dist <= max_dist:
+            out.at[idx, commune_col] = ref_name[best_idx]
+    return out
+
+
+def _filter_fr_geojson_by_communes(geojson: Dict[str, object], selected_communes: List[object], enabled: bool = True) -> Dict[str, object]:
+    if not enabled:
+        return geojson
+    if not isinstance(geojson, dict):
+        return {}
+    features = geojson.get("features")
+    if not isinstance(features, list):
+        return geojson
+    selected_norm = _normalized_text_set(selected_communes)
+    if not selected_norm:
+        return geojson
+    kept: List[Dict[str, object]] = []
+    for feature in features:
+        if not isinstance(feature, dict):
+            continue
+        props = feature.get("properties")
+        commune_name = props.get("commune_name") if isinstance(props, dict) else ""
+        if _normalize_text_for_match(commune_name) in selected_norm:
+            kept.append(feature)
+    out = dict(geojson)
+    out["features"] = kept
+    return out
+
+
+def _build_filter_audit_table(raw_counts: Dict[str, int], filtered_counts: Dict[str, int]) -> pd.DataFrame:
+    labels = [
+        ("weather", "Meteo"),
+        ("sectors", "Secteurs LGV"),
+        ("hydro", "Hydro"),
+        ("piezo", "Piezometres"),
+        ("geotech", "Geotech"),
+        ("lgv_communes", "Communes LGV"),
+    ]
+    rows: List[Dict[str, object]] = []
+    for key, label in labels:
+        raw = int(raw_counts.get(key, 0) or 0)
+        filtered = int(filtered_counts.get(key, 0) or 0)
+        keep_ratio = (100.0 * float(filtered) / float(raw)) if raw > 0 else 0.0
+        rows.append(
+            {
+                "jeu_donnees": label,
+                "lignes_snapshot": raw,
+                "lignes_apres_filtres": filtered,
+                "conservation_pct": round(keep_ratio, 1),
+            }
+        )
+    return pd.DataFrame(rows)
 
 
 def _location_match_strength(commune_name: object, station_commune_name: object) -> float:
@@ -3022,8 +3183,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-st.title("LGV SEA - Rapport Streamlit Pro")
-st.caption("Suivi hydrometeo et geotechnique avec classement par commune")
+header_left, header_right = st.columns([1.45, 1.0])
+with header_left:
+    st.title("LGV SEA - Rapport Streamlit Pro")
+    st.caption("Suivi hydrometeo et geotechnique avec classement par commune")
+with header_right:
+    st.markdown("**Acces rapide pro**")
+    if PRO_APP_ACCESS_URL:
+        st.link_button("Ouvrir dashboard Pro", PRO_APP_ACCESS_URL, use_container_width=True)
+    if PRO_PORTAL_ACCESS_URL and PRO_PORTAL_ACCESS_URL != PRO_APP_ACCESS_URL:
+        st.link_button("Ouvrir portail Pro", PRO_PORTAL_ACCESS_URL, use_container_width=True)
 
 snapshot, snapshot_source = _load_snapshot_payload()
 # Snapshot vide ({}) = collecte en cours ou fallback workflow → continuer avec données vides
@@ -3290,6 +3459,7 @@ with st.sidebar:
         commune_values.extend(lgv_communes_df["commune_name"].dropna().astype(str).unique().tolist())
     communes = sorted(_unique_text_values(commune_values))
     selected_communes = _multiselect_with_all("Communes", communes, key="flt_communes")
+    commune_filter_is_active = not _selection_covers_all(selected_communes, communes)
 
     station_communes = (
         sorted(weather_df["station_commune_name"].dropna().astype(str).unique().tolist())
@@ -3338,6 +3508,13 @@ with st.sidebar:
     show_slip = st.checkbox("Layer zones glissement", value=True)
     show_fr_layer = st.checkbox("Layer geographie FR", value=False)
 
+    st.markdown("---")
+    st.subheader("Liens pro")
+    if PRO_APP_ACCESS_URL:
+        st.markdown(f"[Dashboard Pro]({PRO_APP_ACCESS_URL})")
+    if PRO_PORTAL_ACCESS_URL and PRO_PORTAL_ACCESS_URL != PRO_APP_ACCESS_URL:
+        st.markdown(f"[Portail Pro]({PRO_PORTAL_ACCESS_URL})")
+
 weather_for_context = weather_df.copy()
 if not weather_for_context.empty:
     weather_for_context = _apply_weather_source_profile(
@@ -3355,8 +3532,19 @@ if not weather_for_context.empty and weather_source_profile == "Auto (recommande
     )
 if not weather_for_context.empty:
     weather_for_context = _apply_pluvio_quality_gate(weather_for_context, bool(enforce_pluvio_quality))
-if not weather_for_context.empty and selected_station_communes:
-    weather_for_context = weather_for_context[weather_for_context["station_commune_name"].astype(str).isin(selected_station_communes)]
+if commune_filter_is_active and not weather_for_context.empty:
+    weather_for_context = _filter_df_by_communes(
+        weather_for_context,
+        selected_communes,
+        commune_col="station_commune_name",
+    )
+if not weather_for_context.empty:
+    weather_for_context = _filter_df_by_communes(
+        weather_for_context,
+        selected_station_communes,
+        commune_col="station_commune_name",
+        enabled=bool(selected_station_communes),
+    )
 if not weather_for_context.empty and int(weather_min_quality) > 0 and "weather_quality_note" in weather_for_context.columns:
     weather_for_context = weather_for_context[
         pd.to_numeric(weather_for_context["weather_quality_note"], errors="coerce").fillna(0.0) >= float(weather_min_quality)
@@ -3372,11 +3560,10 @@ if not weather_for_context.empty and weather_exact_day_enabled:
     weather_for_context = weather_for_context[obs_day == weather_exact_day]
 
 filtered_weather = weather_for_context.copy()
-if not filtered_weather.empty and str(min_risk).upper() != "TOUT":
-    weather_risk_col = "meteo_operational_level"
-    if weather_risk_mode.startswith("Pluie") or weather_risk_col not in filtered_weather.columns:
-        weather_risk_col = "risk_level"
-    filtered_weather = filtered_weather[filtered_weather[weather_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+weather_risk_col = "meteo_operational_level"
+if weather_risk_mode.startswith("Pluie") or weather_risk_col not in filtered_weather.columns:
+    weather_risk_col = "risk_level"
+filtered_weather = _apply_min_risk_filter(filtered_weather, min_risk, [weather_risk_col, "risk_level"])
 
 if int(live_synop_added_count) > 0:
     st.info(
@@ -3407,12 +3594,13 @@ if weather_for_context.empty and not weather_df.empty:
     if strict_reliable_mode:
         st.info("Mode strict actif: les estimations Open-Meteo ne sont pas utilisees pour remplacer ces donnees.")
 
-weather_signal_df = _select_weather_pool_for_ui(
+weather_pool_ui = _select_weather_pool_for_ui(
     filtered_weather,
     weather_for_context,
     weather_df,
     strict_reliable_mode=bool(strict_reliable_mode),
 )
+weather_signal_df = weather_pool_ui
 effective_rain_col_weather = _choose_weather_signal_column(
     weather_signal_df,
     rain_col_weather,
@@ -3476,13 +3664,11 @@ if not sectors_df.empty:
     sectors_df = _build_slip_assessment(sectors_df, manual_pk_ranges)
 
 filtered_sectors = sectors_df.copy()
-if not filtered_sectors.empty and selected_communes:
-    filtered_sectors = filtered_sectors[filtered_sectors["commune_name"].astype(str).isin(selected_communes)]
-if not filtered_sectors.empty and str(min_risk).upper() != "TOUT":
-    sector_risk_col = "risk_level"
-    if sector_risk_mode.startswith("IA") and "ai_pred_risk_level" in filtered_sectors.columns:
-        sector_risk_col = "ai_pred_risk_level"
-    filtered_sectors = filtered_sectors[filtered_sectors[sector_risk_col].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+filtered_sectors = _filter_df_by_communes(filtered_sectors, selected_communes, enabled=commune_filter_is_active)
+sector_risk_col = "risk_level"
+if sector_risk_mode.startswith("IA") and "ai_pred_risk_level" in filtered_sectors.columns:
+    sector_risk_col = "ai_pred_risk_level"
+filtered_sectors = _apply_min_risk_filter(filtered_sectors, min_risk, [sector_risk_col, "risk_level", "ai_pred_risk_level"])
 if not filtered_sectors.empty and "ai_pred_probability" in filtered_sectors.columns and int(ai_probability_min_pct) > 0:
     min_prob = float(ai_probability_min_pct) / 100.0
     filtered_sectors = filtered_sectors[
@@ -3499,19 +3685,51 @@ if not slip_source_df.empty and "slip_index" in slip_source_df.columns:
 else:
     slip_focus_df = pd.DataFrame()
 
-filtered_hydro = hydro_df.copy()
+hydro_with_commune = _attach_nearest_commune_from_sectors(hydro_df, sectors_df)
+piezo_with_commune = _attach_nearest_commune_from_sectors(piezo_df, sectors_df)
+geotech_with_commune = _attach_nearest_commune_from_sectors(geotech_df, sectors_df)
+
+filtered_hydro = _filter_df_by_communes(hydro_with_commune, selected_communes, enabled=commune_filter_is_active)
 if not filtered_hydro.empty and selected_hydro_sources and "source" in filtered_hydro.columns:
     filtered_hydro = filtered_hydro[filtered_hydro["source"].astype(str).isin(selected_hydro_sources)]
 if not filtered_hydro.empty and selected_hydro_rivers and "river_name" in filtered_hydro.columns:
     filtered_hydro = filtered_hydro[filtered_hydro["river_name"].astype(str).isin(selected_hydro_rivers)]
-if not filtered_hydro.empty and str(hydro_risk_filter).upper() != "TOUT" and "risk_level" in filtered_hydro.columns:
-    filtered_hydro = filtered_hydro[
-        filtered_hydro["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(str(hydro_risk_filter).upper())
-    ]
+filtered_hydro = _apply_min_risk_filter(filtered_hydro, str(hydro_risk_filter).upper(), ["risk_level"])
 if not filtered_hydro.empty and hydro_only_exceeded and "threshold_exceeded" in filtered_hydro.columns:
     filtered_hydro = filtered_hydro[filtered_hydro["threshold_exceeded"].fillna(False).astype(bool)]
-if not filtered_hydro.empty and str(min_risk).upper() != "TOUT" and "risk_level" in filtered_hydro.columns:
-    filtered_hydro = filtered_hydro[filtered_hydro["risk_level"].map(lambda x: _risk_rank(str(x))) >= _risk_rank(min_risk)]
+filtered_hydro = _apply_min_risk_filter(filtered_hydro, min_risk, ["risk_level"])
+
+filtered_piezo = _filter_df_by_communes(piezo_with_commune, selected_communes, enabled=commune_filter_is_active)
+filtered_piezo = _apply_min_risk_filter(filtered_piezo, min_risk, ["risk_level"])
+
+filtered_geotech = _filter_df_by_communes(geotech_with_commune, selected_communes, enabled=commune_filter_is_active)
+filtered_geotech = _apply_min_risk_filter(filtered_geotech, min_risk, ["risk_level"])
+
+filtered_lgv_communes = _filter_df_by_communes(lgv_communes_df, selected_communes, enabled=commune_filter_is_active)
+filtered_fr_communes_geojson = _filter_fr_geojson_by_communes(
+    fr_communes_geojson,
+    selected_communes,
+    enabled=commune_filter_is_active,
+)
+
+filter_audit_df = _build_filter_audit_table(
+    raw_counts={
+        "weather": int(len(weather_df)),
+        "sectors": int(len(sectors_df)),
+        "hydro": int(len(hydro_df)),
+        "piezo": int(len(piezo_df)),
+        "geotech": int(len(geotech_df)),
+        "lgv_communes": int(len(lgv_communes_df)),
+    },
+    filtered_counts={
+        "weather": int(len(filtered_weather)),
+        "sectors": int(len(filtered_sectors)),
+        "hydro": int(len(filtered_hydro)),
+        "piezo": int(len(filtered_piezo)),
+        "geotech": int(len(filtered_geotech)),
+        "lgv_communes": int(len(filtered_lgv_communes)),
+    },
+)
 
 commune_df = _aggregate_communes(filtered_sectors, commune_rain_col)
 if not commune_df.empty:
@@ -3524,8 +3742,8 @@ if not commune_df.empty:
     )
 
 commune_pool = commune_df.copy()
-if not lgv_communes_df.empty:
-    lgv_pool = lgv_communes_df.copy()
+if not filtered_lgv_communes.empty:
+    lgv_pool = filtered_lgv_communes.copy()
     lgv_pool["commune_name"] = lgv_pool.get("commune_name", "Inconnue").fillna("Inconnue").astype(str)
     lgv_pool["commune_code"] = lgv_pool.get("commune_code", "").fillna("").astype(str)
     if "departement_code" not in lgv_pool.columns:
@@ -3562,12 +3780,7 @@ if not commune_pool.empty:
         axis=1,
     )
 
-    weather_ctx_source = _select_weather_pool_for_ui(
-        filtered_weather,
-        weather_for_context,
-        weather_df,
-        strict_reliable_mode=bool(strict_reliable_mode),
-    )
+    weather_ctx_source = weather_pool_ui
     weather_context_df = _build_commune_weather_context(
         commune_pool[["commune_label", "latitude", "longitude"]],
         weather_ctx_source,
@@ -3750,12 +3963,7 @@ if not commune_pool.empty:
                 "error": str(exc),
             }
         try:
-            weather_reference_pool = _select_weather_pool_for_ui(
-                filtered_weather,
-                weather_for_context,
-                weather_df,
-                strict_reliable_mode=bool(strict_reliable_mode),
-            )
+            weather_reference_pool = weather_pool_ui
             selected_commune_weather_reference = _build_commune_weather_reference(
                 selected_commune,
                 weather_reference_pool,
@@ -3833,12 +4041,7 @@ if history_clim_df.empty and not history_monthly_df.empty:
 
 pluvio_ranking_df = _build_pluvio_ranking(
     commune_pool.to_dict(orient="records") if not commune_pool.empty else compare_commune_rows,
-    _select_weather_pool_for_ui(
-        filtered_weather,
-        weather_for_context,
-        weather_df,
-        strict_reliable_mode=bool(strict_reliable_mode),
-    ),
+    weather_pool_ui,
     compare_history_full_df,
 )
 risk_level = str(snapshot.get("risk_level", "INDETERMINE"))
@@ -3849,7 +4052,7 @@ hydro_exceeded_count = (
     if (not filtered_hydro.empty and "threshold_exceeded" in filtered_hydro.columns)
     else 0
 )
-total_lgv_communes = int(len(lgv_communes_df)) if not lgv_communes_df.empty else int(len(commune_df))
+total_lgv_communes = int(len(filtered_lgv_communes)) if not filtered_lgv_communes.empty else int(len(commune_df))
 ai_critical_count = int((filtered_sectors.get("ai_pred_risk_level", pd.Series(dtype=str)) == "CRITIQUE").sum()) if not filtered_sectors.empty else 0
 fragile_soil_count = (
     int((pd.to_numeric(filtered_sectors.get("ai_soil_fragility", 0.0), errors="coerce").fillna(0.0) >= 0.70).sum())
@@ -3877,7 +4080,7 @@ col1.metric("Risque global", risk_level)
 col2.metric("Score global", f"{score:.2f}/4")
 col3.metric("Stations meteo", int(len(filtered_weather)))
 col4.metric("Points LGV filtres", int(len(filtered_sectors)))
-col5.metric("Communes traversees LGV", total_lgv_communes)
+col5.metric("Communes LGV filtrees", total_lgv_communes)
 col6.metric("Hydro seuil urgence", hydro_exceeded_count)
 col7.metric("Secteurs IA critiques", ai_critical_count)
 col8.metric("Secteurs sols fragiles", fragile_soil_count)
@@ -4332,11 +4535,11 @@ with tabs[0]:
                 st.altair_chart(corr_chart, use_container_width=True)
 
     st.subheader("Profil pedologique LGV (points geotechniques)")
-    if geotech_df.empty or "pedology_family" not in geotech_df.columns:
+    if filtered_geotech.empty or "pedology_family" not in filtered_geotech.columns:
         st.info("Pedologie indisponible dans ce snapshot.")
     else:
         pedo = (
-            geotech_df["pedology_family"]
+            filtered_geotech["pedology_family"]
             .fillna("Pedologie indeterminee")
             .astype(str)
             .value_counts()
@@ -4580,12 +4783,7 @@ with tabs[0]:
                 if hit.empty:
                     continue
                 com = hit.iloc[0].to_dict()
-                wx_source = _select_weather_pool_for_ui(
-                    filtered_weather,
-                    weather_for_context,
-                    weather_df,
-                    strict_reliable_mode=bool(strict_reliable_mode),
-                )
+                wx_source = weather_pool_ui
                 ref = _build_commune_weather_reference(
                     com,
                     wx_source,
@@ -4870,12 +5068,7 @@ with tabs[0]:
             )
             st.caption(f"Source jour precis: Open-Meteo archive ({selected_daily_day_precip.get('model')})")
 
-        detail_weather_pool = _select_weather_pool_for_ui(
-            filtered_weather,
-            weather_for_context,
-            weather_df,
-            strict_reliable_mode=bool(strict_reliable_mode),
-        )
+        detail_weather_pool = weather_pool_ui
         nearest_weather_snapshot = _select_best_weather_row(
             detail_weather_pool,
             float(selected_commune["latitude"]),
@@ -4883,7 +5076,7 @@ with tabs[0]:
             commune_name=selected_commune.get("commune_name"),
         )
         nearest_hydro = _nearest_row(filtered_hydro, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
-        nearest_piezo = _nearest_row(piezo_df, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
+        nearest_piezo = _nearest_row(filtered_piezo, float(selected_commune["latitude"]), float(selected_commune["longitude"]))
 
         cwx, chx, cpx = st.columns(3)
         with cwx:
@@ -5017,6 +5210,7 @@ with tabs[0]:
                         {
                             "station_code": nearest_hydro.get("station_code"),
                             "river_name": nearest_hydro.get("river_name"),
+                            "commune_name": nearest_hydro.get("commune_name"),
                             "distance_km": nearest_hydro.get("_dist_km"),
                             "last_level_m": nearest_hydro.get("last_level_m"),
                             "trend_mph": nearest_hydro.get("trend_mph"),
@@ -5122,7 +5316,15 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Carte multi-couches")
-    if commune_df.empty and filtered_weather.empty and filtered_sectors.empty and filtered_hydro.empty and lgv_communes_df.empty:
+    if (
+        commune_df.empty
+        and filtered_weather.empty
+        and filtered_sectors.empty
+        and filtered_hydro.empty
+        and filtered_piezo.empty
+        and filtered_geotech.empty
+        and filtered_lgv_communes.empty
+    ):
         st.info("Pas de donnees cartographiques avec ces filtres.")
     else:
         m = _build_map(
@@ -5132,10 +5334,10 @@ with tabs[1]:
             sectors_df=filtered_sectors,
             slip_corridors_df=slip_corridors_df,
             hydro_df=filtered_hydro,
-            piezo_df=piezo_df,
-            geotech_df=geotech_df,
-            lgv_communes_df=lgv_communes_df,
-            fr_communes_geojson=fr_communes_geojson,
+            piezo_df=filtered_piezo,
+            geotech_df=filtered_geotech,
+            lgv_communes_df=filtered_lgv_communes,
+            fr_communes_geojson=filtered_fr_communes_geojson,
             rain_col_weather=effective_rain_col_weather,
             min_risk=min_risk,
             show_weather=show_weather,
@@ -5181,6 +5383,14 @@ with tabs[1]:
         )
 
 with tabs[2]:
+    st.subheader("Suivi filtres et coherence")
+    if filter_audit_df.empty:
+        st.info("Suivi des filtres indisponible.")
+    else:
+        st.dataframe(filter_audit_df, use_container_width=True, hide_index=True)
+        commune_filter_state = "actif" if commune_filter_is_active else "inactif (toutes communes)"
+        st.caption(f"Etat filtre communes: {commune_filter_state}. Risque minimum global: {str(min_risk).upper()}.")
+
     st.subheader("Tableau communes")
     if commune_df.empty:
         st.info("Aucune commune disponible.")
@@ -5392,6 +5602,7 @@ with tabs[2]:
             "station_code",
             "station_name",
             "river_name",
+            "commune_name",
             "source",
             "distance_to_lgv_km",
             "last_level_m",
@@ -5410,9 +5621,12 @@ with tabs[2]:
             hydro_view = hydro_view.sort_values("threshold_ratio", ascending=False, na_position="last")
         st.dataframe(hydro_view, use_container_width=True, hide_index=True)
 
-    st.subheader("Communes traversees par la LGV SEA (liste exhaustive)")
-    if lgv_communes_df.empty:
-        st.info("Liste exhaustive des communes indisponible dans ce snapshot.")
+    lgv_title = "Communes traversees par la LGV SEA (liste exhaustive)"
+    if commune_filter_is_active:
+        lgv_title = "Communes traversees par la LGV SEA (filtrees)"
+    st.subheader(lgv_title)
+    if filtered_lgv_communes.empty:
+        st.info("Aucune commune LGV sur les filtres actifs.")
     else:
         lgvc_cols = [
             "order_on_line",
@@ -5425,8 +5639,8 @@ with tabs[2]:
             "traversed_km",
             "sample_count",
         ]
-        lgvc_cols = [c for c in lgvc_cols if c in lgv_communes_df.columns]
-        lgv_view = lgv_communes_df[lgvc_cols].copy()
+        lgvc_cols = [c for c in lgvc_cols if c in filtered_lgv_communes.columns]
+        lgv_view = filtered_lgv_communes[lgvc_cols].copy()
         if "order_on_line" in lgv_view.columns:
             lgv_view = lgv_view.sort_values("order_on_line", na_position="last")
         st.dataframe(
@@ -5456,7 +5670,8 @@ with tabs[3]:
         {
             "line_name": line_meta.get("line_name", "LGV SEA"),
             "line_length_km": line_meta.get("line_length_km"),
-            "communes_traversees": int(len(lgv_communes_df)) if not lgv_communes_df.empty else None,
+            "communes_traversees_snapshot": int(len(lgv_communes_df)) if not lgv_communes_df.empty else None,
+            "communes_traversees_apres_filtres": int(len(filtered_lgv_communes)) if not filtered_lgv_communes.empty else 0,
             "risk_level_global": snapshot.get("risk_level"),
             "score_global": snapshot.get("score"),
         }
