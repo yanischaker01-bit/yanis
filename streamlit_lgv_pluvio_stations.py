@@ -253,33 +253,45 @@ def load_vigicrue_rivers() -> list:
     return dedup
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=900)
 def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
-    """Cumul pluie réel via Open-Meteo forecast (past_days) — lag ~6h, fiable."""
+    """Cumul pluie via Open-Meteo.
+    24h  → AROME Météo-France 1,3 km (orages locaux), sinon ERA5.
+    7j+  → ERA5 seamless (couverture longue durée).
+    """
     today = datetime.now(timezone.utc).date()
     if periode == "24h":
-        past_days = 1                          # hier uniquement
+        past_days = 1
     elif periode == "7 jours":
         past_days = 7
     elif periode == "30 jours":
         past_days = 30
-    else:                                      # Mois courant
-        past_days = today.day - 1             # jours écoulés depuis le 1er
+    else:
+        past_days = today.day - 1
     if past_days <= 0:
         return 0.0
-    try:
-        r = requests.get(FORECAST_URL, params={
-            "latitude": round(lat, 4), "longitude": round(lon, 4),
-            "daily": "precipitation_sum",
-            "past_days": past_days,
-            "forecast_days": 0,
-            "timezone": "Europe/Paris",
-        }, timeout=15)
-        r.raise_for_status()
-        vals = r.json()["daily"]["precipitation_sum"]
-        return round(sum(v for v in vals if v is not None), 1)
-    except Exception:
-        return float("nan")
+
+    base = {
+        "latitude": round(lat, 4), "longitude": round(lon, 4),
+        "daily": "precipitation_sum",
+        "past_days": past_days, "forecast_days": 0,
+        "timezone": "Europe/Paris",
+    }
+    # For 24h: try AROME first (1.3 km, hourly update — captures local storms)
+    models = ["meteofrance_arome_france", None] if periode == "24h" else [None]
+    for model in models:
+        try:
+            params = dict(base)
+            if model:
+                params["models"] = model
+            r = requests.get(FORECAST_URL, params=params, timeout=15)
+            r.raise_for_status()
+            vals = r.json()["daily"]["precipitation_sum"]
+            if vals and any(v is not None for v in vals):
+                return round(sum(v for v in vals if v is not None), 1)
+        except Exception:
+            continue
+    return float("nan")
 
 
 @st.cache_data(ttl=3600)
@@ -581,7 +593,8 @@ if selected_multi and not sectors_df.empty:
                 margin=dict(t=10, b=30, l=10, r=90),
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.caption(f"Source : Open-Meteo ERA5 (near real-time) · {date_str}")
+            _src = "AROME Météo-France 1,3 km" if periode == "24h" else "ERA5 near real-time"
+            st.caption(f"Source : Open-Meteo {_src} · {date_str}")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
 comm_df = (sectors_df if selected_one == "— Toutes —"
