@@ -547,8 +547,20 @@ if selected_multi and not sectors_df.empty:
         if df_cmp.empty:
             st.info("Pas de données pour les communes sélectionnées.")
         else:
-            df_cmp["label"] = df_cmp["rain_mm"].apply(lambda v: f"{v:.1f} mm")
-            df_cmp["color"] = df_cmp["rain_mm"].apply(rain_color_mm)
+            today = datetime.now(timezone.utc).date()
+            if periode == "24h":
+                date_str = f"hier {(today - timedelta(days=1)).strftime('%d/%m/%Y')}"
+            elif periode == "7 jours":
+                date_str = f"{(today - timedelta(days=7)).strftime('%d/%m')} → {(today - timedelta(days=1)).strftime('%d/%m/%Y')}"
+            elif periode == "30 jours":
+                date_str = f"{(today - timedelta(days=30)).strftime('%d/%m')} → {(today - timedelta(days=1)).strftime('%d/%m/%Y')}"
+            else:
+                date_str = f"1er → {(today - timedelta(days=1)).strftime('%d/%m/%Y')}"
+
+            df_cmp["label"] = df_cmp["rain_mm"].apply(
+                lambda v: "Sec" if v == 0 else f"{v:.1f} mm")
+            df_cmp["color"] = df_cmp["rain_mm"].apply(
+                lambda v: "#d1d5db" if v == 0 else rain_color_mm(v))
 
             fig = go.Figure(go.Bar(
                 x=df_cmp["rain_mm"],
@@ -562,14 +574,14 @@ if selected_multi and not sectors_df.empty:
             ))
             height = max(260, len(df_cmp) * 34 + 60)
             fig.update_layout(
-                xaxis=dict(title=f"Cumul pluie (mm) — {periode}", zeroline=True),
+                xaxis=dict(title=f"Cumul pluie (mm)", zeroline=True),
                 yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
                 height=height,
                 plot_bgcolor="white", paper_bgcolor="white",
-                margin=dict(t=10, b=30, l=10, r=80),
+                margin=dict(t=10, b=30, l=10, r=90),
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.caption("Source : Open-Meteo archive · cumul sur la période sélectionnée")
+            st.caption(f"Source : Open-Meteo ERA5 (near real-time) · {date_str}")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
 comm_df = (sectors_df if selected_one == "— Toutes —"

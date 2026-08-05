@@ -10,7 +10,8 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
-ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 STALE_MINUTES = 180
 
 RISK_COLOR = {
@@ -89,6 +90,35 @@ def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
         return pd.DataFrame([{"mois": m, "pluie_mm": round(v, 1)} for m, v in sorted(monthly.items())])
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
+    """Cumul pluie via Open-Meteo forecast (past_days) — lag ~6h, fiable."""
+    today = datetime.now(timezone.utc).date()
+    if periode == "24h":
+        past_days = 1
+    elif periode == "7 jours":
+        past_days = 7
+    elif periode == "30 jours":
+        past_days = 30
+    else:
+        past_days = today.day - 1
+    if past_days <= 0:
+        return 0.0
+    try:
+        r = requests.get(FORECAST_URL, params={
+            "latitude": round(lat, 4), "longitude": round(lon, 4),
+            "daily": "precipitation_sum",
+            "past_days": past_days,
+            "forecast_days": 0,
+            "timezone": "Europe/Paris",
+        }, timeout=15)
+        r.raise_for_status()
+        vals = r.json()["daily"]["precipitation_sum"]
+        return round(sum(v for v in vals if v is not None), 1)
+    except Exception:
+        return float("nan")
 
 
 def risk_badge(level: str) -> str:
@@ -219,8 +249,6 @@ with st.sidebar:
     selected = st.selectbox("📍 Commune", ["— Toutes —"] + list(communes))
 
     periode = st.selectbox("📅 Période", ["24h", "7 jours", "30 jours", "Mois courant"])
-    rain_col = {"24h": "weather_max_24h_mm", "7 jours": "weather_max_7d_mm",
-                "30 jours": "weather_max_30d_mm", "Mois courant": "weather_max_month_mm"}[periode]
 
     risque_min = st.selectbox("⚠ Risque minimum", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"])
     show_ai_detail = st.checkbox("Colonnes IA détaillées dans le tableau", value=False)
@@ -390,6 +418,7 @@ with tab_hist:
 
 # ── Secteurs (bandeau commune + détail IA + tableau) ──────────────────────
 with tab_secteurs:
+    ometo_rain: dict = {}
     if selected != "— Toutes —":
         commune_row = {}
         if not commune_ranking.empty and "commune_name" in commune_ranking.columns:
@@ -409,18 +438,26 @@ with tab_secteurs:
             f'<span style="margin-left:16px">Prédiction IA glissement : {risk_badge(ai_lvl)}</span>'
             f'</div>', unsafe_allow_html=True)
 
+        _om_lat = _om_lon = None
+        _loc = map_df.dropna(subset=["latitude", "longitude"]) if not map_df.empty else pd.DataFrame()
+        if not _loc.empty:
+            _om_lat = round(float(_loc["latitude"].mean()), 4)
+            _om_lon = round(float(_loc["longitude"].mean()), 4)
+
+        if _om_lat is not None:
+            for _p in ["24h", "7 jours", "30 jours", "Mois courant"]:
+                ometo_rain[_p] = load_commune_rain_ometo(_om_lat, _om_lon, _p)
+
         c1, c2, c3, c4 = st.columns(4)
-        for col_widget, label, col_name in [
-            (c1, "☔ Max 24h", "weather_max_24h_mm"),
-            (c2, "🌧 Max 7j", "weather_max_7d_mm"),
-            (c3, "🌦 Max 30j", "weather_max_30d_mm"),
-            (c4, "📅 Mois", "weather_max_month_mm"),
+        for _cw, _label, _key in [
+            (c1, "☔ Cumul 24h",       "24h"),
+            (c2, "🌧 Cumul 7j",        "7 jours"),
+            (c3, "🌦 Cumul 30j",       "30 jours"),
+            (c4, "📅 Mois courant",    "Mois courant"),
         ]:
-            if col_name in df.columns:
-                val = df[col_name].max()
-                col_widget.metric(label, f"{val:.1f} mm" if pd.notna(val) else "—")
-            else:
-                col_widget.metric(label, "—")
+            _v = ometo_rain.get(_key, float("nan"))
+            _cw.metric(_label, f"{_v:.1f} mm" if pd.notna(_v) else "—")
+        st.caption("Pluie : Open-Meteo ERA5 (near real-time, lag ~6h)")
 
         a1, a2, a3 = st.columns(3)
         a1.metric("Probabilité IA max", f"{safe_float(commune_row.get('ai_max_probability')) * 100:.0f} %")
@@ -453,24 +490,34 @@ with tab_secteurs:
     if df.empty:
         st.info("Aucun secteur pour ces filtres.")
     else:
-        base_cols = ["commune_name", "pk_km", "risk_level", rain_col, "ai_pred_risk_level"]
+        base_cols = ["commune_name", "pk_km", "risk_level", "ai_pred_risk_level"]
         ai_cols = ["ai_pred_probability", "ai_confidence", "ai_soil_fragility", "ai_dominant_pedology"]
         show_cols = [c for c in base_cols + (ai_cols if show_ai_detail else []) if c in df.columns]
         rename = {
             "commune_name": "Commune", "pk_km": "PK (km)",
             "risk_level": "Risque", "ai_pred_risk_level": "Risque IA",
-            "weather_max_24h_mm": "24h mm", "weather_max_7d_mm": "7j mm",
-            "weather_max_30d_mm": "30j mm", "weather_max_month_mm": "Mois mm",
             "ai_pred_probability": "Proba IA", "ai_confidence": "Confiance IA",
             "ai_soil_fragility": "Fragilité sol", "ai_dominant_pedology": "Sol dominant",
         }
-        disp = df[show_cols].rename(columns=rename)
+        disp = df[show_cols].copy().rename(columns=rename)
+        # Insérer colonne pluie Open-Meteo (commune sélectionnée uniquement)
+        if selected != "— Toutes —" and ometo_rain:
+            _rv = ometo_rain.get(periode, float("nan"))
+            _pluvio_label = f"Pluie {periode}"
+            disp.insert(2, _pluvio_label, f"{_rv:.1f} mm" if pd.notna(_rv) else "—")
         for pct_col in ["Proba IA", "Confiance IA", "Fragilité sol"]:
             if pct_col in disp.columns:
                 disp[pct_col] = fmt_pct(disp[pct_col])
-        rain_label = rename.get(rain_col, rain_col)
-        if rain_label in disp.columns:
-            disp = disp.sort_values(rain_label, ascending=False, na_position="last")
+        if "Risque IA" in disp.columns:
+            disp = disp.sort_values(
+                "Risque IA",
+                key=lambda s: s.map(lambda x: RISK_RANK.get(str(x), 0)),
+                ascending=False, na_position="last")
+        elif "Risque" in disp.columns:
+            disp = disp.sort_values(
+                "Risque",
+                key=lambda s: s.map(lambda x: RISK_RANK.get(str(x), 0)),
+                ascending=False, na_position="last")
         st.dataframe(disp, use_container_width=True, hide_index=True, height=360)
 
 # ── Communes ────────────────────────────────────────────────────────────
