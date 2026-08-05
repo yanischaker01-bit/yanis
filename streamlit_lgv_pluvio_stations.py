@@ -353,32 +353,6 @@ def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def commune_alerts_from_snapshot(df: pd.DataFrame) -> list:
-    """Alertes pluie par commune à partir des données snapshot mesurées."""
-    alerts = []
-    if df.empty:
-        return alerts
-    thresholds = [
-        ("weather_max_24h_mm",   "24h",   30, 60,  "INONDATION"),
-        ("weather_max_7d_mm",    "7 jours", 80, 150, "INONDATION"),
-        ("weather_max_30d_mm",   "30j",   200, 350, "INONDATION"),
-        ("weather_max_month_mm", "mois",  150, 250, "INONDATION"),
-    ]
-    for _, row in df.iterrows():
-        commune = row.get("commune_name", "?")
-        pk      = row.get("pk_km", "")
-        pk_str  = f" PK {pk:.1f} km" if pd.notna(pk) else ""
-        for col, label, seuil_orange, seuil_rouge, atype in thresholds:
-            val = row.get(col)
-            if val is None or not isinstance(val, (int, float)) or pd.isna(val):
-                continue
-            if val >= seuil_rouge:
-                alerts.append(dict(dep="commune", date="", type=atype, level="ROUGE",
-                    msg=f"{commune}{pk_str} — {label} : {val:.1f} mm ⚠️ seuil critique"))
-            elif val >= seuil_orange:
-                alerts.append(dict(dep="commune", date="", type=atype, level="ORANGE",
-                    msg=f"{commune}{pk_str} — {label} : {val:.1f} mm"))
-    return sorted(alerts, key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x.get("msg","")))
 
 
 def safe_df(records) -> pd.DataFrame:
@@ -530,8 +504,6 @@ with st.sidebar:
                                      default=communes[:4] if len(communes) >= 4 else communes)
     selected_one   = st.selectbox("Commune principale", ["— Toutes —"] + list(communes))
     periode  = st.selectbox("📅 Période pluvio", ["24h","7 jours","30 jours","Mois courant"])
-    rain_col = {"24h":"weather_max_24h_mm","7 jours":"weather_max_7d_mm",
-                "30 jours":"weather_max_30d_mm","Mois courant":"weather_max_month_mm"}[periode]
 
 # ── 3. COMPARAISON COMMUNES ─────────────────────────────────────────────────
 if selected_multi and not sectors_df.empty:
@@ -684,7 +656,7 @@ if not map_df.empty:
                 popup=folium.Popup(
                     f"<b>{row.get('commune_name','')} — PK {row.get('pk_km','')} km</b><br>"
                     f"Cumul {periode} : <b>{rain_label_s}</b><br>"
-                    f"<small>Source : Open-Meteo archive</small>", max_width=250),
+                    f"<small>Source : Open-Meteo AROME 1,3 km</small>", max_width=250),
             ).add_to(m)
     else:
         # All communes: color by nearest dept's forecast (no per-sector API calls)
@@ -729,7 +701,8 @@ if selected_one != "— Toutes —" and not disp.empty:
         lon_t = round(float(loc_t["longitude"].mean()), 4)
         rain_t = load_commune_rain_ometo(lat_t, lon_t, periode)
         disp[f"Cumul {periode} (mm)"] = rain_t if not pd.isna(rain_t) else None
-        st.caption(f"Pluie = cumul Open-Meteo archive pour la commune · {periode}")
+        _src_lbl = "AROME 1,3 km" if periode == "24h" else "ERA5 near real-time"
+        st.caption(f"Pluie : Open-Meteo {_src_lbl} · cumul {periode}")
 elif not disp.empty:
     st.caption("ℹ️ Voir **Comparaison communes** ci-dessus pour les données pluvio fiables (Open-Meteo).")
 
