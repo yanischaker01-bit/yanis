@@ -480,24 +480,42 @@ with st.sidebar:
 
 # ── 3. COMPARAISON COMMUNES ─────────────────────────────────────────────────
 if selected_multi and not sectors_df.empty and rain_col in sectors_df.columns:
-    st.subheader("📊 Comparaison communes — pluie par secteur")
-    df_cmp = (sectors_df[sectors_df["commune_name"].isin(selected_multi)]
-              [["commune_name","pk_km",rain_col]].copy()
-              .dropna(subset=[rain_col])
-              .sort_values(rain_col, ascending=False))
-    if not df_cmp.empty:
-        fig = px.bar(
-            df_cmp, x="commune_name", y=rain_col, color=rain_col,
-            color_continuous_scale=["#bfdbfe","#3b82f6","#ea580c","#dc2626"],
-            labels={"commune_name":"Commune", rain_col:"Pluie (mm)"},
-            text=rain_col,
-            hover_data=["pk_km"] if "pk_km" in df_cmp.columns else None,
+    st.subheader(f"📊 Comparaison communes — pluie max secteur ({periode})")
+
+    # Aggregate: one row per commune = max across all its sectors (worst-case)
+    df_src = (sectors_df[sectors_df["commune_name"].isin(selected_multi)]
+              [["commune_name", rain_col]]
+              .dropna(subset=[rain_col]))
+    df_cmp = (df_src.groupby("commune_name", as_index=False)[rain_col]
+              .max()
+              .sort_values(rain_col, ascending=True))   # ascending → top of horizontal chart = highest
+
+    if df_cmp.empty:
+        st.info("Pas de données pluvio pour les communes sélectionnées.")
+    else:
+        df_cmp["label"] = df_cmp[rain_col].apply(lambda v: f"{v:.1f} mm")
+        df_cmp["color"] = df_cmp[rain_col].apply(rain_color_mm)
+
+        fig = go.Figure(go.Bar(
+            x=df_cmp[rain_col],
+            y=df_cmp["commune_name"],
+            orientation="h",
+            marker_color=df_cmp["color"].tolist(),
+            text=df_cmp["label"],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>Pluie max : %{x:.1f} mm<extra></extra>",
+        ))
+        height = max(260, len(df_cmp) * 32 + 60)
+        fig.update_layout(
+            xaxis=dict(title=f"mm ({periode})", zeroline=True),
+            yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
+            height=height,
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=10, b=30, l=10, r=70),
         )
-        fig.update_traces(texttemplate="%{text:.1f}", textposition="outside")
-        fig.update_layout(coloraxis_showscale=False, height=300,
-                          plot_bgcolor="white", paper_bgcolor="white",
-                          margin=dict(t=20,b=20,l=20,r=20), xaxis=dict(tickangle=-30))
         st.plotly_chart(fig, use_container_width=True)
+        st.caption(f"Valeur affichée = secteur le plus arrosé de la commune sur la période {periode}.")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
 comm_df = (sectors_df if selected_one == "— Toutes —"
