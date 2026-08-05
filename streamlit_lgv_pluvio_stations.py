@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -148,36 +149,112 @@ def load_weather_alerts_all() -> list:
     return sorted(alerts, key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["date"]))
 
 
+def _normalize(s: str) -> str:
+    """Lowercase + strip accents for robust name matching."""
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+# Cours d'eau traversés ou longés par la LGV SEA Tours→Bordeaux
+_RIVERS_RAW = [
+    "vienne", "clain", "charente", "boutonne", "seugne", "touvre",
+    "dronne", "isle", "dordogne", "garonne", "thouet", "sevre",
+    "indre", "cher", "creuse", "ciron", "jalles", "estey",
+    "leyre", "midouze", "brion", "anglin",
+]
+RIVERS_LGV = [_normalize(r) for r in _RIVERS_RAW]
+
+# Departments along LGV SEA (filter unrelated rivers with same name elsewhere)
+_DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
+
+
 @st.cache_data(ttl=1800)
-def load_vigicrue() -> list:
-    """Vigilance crues via API officielle Vigicrue (XML)."""
+def load_vigicrue_rivers() -> list:
+    """Vigilance crues des cours d'eau à proximité de la LGV SEA (API Vigicrue XML)."""
     VC_LEVEL = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
-    results  = []
-    deps_ok  = set(DEPS.keys())
-    try:
-        r = requests.get(
-            "https://www.vigicrues.gouv.fr/services/2/InfosCrues.xml",
-            params={"TypEntVigiCru": 3}, timeout=15,
-        )
-        if r.status_code == 200:
-            root = ET.fromstring(r.content)
+    results: list = []
+
+    # Try tronçon level (4), then section level (3) as fallback
+    for params in [{"TypEntVigiCru": 4}, {"TypEntVigiCru": 3}, {}]:
+        try:
+            r = requests.get(
+                "https://www.vigicrues.gouv.fr/services/2/InfoVigiCrue.xml",
+                params=params, timeout=15,
+            )
+            if r.status_code != 200:
+                continue
+            content = r.content.strip()
+            if not content.startswith(b"<"):
+                continue
+
+            root = ET.fromstring(content)
+            found = False
+
             for elem in root.iter():
-                cd  = (elem.get("CdEntVigiCru") or elem.get("CdDep")
-                       or elem.get("CDDep") or "")
-                niv = elem.get("NivVigiCruHydro") or elem.get("NivVigiCru")
-                if cd in deps_ok and niv:
-                    lvl = VC_LEVEL.get(int(niv), "VERT")
-                    nom = DEPS[cd]["nom"]
-                    results.append(dict(dep=cd, level=lvl, type="VIGICRUE",
-                        msg=f"Dép.{cd} {nom} — Vigilance crue {lvl.lower()}"))
-    except Exception:
-        pass
-    # If API returned nothing useful, show info
-    if not results:
-        for dep, info in DEPS.items():
-            results.append(dict(dep=dep, level="INFO", type="VIGICRUE",
-                msg=f"Dép.{dep} {info['nom']} — Vigicrue : données indisponibles"))
-    return [r for r in results if r["level"] != "VERT"]
+                # River / section name — try all known attribute variants
+                name = ""
+                for attr in ("NomEntVigiCru", "NomTroncon", "LibEntVigiCru",
+                             "NomCoursDeau", "Nom", "lib", "label"):
+                    name = elem.get(attr, "")
+                    if name:
+                        break
+                if not name:
+                    continue
+
+                # Vigilance level
+                niv_raw = ""
+                for attr in ("NivVigiCruHydro", "NivVigiCru", "NivVig",
+                             "couleur", "Couleur"):
+                    niv_raw = elem.get(attr, "")
+                    if niv_raw:
+                        break
+                if not niv_raw:
+                    continue
+                try:
+                    niv = int(float(niv_raw))
+                except ValueError:
+                    continue
+
+                # Department (optional — used to filter false positives)
+                dep_raw = (elem.get("CdEntVigiCru") or elem.get("CdDep")
+                           or elem.get("CDDep") or "")
+
+                name_norm = _normalize(name)
+                is_lgv = any(rv in name_norm for rv in RIVERS_LGV)
+                dep_ok = (not dep_raw) or (dep_raw in _DEP_OK)
+
+                if is_lgv and dep_ok:
+                    lvl = VC_LEVEL.get(niv, "VERT")
+                    results.append(dict(
+                        riviere=name, dep=dep_raw, level=lvl, type="VIGICRUE",
+                        msg=f"🏞️ {name} — vigilance {lvl.lower()}",
+                    ))
+                    found = True
+
+            if found:
+                break
+        except Exception:
+            continue
+
+    # Deduplicate (same river + same level)
+    seen: set = set()
+    dedup: list = []
+    for item in results:
+        key = (_normalize(item["riviere"])[:25], item["level"])
+        if key not in seen:
+            seen.add(key)
+            dedup.append(item)
+
+    # Sort: highest level first, then alphabetical
+    dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
+
+    if not dedup:
+        dedup.append(dict(
+            riviere="", dep="", level="INFO", type="VIGICRUE",
+            msg="Vigicrue : aucune crue active sur les cours d'eau LGV SEA",
+        ))
+    return dedup
 
 
 @st.cache_data(ttl=3600)
@@ -332,7 +409,7 @@ for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
 st.subheader("🚨 Alertes surveillance — 7 prochains jours")
 
 met_alerts  = load_weather_alerts_all()
-vc_alerts   = load_vigicrue()
+vc_alerts   = load_vigicrue_rivers()
 comm_alerts = commune_alerts_from_snapshot(sectors_df)
 active_met  = [a for a in met_alerts  if a["level"] in ("ROUGE","ORANGE","JAUNE")]
 active_vc   = [a for a in vc_alerts   if a["level"] in ("ROUGE","ORANGE","JAUNE")]
