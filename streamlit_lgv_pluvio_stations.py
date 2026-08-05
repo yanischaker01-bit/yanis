@@ -175,12 +175,13 @@ def load_vigicrue_rivers() -> list:
     VC_LEVEL = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
     results: list = []
 
-    # Try tronçon level (4), then section level (3) as fallback
-    for params in [{"TypEntVigiCru": 4}, {"TypEntVigiCru": 3}, {}]:
+    # TypEntVigiCru=3 = tronçons (sections de cours d'eau) — principal format Vigicrue v2
+    for params in [{"TypEntVigiCru": 3}, {}]:
         try:
             r = requests.get(
                 "https://www.vigicrues.gouv.fr/services/2/InfoVigiCrue.xml",
                 params=params, timeout=15,
+                headers={"Accept": "application/xml,text/xml,*/*"},
             )
             if r.status_code != 200:
                 continue
@@ -192,20 +193,19 @@ def load_vigicrue_rivers() -> list:
             found = False
 
             for elem in root.iter():
-                # River / section name — try all known attribute variants
+                # Name: Vigicrue v2 uses LibTroncon or NomTroncon; fallback to others
                 name = ""
-                for attr in ("NomEntVigiCru", "NomTroncon", "LibEntVigiCru",
-                             "NomCoursDeau", "Nom", "lib", "label"):
+                for attr in ("LibTroncon", "NomTroncon", "NomEntVigiCru",
+                             "LibEntVigiCru", "NomCoursDeau", "Nom", "lib"):
                     name = elem.get(attr, "")
                     if name:
                         break
                 if not name:
                     continue
 
-                # Vigilance level
+                # Vigilance level: NivVigiCru is standard in v2
                 niv_raw = ""
-                for attr in ("NivVigiCruHydro", "NivVigiCru", "NivVig",
-                             "couleur", "Couleur"):
+                for attr in ("NivVigiCru", "NivVigiCruHydro", "NivVig", "couleur"):
                     niv_raw = elem.get(attr, "")
                     if niv_raw:
                         break
@@ -216,10 +216,8 @@ def load_vigicrue_rivers() -> list:
                 except ValueError:
                     continue
 
-                # Department (optional — used to filter false positives)
-                dep_raw = (elem.get("CdEntVigiCru") or elem.get("CdDep")
+                dep_raw = (elem.get("CdDep") or elem.get("CdEntVigiCru")
                            or elem.get("CDDep") or "")
-
                 name_norm = _normalize(name)
                 is_lgv = any(rv in name_norm for rv in RIVERS_LGV)
                 dep_ok = (not dep_raw) or (dep_raw in _DEP_OK)
@@ -228,7 +226,7 @@ def load_vigicrue_rivers() -> list:
                     lvl = VC_LEVEL.get(niv, "VERT")
                     results.append(dict(
                         riviere=name, dep=dep_raw, level=lvl, type="VIGICRUE",
-                        msg=f"🏞️ {name} — vigilance {lvl.lower()}",
+                        msg=f"{name} — vigilance {lvl.lower()}",
                     ))
                     found = True
 
@@ -237,7 +235,7 @@ def load_vigicrue_rivers() -> list:
         except Exception:
             continue
 
-    # Deduplicate (same river + same level)
+    # Deduplicate
     seen: set = set()
     dedup: list = []
     for item in results:
@@ -246,14 +244,12 @@ def load_vigicrue_rivers() -> list:
             seen.add(key)
             dedup.append(item)
 
-    # Sort: highest level first, then alphabetical
+    # Sort: highest level first, then by name
     dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
 
     if not dedup:
-        dedup.append(dict(
-            riviere="", dep="", level="INFO", type="VIGICRUE",
-            msg="Vigicrue : aucune crue active sur les cours d'eau LGV SEA",
-        ))
+        dedup.append(dict(riviere="", dep="", level="INFO", type="VIGICRUE",
+            msg="API Vigicrue indisponible ou aucune crue en cours sur les cours d'eau LGV SEA"))
     return dedup
 
 
@@ -358,10 +354,13 @@ def alert_card(a: dict):
     atype = a.get("type", "")
     color = LEVEL_COLOR.get(lvl, "#6b7280")
     icon  = ALERT_CFG.get(atype, ("⚠️", ""))[0]
+    prefix = LEVEL_EMOJI.get(lvl, "")
+    if lvl == "VERT":
+        prefix = "✅"
     st.markdown(
         f'<div style="padding:7px 14px;border-radius:6px;border-left:4px solid {color};'
         f'background:{color}12;margin-bottom:5px;font-size:13px">'
-        f'{LEVEL_EMOJI.get(lvl,"")} {icon} <b>[{lvl}]</b> {a.get("msg","")}'
+        f'{prefix} {icon} <b>[{lvl}]</b> {a.get("msg","")}'
         f'</div>', unsafe_allow_html=True)
 
 
@@ -411,48 +410,55 @@ st.subheader("🚨 Alertes surveillance — 7 prochains jours")
 met_alerts  = load_weather_alerts_all()
 vc_alerts   = load_vigicrue_rivers()
 comm_alerts = commune_alerts_from_snapshot(sectors_df)
-active_met  = [a for a in met_alerts  if a["level"] in ("ROUGE","ORANGE","JAUNE")]
-active_vc   = [a for a in vc_alerts   if a["level"] in ("ROUGE","ORANGE","JAUNE")]
-all_active  = active_met + active_vc
 
-if not all_active:
-    st.success("✅ Aucune alerte active sur les 7 prochains jours.")
-else:
-    # Summary chips
-    by_type: dict = defaultdict(list)
-    for a in all_active:
-        by_type[a["type"]].append(a)
+# Active weather alerts only (for summary chips)
+active_met = [a for a in met_alerts if a["level"] in ("ROUGE","ORANGE","JAUNE")]
+by_met: dict = defaultdict(list)
+for a in active_met:
+    by_met[a["type"]].append(a)
 
+# Summary chips
+if active_met:
     chips = ""
-    for atype, alist in by_type.items():
-        worst = max(alist, key=lambda x: LEVEL_RANK.get(x["level"],0))
-        color = LEVEL_COLOR.get(worst["level"],"#6b7280")
-        icon, label = ALERT_CFG.get(atype, ("⚠️",""))
+    for atype, alist in by_met.items():
+        worst = max(alist, key=lambda x: LEVEL_RANK.get(x["level"], 0))
+        color = LEVEL_COLOR.get(worst["level"], "#6b7280")
+        icon, label = ALERT_CFG.get(atype, ("⚠️", ""))
         chips += (f'<span style="display:inline-block;margin:3px 4px;padding:3px 10px;'
                   f'border-radius:20px;background:{color};color:white;font-size:12px;font-weight:600">'
                   f'{icon} {label} ({len(alist)})</span>')
     st.markdown(chips, unsafe_allow_html=True)
+else:
+    st.success("✅ Aucune alerte météo active sur les 7 prochains jours.")
 
-    tab_labels = []
-    tab_data   = []
-    order = ["ORAGE","INONDATION","VIGICRUE","CANICULE","INCENDIE","VENT"]
-    for atype in order:
-        if atype in by_type:
-            icon, label = ALERT_CFG[atype]
-            tab_labels.append(f"{icon} {label}")
-            tab_data.append(by_type[atype])
+# Build tabs — Vigicrue always present
+tab_labels: list = []
+tab_data:   list = []
+for atype in ("ORAGE","INONDATION","CANICULE","INCENDIE","VENT"):
+    if atype in by_met:
+        icon, label = ALERT_CFG[atype]
+        tab_labels.append(f"{icon} {label} ({len(by_met[atype])})")
+        tab_data.append(by_met[atype])
 
-    # Onglet communes (données snapshot mesurées)
-    if comm_alerts:
-        tab_labels.append("📍 Communes")
-        tab_data.append(comm_alerts)
+# Vigicrue — always show (even if VERT / indisponible)
+vc_active = [a for a in vc_alerts if a["level"] in ("ROUGE","ORANGE","JAUNE")]
+vc_label  = f"🏞️ Vigicrue" + (f" ⚠ {len(vc_active)}" if vc_active else " ✅")
+tab_labels.append(vc_label)
+tab_data.append(vc_alerts)
 
-    if tab_labels:
-        tabs = st.tabs(tab_labels)
-        for tab, alist in zip(tabs, tab_data):
-            with tab:
-                for a in alist:
-                    alert_card(a)
+# Communes mesurées
+if comm_alerts:
+    tab_labels.append(f"📍 Communes ({len(comm_alerts)})")
+    tab_data.append(comm_alerts)
+
+if tab_labels:
+    tabs = st.tabs(tab_labels)
+    for tab, alist in zip(tabs, tab_data):
+        with tab:
+            if not alist:
+                st.info("Aucune donnée.")
+            for a in alist:
+                alert_card(a)
 
 st.caption("Alertes calculées via prévisions Open-Meteo + API Vigicrue · "
            "Vigilance officielle : [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) · "
