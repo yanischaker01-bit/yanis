@@ -254,6 +254,37 @@ def load_vigicrue_rivers() -> list:
 
 
 @st.cache_data(ttl=3600)
+def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
+    """Cumul de pluie réel (Open-Meteo archive) pour la période donnée."""
+    today = datetime.now(timezone.utc).date()
+    if periode == "24h":
+        start = today - timedelta(days=2)
+        end   = today - timedelta(days=1)
+    elif periode == "7 jours":
+        start = today - timedelta(days=7)
+        end   = today - timedelta(days=1)
+    elif periode == "30 jours":
+        start = today - timedelta(days=30)
+        end   = today - timedelta(days=1)
+    else:  # Mois courant
+        start = today.replace(day=1)
+        end   = today - timedelta(days=1)
+    if start > end:
+        return 0.0
+    try:
+        r = requests.get(ARCHIVE_URL, params={
+            "latitude": round(lat, 4), "longitude": round(lon, 4),
+            "start_date": str(start), "end_date": str(end),
+            "daily": "precipitation_sum", "timezone": "Europe/Paris",
+        }, timeout=15)
+        r.raise_for_status()
+        vals = r.json()["daily"]["precipitation_sum"]
+        return round(sum(v for v in vals if v is not None), 1)
+    except Exception:
+        return float("nan")
+
+
+@st.cache_data(ttl=3600)
 def load_forecast_dep(dep: str) -> dict:
     d = DEPS[dep]
     try:
@@ -479,43 +510,54 @@ with st.sidebar:
                 "30 jours":"weather_max_30d_mm","Mois courant":"weather_max_month_mm"}[periode]
 
 # ── 3. COMPARAISON COMMUNES ─────────────────────────────────────────────────
-if selected_multi and not sectors_df.empty and rain_col in sectors_df.columns:
-    st.subheader(f"📊 Comparaison communes — pluie max secteur ({periode})")
+if selected_multi and not sectors_df.empty:
+    st.subheader(f"📊 Comparaison communes — cumul pluie ({periode})")
 
-    # Aggregate: one row per commune = max across all its sectors (worst-case)
-    df_src = (sectors_df[sectors_df["commune_name"].isin(selected_multi)]
-              [["commune_name", rain_col]]
-              .dropna(subset=[rain_col]))
-    df_cmp = (df_src.groupby("commune_name", as_index=False)[rain_col]
-              .max()
-              .sort_values(rain_col, ascending=True))   # ascending → top of horizontal chart = highest
-
-    if df_cmp.empty:
-        st.info("Pas de données pluvio pour les communes sélectionnées.")
+    if len(selected_multi) > 12:
+        st.warning("Sélectionne 12 communes max pour la comparaison.")
     else:
-        df_cmp["label"] = df_cmp[rain_col].apply(lambda v: f"{v:.1f} mm")
-        df_cmp["color"] = df_cmp[rain_col].apply(rain_color_mm)
+        rows = []
+        with st.spinner("Chargement données pluvio Open-Meteo…"):
+            for commune in selected_multi:
+                loc = (sectors_df[sectors_df["commune_name"] == commune]
+                       .dropna(subset=["latitude","longitude"]))
+                if loc.empty:
+                    continue
+                lat = round(float(loc["latitude"].mean()), 4)
+                lon = round(float(loc["longitude"].mean()), 4)
+                rain = load_commune_rain_ometo(lat, lon, periode)
+                rows.append({"commune_name": commune, "rain_mm": rain})
 
-        fig = go.Figure(go.Bar(
-            x=df_cmp[rain_col],
-            y=df_cmp["commune_name"],
-            orientation="h",
-            marker_color=df_cmp["color"].tolist(),
-            text=df_cmp["label"],
-            textposition="outside",
-            cliponaxis=False,
-            hovertemplate="<b>%{y}</b><br>Pluie max : %{x:.1f} mm<extra></extra>",
-        ))
-        height = max(260, len(df_cmp) * 32 + 60)
-        fig.update_layout(
-            xaxis=dict(title=f"mm ({periode})", zeroline=True),
-            yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
-            height=height,
-            plot_bgcolor="white", paper_bgcolor="white",
-            margin=dict(t=10, b=30, l=10, r=70),
-        )
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(f"Valeur affichée = secteur le plus arrosé de la commune sur la période {periode}.")
+        df_cmp = (pd.DataFrame(rows)
+                  .dropna(subset=["rain_mm"])
+                  .sort_values("rain_mm", ascending=True))
+
+        if df_cmp.empty:
+            st.info("Pas de données pour les communes sélectionnées.")
+        else:
+            df_cmp["label"] = df_cmp["rain_mm"].apply(lambda v: f"{v:.1f} mm")
+            df_cmp["color"] = df_cmp["rain_mm"].apply(rain_color_mm)
+
+            fig = go.Figure(go.Bar(
+                x=df_cmp["rain_mm"],
+                y=df_cmp["commune_name"],
+                orientation="h",
+                marker_color=df_cmp["color"].tolist(),
+                text=df_cmp["label"],
+                textposition="outside",
+                cliponaxis=False,
+                hovertemplate="<b>%{y}</b><br>Cumul : %{x:.1f} mm<extra></extra>",
+            ))
+            height = max(260, len(df_cmp) * 34 + 60)
+            fig.update_layout(
+                xaxis=dict(title=f"Cumul pluie (mm) — {periode}", zeroline=True),
+                yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
+                height=height,
+                plot_bgcolor="white", paper_bgcolor="white",
+                margin=dict(t=10, b=30, l=10, r=80),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Source : Open-Meteo archive · cumul sur la période sélectionnée")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
 comm_df = (sectors_df if selected_one == "— Toutes —"
