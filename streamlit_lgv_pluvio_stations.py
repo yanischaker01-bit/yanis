@@ -397,9 +397,17 @@ def alert_card(a: dict):
 
 # ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="LGV SEA – Pluviométrie", page_icon="🌧", layout="wide")
-st.title("🌧 LGV SEA – Pluviométrie & alertes météo")
+st.title("🌧 LGV SEA – Pluviométrie")
 
-if st.button("🔄 Rafraîchir"):
+col_title, col_btn = st.columns([5, 1])
+col_title.caption(
+    "📡 Données météo : **Open-Meteo** (modèles ERA5 + ECMWF) · "
+    "Crues : **Vigicrue** · Données non officielles — "
+    "pour les alertes officielles : "
+    "[vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) · "
+    "[vigicrues.gouv.fr](https://www.vigicrues.gouv.fr/)"
+)
+if col_btn.button("🔄 Rafraîchir"):
     st.cache_data.clear()
     st.rerun()
 
@@ -415,40 +423,63 @@ for col in ["weather_max_24h_mm","weather_max_7d_mm","weather_max_30d_mm",
     if col in sectors_df.columns:
         sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
 
-# ── 1. VIGILANCE PLUIE PAR DÉPARTEMENT ─────────────────────────────────────
-st.subheader("📡 Vigilance pluvio — prévisions 7 jours")
+# Pre-compute dept forecast rain (used for map coloring + dept cards)
+RAIN_LABELS = {
+    "VERT":   ("Peu de pluie",    "#16a34a", "🟢"),
+    "JAUNE":  ("Pluie modérée",   "#eab308", "🟡"),
+    "ORANGE": ("Pluies fortes",   "#ea580c", "🟠"),
+    "ROUGE":  ("Pluies très fortes","#dc2626","🔴"),
+}
+dep_rain_data: dict = {}   # dep -> {max_mm, total, lvl, color}
+for _dep, _info in DEPS.items():
+    _fc    = load_forecast_dep(_dep)
+    _rains = [v for v in _fc.get("daily", {}).get("precipitation_sum", []) if v is not None]
+    _max   = max(_rains) if _rains else 0.0
+    _total = sum(_rains)
+    _lvl, _color, _emoji = rain_risk(_max)
+    dep_rain_data[_dep] = {"max": _max, "total": _total,
+                            "lvl": _lvl, "color": _color, "emoji": _emoji}
+
+
+def nearest_dep(lat: float, lon: float) -> str:
+    """Return dep code nearest to a lat/lon (for map coloring)."""
+    return min(DEPS.keys(),
+               key=lambda d: (DEPS[d]["lat"] - lat) ** 2 + (DEPS[d]["lon"] - lon) ** 2)
+
+
+# ── 1. PLUIE PRÉVUE PAR DÉPARTEMENT ─────────────────────────────────────────
+st.subheader("📡 Pluie prévue 7 jours par département (Open-Meteo)")
 dep_cols = st.columns(len(DEPS))
 for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
-    fc    = load_forecast_dep(dep)
-    daily = fc.get("daily", {})
-    rains = [v for v in daily.get("precipitation_sum", []) if v is not None]
-    max_mm = max(rains) if rains else 0.0
-    total  = sum(rains)
-    lvl, color, emoji = rain_risk(max_mm)
+    d = dep_rain_data[dep]
+    lvl_label, color, emoji = RAIN_LABELS[d["lvl"]]
     col_w.markdown(
         f'<div style="padding:10px 6px;border-radius:8px;border:2px solid {color};'
         f'text-align:center;background:{color}14">'
         f'<div style="font-size:22px">{emoji}</div>'
         f'<b style="font-size:13px">Dép. {dep}</b><br>'
         f'<span style="font-size:11px;color:#666">{info["nom"]}</span><br>'
-        f'<b style="color:{color}">{lvl}</b><br>'
-        f'<span style="font-size:12px">max {max_mm:.0f} mm/j · {total:.0f} mm total</span>'
+        f'<b style="color:{color};font-size:12px">{lvl_label}</b><br>'
+        f'<span style="font-size:12px">max {d["max"]:.0f} mm/j · {d["total"]:.0f} mm</span>'
         f'</div>', unsafe_allow_html=True)
 
-# ── 2. ALERTES ──────────────────────────────────────────────────────────────
-st.subheader("🚨 Alertes surveillance — 7 prochains jours")
+# ── 2. INDICATEURS MÉTÉO ─────────────────────────────────────────────────────
+st.subheader("📊 Indicateurs météo — 7 prochains jours")
+st.info(
+    "⚠️ **Ces indicateurs sont calculés automatiquement** à partir des prévisions Open-Meteo "
+    "(seuils paramétrés) et **ne remplacent pas les alertes officielles** Météo-France ou Vigicrue. "
+    "En cas de doute, consulter [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/).",
+    icon=None,
+)
 
-met_alerts  = load_weather_alerts_all()
-vc_alerts   = load_vigicrue_rivers()
-comm_alerts = commune_alerts_from_snapshot(sectors_df)
+met_alerts = load_weather_alerts_all()
+vc_alerts  = load_vigicrue_rivers()
 
-# Active weather alerts only (for summary chips)
 active_met = [a for a in met_alerts if a["level"] in ("ROUGE","ORANGE","JAUNE")]
 by_met: dict = defaultdict(list)
 for a in active_met:
     by_met[a["type"]].append(a)
 
-# Summary chips
 if active_met:
     chips = ""
     for atype, alist in by_met.items():
@@ -460,27 +491,20 @@ if active_met:
                   f'{icon} {label} ({len(alist)})</span>')
     st.markdown(chips, unsafe_allow_html=True)
 else:
-    st.success("✅ Aucune alerte météo active sur les 7 prochains jours.")
+    st.success("✅ Aucun indicateur météo significatif sur les 7 prochains jours.")
 
-# Build tabs — Vigicrue always present
 tab_labels: list = []
 tab_data:   list = []
-for atype in ("ORAGE","INONDATION","CANICULE","INCENDIE","VENT"):
+for atype in ("ORAGE", "INONDATION", "CANICULE", "INCENDIE", "VENT"):
     if atype in by_met:
         icon, label = ALERT_CFG[atype]
         tab_labels.append(f"{icon} {label} ({len(by_met[atype])})")
         tab_data.append(by_met[atype])
 
-# Vigicrue — always show (even if VERT / indisponible)
 vc_active = [a for a in vc_alerts if a["level"] in ("ROUGE","ORANGE","JAUNE")]
-vc_label  = f"🏞️ Vigicrue" + (f" ⚠ {len(vc_active)}" if vc_active else " ✅")
+vc_label  = "🏞️ Vigicrue" + (f" ⚠ {len(vc_active)}" if vc_active else " ✅")
 tab_labels.append(vc_label)
 tab_data.append(vc_alerts)
-
-# Communes mesurées
-if comm_alerts:
-    tab_labels.append(f"📍 Communes ({len(comm_alerts)})")
-    tab_data.append(comm_alerts)
 
 if tab_labels:
     tabs = st.tabs(tab_labels)
@@ -490,10 +514,6 @@ if tab_labels:
                 st.info("Aucune donnée.")
             for a in alist:
                 alert_card(a)
-
-st.caption("Alertes calculées via prévisions Open-Meteo + API Vigicrue · "
-           "Vigilance officielle : [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) · "
-           "[vigicrues.gouv.fr](https://www.vigicrues.gouv.fr/)")
 
 st.divider()
 
@@ -622,45 +642,80 @@ else:
     st.info("Historique indisponible.")
 
 # ── 6. CARTE ────────────────────────────────────────────────────────────────
-st.subheader("🗺 Carte — pluie par secteur")
-if not map_df.empty and rain_col in map_df.columns:
+st.subheader("🗺 Carte des secteurs LGV SEA")
+if not map_df.empty:
     m = folium.Map(
         location=[lat_c, lon_c],
         zoom_start=8 if selected_one == "— Toutes —" else 11,
         tiles="CartoDB positron", control_scale=True,
     )
-    vmax = map_df[rain_col].max() if map_df[rain_col].max() > 0 else 1
-    for _, row in map_df.dropna(subset=[rain_col]).iterrows():
-        rv  = float(row[rain_col])
-        col = rain_color_mm(rv)
-        rad = max(5, min(20, 5 + (rv / vmax) * 15))
-        folium.CircleMarker(
-            [float(row["latitude"]), float(row["longitude"])],
-            radius=rad, color=col, fill=True, fill_opacity=0.8, weight=1.5,
-            tooltip=f"{row.get('commune_name','')} — {rv:.1f} mm ({periode})",
-            popup=folium.Popup(
-                f"<b>{row.get('commune_name','')} PK {row.get('pk_km','')} km</b><br>"
-                f"Pluie {periode} : <b>{rv:.1f} mm</b>", max_width=230),
-        ).add_to(m)
+
+    if selected_one != "— Toutes —":
+        # Single commune: fetch Open-Meteo rain and color markers
+        loc_single = map_df.dropna(subset=["latitude","longitude"])
+        if not loc_single.empty:
+            lat_s = round(float(loc_single["latitude"].mean()), 4)
+            lon_s = round(float(loc_single["longitude"].mean()), 4)
+            rain_s = load_commune_rain_ometo(lat_s, lon_s, periode)
+            rain_label_s = f"{rain_s:.1f} mm" if not pd.isna(rain_s) else "N/A"
+            col_s = rain_color_mm(rain_s) if not pd.isna(rain_s) else "#9ca3af"
+        for _, row in map_df.dropna(subset=["latitude","longitude"]).iterrows():
+            folium.CircleMarker(
+                [float(row["latitude"]), float(row["longitude"])],
+                radius=7, color=col_s, fill=True, fill_opacity=0.85, weight=1.5,
+                tooltip=f"{row.get('commune_name','')} PK {row.get('pk_km','')} km — {rain_label_s} ({periode})",
+                popup=folium.Popup(
+                    f"<b>{row.get('commune_name','')} — PK {row.get('pk_km','')} km</b><br>"
+                    f"Cumul {periode} : <b>{rain_label_s}</b><br>"
+                    f"<small>Source : Open-Meteo archive</small>", max_width=250),
+            ).add_to(m)
+    else:
+        # All communes: color by nearest dept's forecast (no per-sector API calls)
+        for _, row in map_df.dropna(subset=["latitude","longitude"]).iterrows():
+            rlat = float(row["latitude"]); rlon = float(row["longitude"])
+            dep  = nearest_dep(rlat, rlon)
+            d    = dep_rain_data[dep]
+            folium.CircleMarker(
+                [rlat, rlon], radius=5,
+                color=d["color"], fill=True, fill_opacity=0.75, weight=1.2,
+                tooltip=(f"{row.get('commune_name','')} (PK {row.get('pk_km','')}) — "
+                         f"Dép.{dep} : {d['total']:.0f} mm prévu 7j"),
+                popup=folium.Popup(
+                    f"<b>{row.get('commune_name','')} — PK {row.get('pk_km','')} km</b><br>"
+                    f"Dép. {dep} — {d['total']:.0f} mm prévu sur 7j<br>"
+                    f"Max journalier : {d['max']:.0f} mm/j<br>"
+                    f"<small>Source : Open-Meteo prévision 7j</small>", max_width=260),
+            ).add_to(m)
+
     for seg in (snapshot.get("lgv_lines") or []):
         if isinstance(seg, list):
-            pts = [[p[0], p[1]] for p in seg if isinstance(p, (list,tuple)) and len(p) >= 2]
+            pts = [[p[0], p[1]] for p in seg if isinstance(p, (list, tuple)) and len(p) >= 2]
             if pts:
                 folium.PolyLine(pts, color="#cc0000", weight=2.5, opacity=0.7).add_to(m)
     st_folium(m, use_container_width=True, height=450, returned_objects=[])
+    if selected_one == "— Toutes —":
+        st.caption("Couleur = prévision pluie 7j par département (Open-Meteo). "
+                   "Sélectionner une commune pour voir son cumul mesuré.")
 else:
     st.info("Pas de données de localisation.")
 
 # ── 7. TABLEAU ──────────────────────────────────────────────────────────────
-st.subheader("📋 Données par secteur")
-show = [c for c in ["commune_name","pk_km","weather_max_24h_mm","weather_max_7d_mm",
-                    "weather_max_30d_mm","weather_max_month_mm"] if c in comm_df.columns]
-rename = {"commune_name":"Commune","pk_km":"PK (km)","weather_max_24h_mm":"24h (mm)",
-          "weather_max_7d_mm":"7j (mm)","weather_max_30d_mm":"30j (mm)",
-          "weather_max_month_mm":"Mois (mm)"}
-disp = comm_df[show].rename(columns=rename)
-rl = rename.get(rain_col, rain_col)
-if rl in disp.columns:
-    disp = disp.sort_values(rl, ascending=False, na_position="last")
+st.subheader("📋 Secteurs LGV SEA")
+show_cols = [c for c in ["commune_name","pk_km"] if c in comm_df.columns]
+disp = comm_df[show_cols].rename(columns={"commune_name":"Commune","pk_km":"PK (km)"})
+
+if selected_one != "— Toutes —" and not disp.empty:
+    # Add Open-Meteo rain for the selected commune
+    loc_t = comm_df.dropna(subset=["latitude","longitude"]) if "latitude" in comm_df.columns else pd.DataFrame()
+    if not loc_t.empty:
+        lat_t = round(float(loc_t["latitude"].mean()), 4)
+        lon_t = round(float(loc_t["longitude"].mean()), 4)
+        rain_t = load_commune_rain_ometo(lat_t, lon_t, periode)
+        disp[f"Cumul {periode} (mm)"] = rain_t if not pd.isna(rain_t) else None
+        st.caption(f"Pluie = cumul Open-Meteo archive pour la commune · {periode}")
+elif not disp.empty:
+    st.caption("ℹ️ Voir **Comparaison communes** ci-dessus pour les données pluvio fiables (Open-Meteo).")
+
 if not disp.empty:
-    st.dataframe(disp, use_container_width=True, hide_index=True, height=320)
+    st.dataframe(disp.sort_values("PK (km)") if "PK (km)" in disp.columns else disp,
+                 use_container_width=True, hide_index=True, height=300)
