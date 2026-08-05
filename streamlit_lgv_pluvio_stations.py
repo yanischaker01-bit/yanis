@@ -498,10 +498,25 @@ st.divider()
 # ── Sidebar ──────────────────────────────────────────────────────────────────
 communes = (sorted(sectors_df["commune_name"].dropna().unique())
             if "commune_name" in sectors_df.columns else [])
+
+# Communes par défaut : répartition géographique nord→sud sur la LGV SEA
+def _find_commune(kw: str) -> str | None:
+    k = unicodedata.normalize("NFD", kw.lower()).encode("ascii", "ignore").decode()
+    return next((c for c in communes
+                 if k in unicodedata.normalize("NFD", c.lower()).encode("ascii", "ignore").decode()), None)
+
+_DEFAULT_KW = ["nouatre", "fontaine", "poitier", "biard", "villognon", "clerac", "ambares"]
+_default_communes: list = []
+for _kw in _DEFAULT_KW:
+    _m = _find_commune(_kw)
+    if _m and _m not in _default_communes:
+        _default_communes.append(_m)
+_default_communes = _default_communes[:6] or (communes[:6] if len(communes) >= 6 else communes)
+
 with st.sidebar:
     st.subheader("📍 Communes")
     selected_multi = st.multiselect("Comparer communes", communes,
-                                     default=communes[:4] if len(communes) >= 4 else communes)
+                                     default=_default_communes)
     selected_one   = st.selectbox("Commune principale", ["— Toutes —"] + list(communes))
     periode  = st.selectbox("📅 Période pluvio", ["24h","7 jours","30 jours","Mois courant"])
 
