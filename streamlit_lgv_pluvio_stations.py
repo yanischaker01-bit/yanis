@@ -507,7 +507,16 @@ with st.sidebar:
 
 # ── 3. COMPARAISON COMMUNES ─────────────────────────────────────────────────
 if selected_multi and not sectors_df.empty:
-    st.subheader(f"📊 Comparaison communes — cumul pluie ({periode})")
+    _today = datetime.now(timezone.utc).date()
+    if periode == "24h":
+        _titre_periode = f"hier {(_today - timedelta(days=1)).strftime('%d/%m/%Y')}"
+    elif periode == "7 jours":
+        _titre_periode = f"7 derniers jours (jusqu'au {(_today - timedelta(days=1)).strftime('%d/%m/%Y')})"
+    elif periode == "30 jours":
+        _titre_periode = f"30 derniers jours (jusqu'au {(_today - timedelta(days=1)).strftime('%d/%m/%Y')})"
+    else:
+        _titre_periode = f"mois de {_today.strftime('%B %Y')} (jusqu'au {(_today - timedelta(days=1)).strftime('%d/%m')})"
+    st.subheader(f"📊 Comparaison communes — cumul pluie {_titre_periode}")
 
     if len(selected_multi) > 12:
         st.warning("Sélectionne 12 communes max pour la comparaison.")
