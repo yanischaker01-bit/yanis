@@ -54,6 +54,14 @@ def safe_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
 
 
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if f == f else default  # f == f is False for NaN
+
+
 @st.cache_data(ttl=3600)
 def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
     end = datetime.now(timezone.utc).date()
@@ -84,6 +92,11 @@ def risk_badge(level: str) -> str:
             f'border-radius:12px;padding:1px 9px;font-size:12px;font-weight:600">{emoji} {level}</span>')
 
 
+def fmt_pct(series: pd.Series) -> pd.Series:
+    pct = pd.to_numeric(series, errors="coerce") * 100
+    return pct.round(0).apply(lambda v: "—" if pd.isna(v) else f"{int(v)} %")
+
+
 def factor_tags(factors) -> str:
     if not isinstance(factors, list) or not factors:
         return ""
@@ -100,8 +113,8 @@ st.title("🌧 LGV SEA – Pluviométrie & prédiction glissements")
 
 snapshot = load_snapshot()
 
-if "_error" in snapshot:
-    st.error(f"Erreur chargement : {snapshot['_error']}")
+if not isinstance(snapshot, dict) or "_error" in snapshot:
+    st.error(f"Erreur chargement : {snapshot.get('_error', 'format inattendu') if isinstance(snapshot, dict) else 'format inattendu'}")
     st.stop()
 
 ts = snapshot.get("timestamp_utc", "")
@@ -119,7 +132,7 @@ if sectors_df.empty:
     st.stop()
 
 for col in ["weather_max_24h_mm", "weather_max_7d_mm", "weather_max_30d_mm",
-            "weather_max_month_mm", "latitude", "longitude", "pk_km",
+            "weather_max_month_mm", "latitude", "longitude", "pk_km", "score",
             "ai_pred_probability", "ai_confidence", "ai_soil_fragility"]:
     if col in sectors_df.columns:
         sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
@@ -212,8 +225,8 @@ if selected != "— Toutes —":
             col_widget.metric(label, "—")
 
     a1, a2, a3 = st.columns(3)
-    a1.metric("Probabilité IA max", f"{float(commune_row.get('ai_max_probability', 0.0)) * 100:.0f} %")
-    a2.metric("Fragilité sol moyenne", f"{float(commune_row.get('ai_avg_soil_fragility', 0.0)) * 100:.0f} %")
+    a1.metric("Probabilité IA max", f"{safe_float(commune_row.get('ai_max_probability')) * 100:.0f} %")
+    a2.metric("Fragilité sol moyenne", f"{safe_float(commune_row.get('ai_avg_soil_fragility')) * 100:.0f} %")
     a3.metric("Secteurs IA critiques/élevés",
               int(commune_row.get("ai_critical", 0)) + int(commune_row.get("ai_high", 0)))
 
@@ -225,14 +238,14 @@ if selected != "— Toutes —":
         else:
             detail_df = df
         for _, srow in detail_df.iterrows():
-            proba = float(srow.get("ai_pred_probability", 0.0) or 0.0)
-            conf = float(srow.get("ai_confidence", 0.0) or 0.0)
+            proba = min(max(safe_float(srow.get("ai_pred_probability")), 0.0), 1.0)
+            conf = safe_float(srow.get("ai_confidence"))
             st.markdown(
                 f'**{srow.get("sector_id", "?")}** · PK {srow.get("pk_km", "—")} km '
                 f'&nbsp; {risk_badge(str(srow.get("risk_level", "INDETERMINE")))} '
                 f'&nbsp; IA {risk_badge(str(srow.get("ai_pred_risk_level", "INDETERMINE")))}',
                 unsafe_allow_html=True)
-            st.progress(min(max(proba, 0.0), 1.0), text=f"Probabilité IA glissement : {proba * 100:.0f} % (confiance {conf * 100:.0f} %)")
+            st.progress(proba, text=f"Probabilité IA glissement : {proba * 100:.0f} % (confiance {conf * 100:.0f} %)")
             st.markdown(
                 f'Sol dominant : **{srow.get("ai_dominant_pedology", "—")}** '
                 f'({srow.get("ai_dominant_soil_type", "—")}) &nbsp;·&nbsp; '
@@ -260,7 +273,7 @@ else:
         risk_lvl_row = str(row.get("risk_level", "INDETERMINE"))
         ai_lvl_row = str(row.get("ai_pred_risk_level", "INDETERMINE"))
         color_map = RISK_COLOR.get(ai_lvl_row, "#6b7280")
-        proba_row = float(row.get("ai_pred_probability", 0.0) or 0.0)
+        proba_row = min(max(safe_float(row.get("ai_pred_probability")), 0.0), 1.0)
         popup = (
             f"<b>{row.get('sector_id', '')}</b> — {row.get('commune_name', '')} (PK {row.get('pk_km', '')} km)<br>"
             f"Risque mesuré : {risk_lvl_row}<br>"
@@ -282,18 +295,22 @@ profile_df = df.dropna(subset=["pk_km"]).sort_values("pk_km") if "pk_km" in df.c
 if profile_df.empty:
     st.info("Pas de profil PK disponible.")
 else:
-    bar_colors = profile_df.get("ai_pred_risk_level", pd.Series(dtype=str)).map(
-        lambda x: RISK_COLOR.get(str(x), "#6b7280"))
+    if "ai_pred_risk_level" in profile_df.columns:
+        bar_colors = profile_df["ai_pred_risk_level"].map(lambda x: RISK_COLOR.get(str(x), "#6b7280"))
+    else:
+        bar_colors = pd.Series(["#6b7280"] * len(profile_df), index=profile_df.index)
+    proba_pct = (profile_df["ai_pred_probability"].fillna(0.0) * 100
+                 if "ai_pred_probability" in profile_df.columns else pd.Series(0.0, index=profile_df.index))
     fig = go.Figure()
     fig.add_bar(
-        x=profile_df["pk_km"], y=profile_df.get("ai_pred_probability", 0.0) * 100,
+        x=profile_df["pk_km"], y=proba_pct,
         marker_color=bar_colors, name="Probabilité IA glissement (%)",
         customdata=profile_df[["sector_id", "commune_name"]] if {"sector_id", "commune_name"}.issubset(profile_df.columns) else None,
         hovertemplate="PK %{x} km<br>Proba IA : %{y:.0f} %<extra></extra>",
     )
     if "score" in profile_df.columns:
         fig.add_scatter(
-            x=profile_df["pk_km"], y=profile_df["score"] * 25,
+            x=profile_df["pk_km"], y=profile_df["score"].fillna(0.0) * 25,
             mode="lines+markers", name="Risque mesuré (score ×25)",
             line=dict(color="#0f172a", dash="dot"), marker=dict(size=5),
         )
@@ -330,6 +347,54 @@ if not map_df.empty:
 else:
     st.info("Pas de localisation pour l'historique.")
 
+# ── Répartition du risque (mesuré vs IA) ──────────────────────────────────
+st.subheader("📊 Répartition du risque — mesuré vs prédiction IA")
+levels = ["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"]
+if "risk_level" in df.columns or "ai_pred_risk_level" in df.columns:
+    measured_counts = df["risk_level"].value_counts() if "risk_level" in df.columns else pd.Series(dtype=int)
+    ai_counts = df["ai_pred_risk_level"].value_counts() if "ai_pred_risk_level" in df.columns else pd.Series(dtype=int)
+    fig_dist = go.Figure()
+    fig_dist.add_bar(x=levels, y=[int(measured_counts.get(lvl, 0)) for lvl in levels],
+                      name="Mesuré", marker_color="#0f172a")
+    fig_dist.add_bar(x=levels, y=[int(ai_counts.get(lvl, 0)) for lvl in levels],
+                      name="Prédiction IA", marker_color="#3b82f6")
+    fig_dist.update_layout(
+        barmode="group", yaxis_title="Nombre de secteurs", height=280,
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(t=20, b=20, l=20, r=20), legend=dict(orientation="h", y=1.15),
+    )
+    st.plotly_chart(fig_dist, use_container_width=True)
+else:
+    st.info("Pas de niveau de risque disponible.")
+
+# ── Facteurs de risque dominants ──────────────────────────────────────────
+st.subheader("🧭 Facteurs de risque les plus fréquents")
+if "ai_top_factors" in df.columns:
+    factor_counts: dict = {}
+    for factors in df["ai_top_factors"]:
+        if isinstance(factors, list):
+            for f in factors:
+                if f == "signal_faible":
+                    continue
+                factor_counts[f] = factor_counts.get(f, 0) + 1
+    if not factor_counts:
+        st.info("Aucun facteur de risque marquant sur ce filtre.")
+    else:
+        factors_df = pd.DataFrame(
+            [{"facteur": FACTOR_LABELS.get(k, k), "secteurs": v} for k, v in factor_counts.items()]
+        ).sort_values("secteurs", ascending=True)
+        fig_factors = go.Figure()
+        fig_factors.add_bar(x=factors_df["secteurs"], y=factors_df["facteur"], orientation="h",
+                             marker_color="#7c3aed")
+        fig_factors.update_layout(
+            xaxis_title="Nombre de secteurs concernés", height=280,
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=20, b=20, l=20, r=20),
+        )
+        st.plotly_chart(fig_factors, use_container_width=True)
+else:
+    st.info("Facteurs IA indisponibles dans ce snapshot.")
+
 # ── Tableau secteurs ─────────────────────────────────────────────────────
 titre = f"Secteurs — {selected}" if selected != "— Toutes —" else "Tous les secteurs"
 st.subheader(titre)
@@ -351,7 +416,7 @@ else:
     disp = df[show_cols].rename(columns=rename)
     for pct_col in ["Proba IA", "Confiance IA", "Fragilité sol"]:
         if pct_col in disp.columns:
-            disp[pct_col] = (disp[pct_col] * 100).round(0).astype("Int64").astype(str) + " %"
+            disp[pct_col] = fmt_pct(disp[pct_col])
     rain_label = rename.get(rain_col, rain_col)
     if rain_label in disp.columns:
         disp = disp.sort_values(rain_label, ascending=False, na_position="last")
@@ -373,5 +438,23 @@ if selected == "— Toutes —" and not commune_ranking.empty:
                  "ai_commune_risk_level": "Risque IA", "ai_max_probability": "Proba IA max"}
     disp_cr = cr[show].rename(columns=rename_cr)
     if "Proba IA max" in disp_cr.columns:
-        disp_cr["Proba IA max"] = (pd.to_numeric(disp_cr["Proba IA max"], errors="coerce") * 100).round(0).astype("Int64").astype(str) + " %"
+        disp_cr["Proba IA max"] = fmt_pct(disp_cr["Proba IA max"])
     st.dataframe(disp_cr, use_container_width=True, hide_index=True, height=380)
+
+    if {"commune_name", "commune_note"}.issubset(cr.columns):
+        st.subheader("📊 Top 10 communes les plus à risque")
+        top_cr = cr.dropna(subset=["commune_note"]).sort_values("commune_note", ascending=False).head(10)
+        if not top_cr.empty:
+            fig_top = go.Figure()
+            fig_top.add_bar(
+                x=top_cr["commune_note"], y=top_cr["commune_name"], orientation="h",
+                marker_color=top_cr.get("commune_risk_level", pd.Series(dtype=str)).map(
+                    lambda x: RISK_COLOR.get(str(x), "#6b7280")),
+                text=top_cr["commune_note"], textposition="outside",
+            )
+            fig_top.update_layout(
+                xaxis_title="Note de risque (/100)", yaxis=dict(autorange="reversed"),
+                height=340, plot_bgcolor="white", paper_bgcolor="white",
+                margin=dict(t=20, b=20, l=20, r=40),
+            )
+            st.plotly_chart(fig_top, use_container_width=True)
