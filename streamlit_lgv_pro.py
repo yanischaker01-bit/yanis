@@ -1,10 +1,16 @@
 from __future__ import annotations
 
-import requests
+from datetime import datetime, timedelta, timezone
+
+import folium
 import pandas as pd
+import plotly.graph_objects as go
+import requests
 import streamlit as st
+from streamlit_folium import st_folium
 
 SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
+ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
 RISK_COLOR = {
     "FAIBLE": "#16a34a", "MODERE": "#ea580c",
@@ -46,6 +52,29 @@ def safe_df(records) -> pd.DataFrame:
 
 def safe_dict(value) -> dict:
     return value if isinstance(value, dict) else {}
+
+
+@st.cache_data(ttl=3600)
+def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
+    end = datetime.now(timezone.utc).date()
+    start = (end.replace(day=1) - timedelta(days=365)).replace(day=1)
+    try:
+        r = requests.get(ARCHIVE_URL, params={
+            "latitude": lat, "longitude": lon,
+            "start_date": str(start), "end_date": str(end),
+            "daily": "precipitation_sum", "timezone": "Europe/Paris",
+        }, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        dates = data["daily"]["time"]
+        rain = data["daily"]["precipitation_sum"]
+        monthly: dict = {}
+        for d, v in zip(dates, rain):
+            if v is not None:
+                monthly[d[:7]] = monthly.get(d[:7], 0.0) + v
+        return pd.DataFrame([{"mois": m, "pluie_mm": round(v, 1)} for m, v in sorted(monthly.items())])
+    except Exception:
+        return pd.DataFrame()
 
 
 def risk_badge(level: str) -> str:
@@ -210,6 +239,96 @@ if selected != "— Toutes —":
                 f'Facteurs : {factor_tags(srow.get("ai_top_factors"))}',
                 unsafe_allow_html=True)
             st.markdown("&nbsp;", unsafe_allow_html=True)
+
+# ── Carte des secteurs ───────────────────────────────────────────────────
+st.subheader("🗺 Carte des secteurs")
+map_df = df.dropna(subset=["latitude", "longitude"]) if {"latitude", "longitude"}.issubset(df.columns) else pd.DataFrame()
+if map_df.empty:
+    st.info("Pas de coordonnées disponibles pour la carte.")
+else:
+    lat_c = float(map_df["latitude"].mean())
+    lon_c = float(map_df["longitude"].mean())
+    m = folium.Map(location=[lat_c, lon_c],
+                    zoom_start=8 if selected == "— Toutes —" else 12,
+                    tiles="CartoDB positron", control_scale=True)
+    for seg in (snapshot.get("lgv_lines") or []):
+        if isinstance(seg, list):
+            pts = [[p[0], p[1]] for p in seg if isinstance(p, (list, tuple)) and len(p) >= 2]
+            if pts:
+                folium.PolyLine(pts, color="#1d4ed8", weight=2.5, opacity=0.7, tooltip="Trace LGV SEA").add_to(m)
+    for _, row in map_df.iterrows():
+        risk_lvl_row = str(row.get("risk_level", "INDETERMINE"))
+        ai_lvl_row = str(row.get("ai_pred_risk_level", "INDETERMINE"))
+        color_map = RISK_COLOR.get(ai_lvl_row, "#6b7280")
+        proba_row = float(row.get("ai_pred_probability", 0.0) or 0.0)
+        popup = (
+            f"<b>{row.get('sector_id', '')}</b> — {row.get('commune_name', '')} (PK {row.get('pk_km', '')} km)<br>"
+            f"Risque mesuré : {risk_lvl_row}<br>"
+            f"Prédiction IA : {ai_lvl_row} ({proba_row * 100:.0f} %)<br>"
+            f"Sol dominant : {row.get('ai_dominant_pedology', '—')}"
+        )
+        folium.CircleMarker(
+            [float(row["latitude"]), float(row["longitude"])],
+            radius=6 + 6 * proba_row, color=color_map, fill=True, fill_opacity=0.8, weight=1.5,
+            tooltip=f"{row.get('sector_id', '')} — IA {ai_lvl_row}",
+            popup=folium.Popup(popup, max_width=280),
+        ).add_to(m)
+    st.caption("Couleur = niveau de risque prédit par l'IA (glissement). Taille = probabilité.")
+    st_folium(m, use_container_width=True, height=440, returned_objects=[])
+
+# ── Profil du risque le long de la ligne ─────────────────────────────────
+st.subheader("📈 Profil du risque le long de la ligne (prédiction IA)")
+profile_df = df.dropna(subset=["pk_km"]).sort_values("pk_km") if "pk_km" in df.columns else pd.DataFrame()
+if profile_df.empty:
+    st.info("Pas de profil PK disponible.")
+else:
+    bar_colors = profile_df.get("ai_pred_risk_level", pd.Series(dtype=str)).map(
+        lambda x: RISK_COLOR.get(str(x), "#6b7280"))
+    fig = go.Figure()
+    fig.add_bar(
+        x=profile_df["pk_km"], y=profile_df.get("ai_pred_probability", 0.0) * 100,
+        marker_color=bar_colors, name="Probabilité IA glissement (%)",
+        customdata=profile_df[["sector_id", "commune_name"]] if {"sector_id", "commune_name"}.issubset(profile_df.columns) else None,
+        hovertemplate="PK %{x} km<br>Proba IA : %{y:.0f} %<extra></extra>",
+    )
+    if "score" in profile_df.columns:
+        fig.add_scatter(
+            x=profile_df["pk_km"], y=profile_df["score"] * 25,
+            mode="lines+markers", name="Risque mesuré (score ×25)",
+            line=dict(color="#0f172a", dash="dot"), marker=dict(size=5),
+        )
+    fig.add_hline(y=65, line_dash="dash", line_color="#dc2626", annotation_text="Seuil élevé")
+    fig.add_hline(y=85, line_dash="dash", line_color="#7f1d1d", annotation_text="Seuil critique")
+    fig.update_layout(
+        xaxis_title="PK (km)", yaxis_title="Probabilité IA (%) / Score mesuré",
+        height=320, plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(t=20, b=20, l=20, r=20), legend=dict(orientation="h", y=1.12),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+# ── Historique pluviométrique 12 mois ─────────────────────────────────────
+hist_label = selected if selected != "— Toutes —" else "LGV SEA (centroïde)"
+st.subheader(f"📅 Historique pluviométrique 12 mois — {hist_label}")
+if not map_df.empty:
+    lat_h = float(map_df["latitude"].mean())
+    lon_h = float(map_df["longitude"].mean())
+    monthly_df = load_monthly_rain(lat_h, lon_h)
+    if monthly_df.empty:
+        st.info("Historique indisponible.")
+    else:
+        fig_hist = go.Figure()
+        fig_hist.add_bar(
+            x=monthly_df["mois"], y=monthly_df["pluie_mm"],
+            marker_color="#3b82f6", text=monthly_df["pluie_mm"], textposition="outside",
+        )
+        fig_hist.update_layout(
+            xaxis_title="Mois", yaxis_title="Pluie (mm)", height=260,
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=20, b=20, l=20, r=20), xaxis=dict(tickangle=-30),
+        )
+        st.plotly_chart(fig_hist, use_container_width=True)
+else:
+    st.info("Pas de localisation pour l'historique.")
 
 # ── Tableau secteurs ─────────────────────────────────────────────────────
 titre = f"Secteurs — {selected}" if selected != "— Toutes —" else "Tous les secteurs"
