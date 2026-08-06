@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import math
+import os
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -17,6 +20,12 @@ SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snap
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
+# NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
+FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}"
+FIRMS_SOURCES  = ["VIIRS_NOAA21_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"]  # résolution ~375 m
+FIRMS_BBOX     = "-0.7,44.75,1.0,47.5"  # west,south,east,north — corridor LGV SEA + marge
+FIRMS_RADIUS_KM = 0.5
+
 DEPS = {
     "37": {"nom": "Indre-et-Loire",   "lat": 47.38, "lon":  0.69},
     "86": {"nom": "Vienne",            "lat": 46.58, "lon":  0.34},
@@ -33,6 +42,7 @@ ALERT_CFG = {
     "INONDATION": ("🌊",  "Inondation"),
     "VENT":       ("💨",  "Vent violent"),
     "VIGICRUE":   ("🏞️",  "Vigilance crue"),
+    "FEU_FIRMS":  ("🛰️🔥", "Détection incendie FIRMS"),
 }
 LEVEL_COLOR = {"ROUGE":"#dc2626","ORANGE":"#ea580c","JAUNE":"#eab308","VERT":"#16a34a","INFO":"#3b82f6"}
 LEVEL_EMOJI = {"ROUGE":"🔴","ORANGE":"🟠","JAUNE":"🟡","VERT":"🟢","INFO":"🔵"}
@@ -251,6 +261,188 @@ def load_vigicrue_rivers() -> list:
         dedup.append(dict(riviere="", dep="", level="INFO", type="VIGICRUE",
             msg="API Vigicrue indisponible ou aucune crue en cours sur les cours d'eau LGV SEA"))
     return dedup
+
+
+def get_firms_map_key() -> str | None:
+    """Clé API FIRMS : st.secrets['FIRMS_MAP_KEY'] ou variable d'env FIRMS_MAP_KEY.
+    Clé gratuite : https://firms.modaps.eosdis.nasa.gov/api/map_key/"""
+    try:
+        key = st.secrets.get("FIRMS_MAP_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+    return os.environ.get("FIRMS_MAP_KEY")
+
+
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi    = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+
+@st.cache_data(ttl=3600)
+def build_lgv_pk_polyline(_lgv_lines) -> list[tuple[float, float, float]]:
+    """[(lat, lon, pk_km cumulé), ...] à partir du 1er tracé LGV du snapshot.
+    Le cumul de distance haversine le long du tracé colle au pk_km réel (écart < 100 m)."""
+    if not _lgv_lines:
+        return []
+    seg = _lgv_lines[0]
+    pts = [(p["lat"], p["lon"]) for p in seg if isinstance(p, dict) and "lat" in p and "lon" in p]
+    if len(pts) < 2:
+        return []
+    out = [(pts[0][0], pts[0][1], 0.0)]
+    cum = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(pts, pts[1:]):
+        cum += _haversine_km(lat1, lon1, lat2, lon2)
+        out.append((lat2, lon2, cum))
+    return out
+
+
+def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | None, float | None]:
+    """Retourne (pk_km, distance_km) du point le plus proche du tracé LGV.
+    Projection sur chaque segment en repère métrique local (correction cos(latitude))."""
+    if len(polyline) < 2:
+        return None, None
+    best_dist2 = None
+    best_pk    = None
+    for (lat1, lon1, pk1), (lat2, lon2, pk2) in zip(polyline, polyline[1:]):
+        lat_mid = (lat1 + lat2) / 2.0
+        kx = 111.320 * math.cos(math.radians(lat_mid))
+        ky = 111.320
+        x1, y1 = lon1 * kx, lat1 * ky
+        x2, y2 = lon2 * kx, lat2 * ky
+        xp, yp = lon * kx, lat * ky
+        dx, dy = x2 - x1, y2 - y1
+        seg_len2 = dx * dx + dy * dy
+        t = 0.0 if seg_len2 == 0 else max(0.0, min(1.0, ((xp - x1) * dx + (yp - y1) * dy) / seg_len2))
+        cx, cy = x1 + t * dx, y1 + t * dy
+        dist2 = (xp - cx) ** 2 + (yp - cy) ** 2
+        if best_dist2 is None or dist2 < best_dist2:
+            best_dist2 = dist2
+            best_pk = pk1 + t * (pk2 - pk1)
+    return best_pk, math.sqrt(best_dist2) if best_dist2 is not None else None
+
+
+@st.cache_data(ttl=900)
+def load_firms_hotspots(day_range: int = 1) -> tuple[pd.DataFrame, str | None]:
+    """Détections actives FIRMS (VIIRS NRT) sur la bbox du corridor LGV SEA."""
+    key = get_firms_map_key()
+    if not key:
+        return pd.DataFrame(), "missing_key"
+
+    frames = []
+    for source in FIRMS_SOURCES:
+        url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX, day_range=day_range)
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            txt = r.text.strip()
+            if not txt or "<html" in txt.lower() or txt.lower().startswith(("invalid", "error")):
+                if "invalid" in txt.lower():
+                    return pd.DataFrame(), "invalid_key"
+                continue
+            df = pd.read_csv(io.StringIO(txt))
+            if df.empty or "latitude" not in df.columns:
+                continue
+            df["source"] = source
+            frames.append(df)
+        except Exception:
+            continue
+
+    if not frames:
+        return pd.DataFrame(), None
+    return pd.concat(frames, ignore_index=True), None
+
+
+@st.cache_data(ttl=900)
+def load_firms_alerts(_polyline: list, day_range: int = 1,
+                       radius_km: float = FIRMS_RADIUS_KM) -> tuple[list, str | None]:
+    """Détections FIRMS filtrées à moins de `radius_km` de la LGV SEA, avec PK et distance."""
+    df, err = load_firms_hotspots(day_range)
+    if err:
+        return [], err
+    if df.empty or not _polyline:
+        return [], None
+
+    alerts: list = []
+    seen: set = set()
+    for _, row in df.iterrows():
+        try:
+            lat = float(row["latitude"]); lon = float(row["longitude"])
+        except Exception:
+            continue
+        key = (round(lat, 4), round(lon, 4))
+        if key in seen:
+            continue
+        pk, dist_km = pk_and_distance(lat, lon, _polyline)
+        if pk is None or dist_km is None or dist_km > radius_km:
+            continue
+        seen.add(key)
+
+        acq_date = str(row.get("acq_date", "") or "")
+        acq_time = str(row.get("acq_time", "") or "").zfill(4)
+        heure    = f"{acq_time[:2]}:{acq_time[2:]}" if len(acq_time) == 4 else acq_time
+        conf     = row.get("confidence", "")
+        frp      = row.get("frp", None)
+        dist_m   = dist_km * 1000
+
+        alerts.append(dict(
+            type="FEU_FIRMS", level="ROUGE", lat=lat, lon=lon,
+            pk_km=round(pk, 1), distance_m=round(dist_m),
+            confidence=conf, frp=frp,
+            satellite=row.get("satellite", ""), source=row.get("source", ""),
+            date=acq_date, heure=heure,
+            msg=(f"PK {pk:.1f} km — à {dist_m:.0f} m de la LGV SEA — "
+                 f"détecté le {acq_date} à {heure} UTC (confiance {conf})"),
+        ))
+
+    alerts.sort(key=lambda a: a["pk_km"])
+    return alerts, None
+
+
+@st.cache_data(ttl=3600)
+def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
+    """Série journalière de pluie (Open-Meteo ERA5) sur les `days` derniers jours."""
+    try:
+        r = requests.get(FORECAST_URL, params={
+            "latitude": lat, "longitude": lon,
+            "daily": "precipitation_sum",
+            "past_days": days, "forecast_days": 0,
+            "timezone": "Europe/Paris",
+        }, timeout=15)
+        r.raise_for_status()
+        daily = r.json().get("daily", {})
+        df = pd.DataFrame({"date": daily.get("time", []),
+                            "pluie_mm": daily.get("precipitation_sum", [])})
+        df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600)
+def load_all_communes_daily_rain(_sectors_df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
+    """Série journalière de pluie pour chaque commune du corridor (1 requête/commune, cache 1h)."""
+    if _sectors_df.empty or "commune_name" not in _sectors_df.columns:
+        return pd.DataFrame()
+    coords = (_sectors_df.dropna(subset=["latitude", "longitude"])
+              .groupby("commune_name")[["latitude", "longitude"]].mean())
+    frames = []
+    for commune, row in coords.iterrows():
+        df = load_commune_daily_series(round(float(row["latitude"]), 4),
+                                        round(float(row["longitude"]), 4), days)
+        if df.empty:
+            continue
+        df = df.copy()
+        df["commune_name"] = commune
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 @st.cache_data(ttl=900)
@@ -520,6 +712,179 @@ with st.sidebar:
     selected_one   = st.selectbox("Commune principale", ["— Toutes —"] + list(communes))
     periode  = st.selectbox("📅 Période pluvio", ["24h","7 jours","30 jours","Mois courant"])
 
+    st.subheader("🔥 Incendies FIRMS")
+    firms_window_label = st.selectbox("Fenêtre de détection", ["Dernières 24h","Dernières 48h","Dernières 72h"])
+    firms_day_range = {"Dernières 24h":1, "Dernières 48h":2, "Dernières 72h":3}[firms_window_label]
+
+# ── 2bis. INCENDIES TEMPS RÉEL — NASA FIRMS ─────────────────────────────────
+st.subheader(f"🛰️🔥 Détections incendie temps réel — NASA FIRMS (rayon {FIRMS_RADIUS_KM*1000:.0f} m autour de la LGV SEA)")
+
+lgv_polyline = build_lgv_pk_polyline(snapshot.get("lgv_lines"))
+firms_alerts, firms_err = load_firms_alerts(lgv_polyline, day_range=firms_day_range)
+
+if firms_err == "missing_key":
+    st.warning(
+        "🔑 Clé FIRMS manquante. Crée une clé gratuite sur "
+        "[firms.modaps.eosdis.nasa.gov/api/map_key](https://firms.modaps.eosdis.nasa.gov/api/map_key/), "
+        "puis renseigne-la dans `.streamlit/secrets.toml` (`FIRMS_MAP_KEY = \"...\"`) "
+        "ou la variable d'environnement `FIRMS_MAP_KEY`."
+    )
+elif firms_err == "invalid_key":
+    st.error("🔑 Clé FIRMS invalide — vérifie `FIRMS_MAP_KEY`.")
+elif firms_alerts:
+    st.error(f"🔥 {len(firms_alerts)} détection(s) FIRMS à moins de "
+             f"{FIRMS_RADIUS_KM*1000:.0f} m de la LGV SEA ({firms_window_label.lower()}).")
+    df_firms = pd.DataFrame(firms_alerts).rename(columns={
+        "pk_km": "PK (km)", "distance_m": "Distance LGV (m)",
+        "date": "Date", "heure": "Heure (UTC)",
+        "confidence": "Confiance", "frp": "FRP (MW)", "satellite": "Satellite",
+    })
+    st.dataframe(
+        df_firms[["PK (km)", "Distance LGV (m)", "Date", "Heure (UTC)",
+                  "Confiance", "FRP (MW)", "Satellite"]],
+        use_container_width=True, hide_index=True,
+    )
+else:
+    st.success(f"✅ Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
+               f"de la LGV SEA ({firms_window_label.lower()}).")
+
+st.caption(
+    "Source : NASA FIRMS · VIIRS NOAA-20/NOAA-21/S-NPP (quasi temps réel, résolution ~375 m) · "
+    "[firms.modaps.eosdis.nasa.gov/map](https://firms.modaps.eosdis.nasa.gov/map) — "
+    "PK et distance calculés par projection sur le tracé LGV SEA."
+)
+
+st.divider()
+
+# ── 2ter. POINTS DE VIGILANCE — SYNTHÈSE LGV SEA ────────────────────────────
+st.subheader("🧭 Points de vigilance — surveillance ligne LGV SEA")
+
+risk_sectors = (sectors_df[sectors_df["risk_level"] == "ELEVE"]
+                if "risk_level" in sectors_df.columns else pd.DataFrame())
+
+_chip = lambda bg, txt: (
+    f'<span style="display:inline-block;margin:3px 4px;padding:3px 10px;border-radius:20px;'
+    f'background:{bg};color:white;font-size:12px;font-weight:600">{txt}</span>')
+st.markdown(
+    _chip("#dc2626" if len(risk_sectors) else "#16a34a",
+          f"🏗️ {len(risk_sectors)} secteur(s) à risque structurel élevé") +
+    _chip("#ea580c" if active_met else "#16a34a",
+          f"🌦️ {len(active_met)} alerte(s) météo active(s)") +
+    _chip("#3b82f6" if vc_active else "#16a34a",
+          f"🏞️ {len(vc_active)} vigilance(s) crue") +
+    _chip("#dc2626" if firms_alerts else "#16a34a",
+          f"🛰️🔥 {len(firms_alerts)} détection(s) FIRMS < 500 m"),
+    unsafe_allow_html=True,
+)
+
+if not risk_sectors.empty:
+    with st.expander(f"🏗️ Secteurs à risque structurel élevé ({len(risk_sectors)}) — analyse géotechnique/IA"):
+        _cols = [c for c in ["pk_km","commune_name","departement_name","ai_pred_risk_level",
+                              "ai_pred_score","ai_dominant_soil_type","ai_top_factors"]
+                 if c in risk_sectors.columns]
+        _disp_risk = risk_sectors[_cols].sort_values("pk_km").rename(columns={
+            "pk_km":"PK (km)", "commune_name":"Commune", "departement_name":"Département",
+            "ai_pred_risk_level":"Risque IA", "ai_pred_score":"Score IA",
+            "ai_dominant_soil_type":"Sol dominant", "ai_top_factors":"Facteurs déterminants",
+        })
+        if "Facteurs déterminants" in _disp_risk.columns:
+            _disp_risk["Facteurs déterminants"] = _disp_risk["Facteurs déterminants"].apply(
+                lambda v: ", ".join(v) if isinstance(v, list) else v)
+        st.dataframe(_disp_risk, use_container_width=True, hide_index=True, height=280)
+
+if active_met or vc_active or firms_alerts:
+    with st.expander("⚠️ Détail des alertes actives (météo, crues, incendie)", expanded=True):
+        for a in sorted(active_met, key=lambda x: -LEVEL_RANK.get(x["level"], 0)):
+            alert_card(a)
+        for a in vc_active:
+            alert_card(a)
+        for a in firms_alerts:
+            alert_card(a)
+else:
+    st.success("✅ Aucune alerte météo, crue ou incendie active actuellement.")
+
+st.divider()
+
+# ── 2quater. TOP 20 COMMUNES — CUMUL DE PRÉCIPITATION ───────────────────────
+st.subheader("🌧 TOP 20 communes — cumul de précipitation le plus élevé (30 derniers jours)")
+
+with st.spinner("Chargement pluvio 30 jours pour toutes les communes du corridor…"):
+    all_rain_df = load_all_communes_daily_rain(sectors_df, days=30)
+
+if all_rain_df.empty:
+    st.info("Données pluvio indisponibles pour le classement.")
+else:
+    all_rain_df = all_rain_df.copy()
+    all_rain_df["date"] = pd.to_datetime(all_rain_df["date"]).dt.date
+    d_min, d_max = all_rain_df["date"].min(), all_rain_df["date"].max()
+
+    date_range = st.slider(
+        "📅 Filtrer par période (filtre appliqué sur les données déjà chargées — aucun rechargement)",
+        min_value=d_min, max_value=d_max, value=(d_min, d_max), format="DD/MM",
+    )
+    filtered_rain = all_rain_df[(all_rain_df["date"] >= date_range[0]) &
+                                 (all_rain_df["date"] <= date_range[1])]
+
+    totals = (filtered_rain.groupby("commune_name")["pluie_mm"].sum()
+              .sort_values(ascending=False).head(20))
+
+    if totals.empty:
+        st.info("Aucune donnée sur la période sélectionnée.")
+    else:
+        top20_communes = totals.index.tolist()
+
+        bar_df = totals.sort_values(ascending=True).reset_index()
+        bar_df["color"] = bar_df["pluie_mm"].apply(rain_color_mm)
+        fig_top = go.Figure(go.Bar(
+            x=bar_df["pluie_mm"], y=bar_df["commune_name"], orientation="h",
+            marker_color=bar_df["color"].tolist(),
+            text=bar_df["pluie_mm"].apply(lambda v: f"{v:.0f} mm"),
+            textposition="outside", cliponaxis=False,
+            hovertemplate="<b>%{y}</b><br>Cumul : %{x:.1f} mm<extra></extra>",
+        ))
+        fig_top.update_layout(
+            height=max(320, len(bar_df) * 26 + 60),
+            xaxis=dict(title="Cumul pluie (mm)", zeroline=True),
+            yaxis=dict(tickfont=dict(size=11)),
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=10, b=30, l=10, r=90),
+        )
+        st.plotly_chart(fig_top, use_container_width=True)
+
+        # Courbes journalières : top 3 en couleur (identité), le reste du TOP 20 en gris (contexte)
+        HIGHLIGHT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
+        fig_curve = go.Figure()
+        for commune in reversed(top20_communes):
+            s = filtered_rain[filtered_rain["commune_name"] == commune].sort_values("date")
+            rank = top20_communes.index(commune)
+            is_top3 = rank < 3
+            fig_curve.add_scatter(
+                x=s["date"], y=s["pluie_mm"], mode="lines", name=commune,
+                line=dict(color=HIGHLIGHT_COLORS[rank] if is_top3 else "#c3c2b7",
+                          width=2.5 if is_top3 else 1),
+                opacity=1.0 if is_top3 else 0.45,
+                showlegend=is_top3,
+                hovertemplate=f"<b>{commune}</b><br>%{{x|%d/%m}} : %{{y:.1f}} mm<extra></extra>",
+            )
+        fig_curve.update_layout(
+            height=340, xaxis=dict(title=""), yaxis=dict(title="Pluie/jour (mm)"),
+            plot_bgcolor="white", paper_bgcolor="white",
+            legend=dict(orientation="h", y=1.15),
+            margin=dict(t=35, b=20, l=20, r=20),
+        )
+        st.plotly_chart(fig_curve, use_container_width=True)
+        st.caption("Courbes : les 3 communes les plus arrosées de ce TOP 20 sont mises en évidence "
+                   "(couleur + légende) · les 17 autres apparaissent en gris clair pour le contexte.")
+
+        with st.expander("📋 Table du TOP 20"):
+            st.dataframe(
+                totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
+                use_container_width=True, hide_index=True,
+            )
+    st.caption("Source : Open-Meteo (série journalière, 30 jours) · une requête par commune, mise en cache 1h.")
+
+st.divider()
+
 # ── 3. COMPARAISON COMMUNES ─────────────────────────────────────────────────
 if selected_multi and not sectors_df.empty:
     _today = datetime.now(timezone.utc).date()
@@ -702,9 +1067,27 @@ if not map_df.empty:
 
     for seg in (snapshot.get("lgv_lines") or []):
         if isinstance(seg, list):
-            pts = [[p[0], p[1]] for p in seg if isinstance(p, (list, tuple)) and len(p) >= 2]
+            pts = []
+            for p in seg:
+                if isinstance(p, dict) and "lat" in p and "lon" in p:
+                    pts.append([p["lat"], p["lon"]])
+                elif isinstance(p, (list, tuple)) and len(p) >= 2:
+                    pts.append([p[0], p[1]])
             if pts:
                 folium.PolyLine(pts, color="#cc0000", weight=2.5, opacity=0.7).add_to(m)
+
+    for a in firms_alerts:
+        folium.Marker(
+            [a["lat"], a["lon"]],
+            icon=folium.Icon(color="red", icon="fire", prefix="fa"),
+            tooltip=f"🔥 PK {a['pk_km']} km — {a['distance_m']} m de la LGV SEA",
+            popup=folium.Popup(
+                f"<b>🔥 Détection FIRMS</b><br>"
+                f"PK {a['pk_km']} km — {a['distance_m']} m de la LGV SEA<br>"
+                f"{a['date']} {a['heure']} UTC · confiance {a['confidence']}<br>"
+                f"Satellite : {a['satellite']}", max_width=250),
+        ).add_to(m)
+
     st_folium(m, use_container_width=True, height=450, returned_objects=[])
     if selected_one == "— Toutes —":
         st.caption("Couleur = prévision pluie 7j par département (Open-Meteo). "
