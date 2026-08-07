@@ -56,12 +56,14 @@ ALERT_CFG = {
     "INONDATION": ("🌊",  "Inondation"),
     "VENT":       ("💨",  "Vent violent"),
     "VIGICRUE":   ("🏞️",  "Vigilance crue"),
-    "FEU_FIRMS":  ("🛰️🔥", "Détection incendie FIRMS"),
+    "FEU_FIRMS":  ("🔥",  "Détection incendie FIRMS"),
     "MF_VIGILANCE": ("🛡️", "Vigilance officielle Météo-France"),
 }
 LEVEL_COLOR = {"ROUGE":"#dc2626","ORANGE":"#ea580c","JAUNE":"#eab308","VERT":"#16a34a","INFO":"#3b82f6"}
-LEVEL_EMOJI = {"ROUGE":"🔴","ORANGE":"🟠","JAUNE":"🟡","VERT":"🟢","INFO":"🔵"}
 LEVEL_RANK  = {"ROUGE":4,"ORANGE":3,"JAUNE":2,"VERT":1,"INFO":0}
+LEVEL_LABEL = {"ROUGE":"Rouge","ORANGE":"Orange","JAUNE":"Jaune","VERT":"Vert","INFO":"Info"}
+# st.badge only accepts this fixed palette — map our 5 severity levels onto it.
+LEVEL_BADGE = {"ROUGE":"red","ORANGE":"orange","JAUNE":"yellow","VERT":"green","INFO":"gray"}
 
 
 def rain_risk(max_mm: float):
@@ -124,11 +126,11 @@ def load_meteofrance_vigilance() -> tuple[list, bool]:
         if not level or level == "VERT":
             continue
         phen = f.get("phenomenon", "")
-        icon, label = MF_PHENOMENON_LABELS.get(phen, ("⚠️", phen.capitalize() or "Phénomène"))
+        icon, label = MF_PHENOMENON_LABELS.get(phen, ("", phen.capitalize() or "Phénomène"))
         jour = "aujourd'hui" if f.get("echeance") == "J" else "demain"
         alerts.append(dict(
-            dep=dep, type="MF_VIGILANCE", level=level, phenomenon=phen,
-            msg=f"{icon} Dép.{dep} ({DEPS[dep]['nom']}) — {label} : vigilance {level.lower()} ({jour})",
+            dep=dep, type="MF_VIGILANCE", level=level, phenomenon=phen, icon=icon,
+            msg=f"Dép.{dep} ({DEPS[dep]['nom']}) — {label} : vigilance {level.lower()} ({jour})",
         ))
 
     alerts.sort(key=lambda a: (-LEVEL_RANK.get(a["level"], 0), a["dep"]))
@@ -559,42 +561,61 @@ def load_all_communes_daily_rain(_sectors_df: pd.DataFrame, days: int = 30) -> p
 
 @st.cache_data(ttl=900)
 def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
-    """Cumul pluie via Open-Meteo.
-    24h  → AROME Météo-France 1,3 km (orages locaux), sinon ERA5.
-    7j+  → ERA5 seamless (couverture longue durée).
+    """Cumul pluie.
+    24h  → API prévision Open-Meteo, AROME Météo-France 1,3 km si dispo, sinon
+           blend — la veille est un cycle déjà bouclé, pas une sortie modèle
+           non recalée (vérifié : identique à l'ERA5 sur un cas testé).
+    7j+  → API archive ERA5 (réanalyse), pas l'API prévision : son paramètre
+           `past_days` a été mesuré jusqu'à 2x plus élevé que l'ERA5 sur le
+           même point (46,4 mm vs 21,9 mm sur 7 j ; 71,1 mm vs 54,6 mm sur 30 j),
+           le même défaut que celui corrigé pour le TOP 20.
     """
     today = datetime.now(timezone.utc).date()
+    lat_r, lon_r = round(lat, 4), round(lon, 4)
+
     if periode == "24h":
-        past_days = 1
-    elif periode == "7 jours":
-        past_days = 7
+        for model in ["meteofrance_arome_france", None]:
+            try:
+                params = {
+                    "latitude": lat_r, "longitude": lon_r,
+                    "daily": "precipitation_sum",
+                    "past_days": 1, "forecast_days": 0,
+                    "timezone": "Europe/Paris",
+                }
+                if model:
+                    params["models"] = model
+                r = requests.get(FORECAST_URL, params=params, timeout=15)
+                r.raise_for_status()
+                vals = r.json()["daily"]["precipitation_sum"]
+                if vals and any(v is not None for v in vals):
+                    return round(sum(v for v in vals if v is not None), 1)
+            except Exception:
+                continue
+        return float("nan")
+
+    if periode == "7 jours":
+        days = 7
     elif periode == "30 jours":
-        past_days = 30
+        days = 30
     else:
-        past_days = today.day - 1
-    if past_days <= 0:
+        days = today.day - 1
+    if days <= 0:
         return 0.0
 
-    base = {
-        "latitude": round(lat, 4), "longitude": round(lon, 4),
-        "daily": "precipitation_sum",
-        "past_days": past_days, "forecast_days": 0,
-        "timezone": "Europe/Paris",
-    }
-    # For 24h: try AROME first (1.3 km, hourly update — captures local storms)
-    models = ["meteofrance_arome_france", None] if periode == "24h" else [None]
-    for model in models:
-        try:
-            params = dict(base)
-            if model:
-                params["models"] = model
-            r = requests.get(FORECAST_URL, params=params, timeout=15)
-            r.raise_for_status()
-            vals = r.json()["daily"]["precipitation_sum"]
-            if vals and any(v is not None for v in vals):
-                return round(sum(v for v in vals if v is not None), 1)
-        except Exception:
-            continue
+    start = today - timedelta(days=days)
+    end   = today - timedelta(days=1)
+    try:
+        r = requests.get(ARCHIVE_URL, params={
+            "latitude": lat_r, "longitude": lon_r,
+            "start_date": str(start), "end_date": str(end),
+            "daily": "precipitation_sum", "timezone": "Europe/Paris",
+        }, timeout=20)
+        r.raise_for_status()
+        vals = r.json()["daily"]["precipitation_sum"]
+        if vals:
+            return round(sum(v for v in vals if v is not None), 1)
+    except Exception:
+        pass
     return float("nan")
 
 
@@ -675,16 +696,12 @@ def safe_df(records) -> pd.DataFrame:
 def alert_card(a: dict):
     lvl   = a.get("level", "")
     atype = a.get("type", "")
-    color = LEVEL_COLOR.get(lvl, "#6b7280")
-    icon  = ALERT_CFG.get(atype, ("⚠️", ""))[0]
-    prefix = LEVEL_EMOJI.get(lvl, "")
-    if lvl == "VERT":
-        prefix = "✅"
-    st.markdown(
-        f'<div style="padding:7px 14px;border-radius:6px;border-left:4px solid {color};'
-        f'background:{color}12;margin-bottom:5px;font-size:13px">'
-        f'{prefix} {icon} <b>[{lvl}]</b> {a.get("msg","")}'
-        f'</div>', unsafe_allow_html=True)
+    icon  = a.get("icon") or ALERT_CFG.get(atype, ("", ""))[0] or None
+    c_badge, c_msg = st.columns([1, 7], vertical_alignment="center")
+    with c_badge:
+        st.badge(LEVEL_LABEL.get(lvl, lvl or "Info"), color=LEVEL_BADGE.get(lvl, "gray"))  # type: ignore[arg-type]
+    with c_msg:
+        st.markdown(f"{icon}  {a.get('msg','')}" if icon else a.get("msg", ""))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -717,11 +734,11 @@ for col in ["weather_max_24h_mm","weather_max_7d_mm","weather_max_30d_mm",
 
 # Pre-compute dept forecast rain (used for map coloring + dept cards)
 RAIN_LABELS = {
-    "VERT":   ("Peu de pluie",    "#16a34a", "🟢"),
-    "JAUNE":  ("Pluie modérée",   "#eab308", "🟡"),
-    "ORANGE": ("Pluies fortes",   "#ea580c", "🟠"),
-    "ROUGE":  ("Pluies très fortes","#dc2626","🔴"),
-    "INDETERMINE": ("Indisponible", "#9ca3af", "❓"),
+    "VERT":   "Peu de pluie",
+    "JAUNE":  "Pluie modérée",
+    "ORANGE": "Pluies fortes",
+    "ROUGE":  "Pluies très fortes",
+    "INDETERMINE": "Indisponible",
 }
 dep_rain_data: dict = {}   # dep -> {max, total, lvl, color, emoji, ok}
 for _dep in DEPS:
@@ -747,22 +764,21 @@ def nearest_dep(lat: float, lon: float) -> str:
 
 
 # ── 1. PLUIE PRÉVUE PAR DÉPARTEMENT ─────────────────────────────────────────
-st.subheader("📡 Pluie prévue 7 jours par département (Open-Meteo)")
+st.subheader("Pluie prévue 7 jours par département")
+st.caption("Source : Open-Meteo")
 dep_cols = st.columns(len(DEPS))
 for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
     d = dep_rain_data[dep]
-    lvl_label, color, emoji = RAIN_LABELS[d["lvl"]]
-    detail = (f"max {d['max']:.0f} mm/j · {d['total']:.0f} mm" if d["ok"]
-              else "Open-Meteo indisponible")
-    col_w.markdown(
-        f'<div style="padding:10px 6px;border-radius:8px;border:2px solid {color};'
-        f'text-align:center;background:{color}14">'
-        f'<div style="font-size:22px">{emoji}</div>'
-        f'<b style="font-size:13px">Dép. {dep}</b><br>'
-        f'<span style="font-size:11px;color:#666">{info["nom"]}</span><br>'
-        f'<b style="color:{color};font-size:12px">{lvl_label}</b><br>'
-        f'<span style="font-size:12px">{detail}</span>'
-        f'</div>', unsafe_allow_html=True)
+    with col_w.container(border=True):
+        st.caption(f"Dép. {dep} · {info['nom']}")
+        if d["ok"]:
+            lvl_label = RAIN_LABELS[d["lvl"]]
+            st.badge(lvl_label, color=LEVEL_BADGE.get(d["lvl"], "gray"))  # type: ignore[arg-type]
+            st.metric("Cumul 7 j", f"{d['total']:.0f} mm",
+                      help=f"Maximum journalier : {d['max']:.0f} mm/j")
+        else:
+            st.badge("Indisponible", color="gray")
+            st.caption("Open-Meteo injoignable")
 
 # ── 1bis. VIGILANCE OFFICIELLE MÉTÉO-FRANCE ─────────────────────────────────
 st.subheader("🛡️ Vigilance officielle Météo-France (aujourd'hui / demain)")
@@ -770,14 +786,14 @@ st.subheader("🛡️ Vigilance officielle Météo-France (aujourd'hui / demain)
 mf_alerts, mf_ok = load_meteofrance_vigilance()
 
 if not mf_ok:
-    st.warning("⚠️ Vigilance Météo-France injoignable — statut **non vérifié** "
+    st.warning("Vigilance Météo-France injoignable — statut **non vérifié** "
                "(réessaie dans quelques minutes).")
 elif mf_alerts:
-    st.error(f"🛡️ {len(mf_alerts)} vigilance(s) active(s) sur les départements du corridor LGV SEA.")
+    st.error(f"{len(mf_alerts)} vigilance(s) active(s) sur les départements du corridor LGV SEA.")
     for a in mf_alerts:
         alert_card(a)
 else:
-    st.success("✅ Vigilance verte sur les 6 départements du corridor (aujourd'hui et demain).")
+    st.success("Vigilance verte sur les 6 départements du corridor (aujourd'hui et demain).")
 
 st.caption(
     "Source officielle : [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) — "
@@ -789,7 +805,7 @@ st.caption(
 st.divider()
 
 # ── 2. INDICATEURS MÉTÉO ─────────────────────────────────────────────────────
-st.subheader("📊 Indicateurs météo — 7 prochains jours (estimation indicative, 7 jours)")
+st.subheader("📊 Indicateurs météo indicatifs — 7 prochains jours")
 
 met_alerts, met_ok, met_total = load_weather_alerts_all()
 vc_alerts, vc_ok = load_vigicrue_rivers()
@@ -800,24 +816,21 @@ for a in active_met:
     by_met[a["type"]].append(a)
 
 if met_ok == 0:
-    st.warning("⚠️ Open-Meteo injoignable — indicateurs météo **non vérifiés** actuellement "
+    st.warning("Open-Meteo injoignable — indicateurs météo **non vérifiés** actuellement "
                "(ce n'est pas un « aucune alerte », réessaie dans quelques minutes).")
 elif met_ok < met_total:
     st.caption(f"ℹ️ Prévisions récupérées pour {met_ok}/{met_total} départements — "
                "le reste sera réessayé au prochain rafraîchissement.")
 
 if active_met:
-    chips = ""
-    for atype, alist in by_met.items():
+    badge_cols = st.columns(len(by_met))
+    for col, (atype, alist) in zip(badge_cols, by_met.items()):
         worst = max(alist, key=lambda x: LEVEL_RANK.get(x["level"], 0))
-        color = LEVEL_COLOR.get(worst["level"], "#6b7280")
-        icon, label = ALERT_CFG.get(atype, ("⚠️", ""))
-        chips += (f'<span style="display:inline-block;margin:3px 4px;padding:3px 10px;'
-                  f'border-radius:20px;background:{color};color:white;font-size:12px;font-weight:600">'
-                  f'{icon} {label} ({len(alist)})</span>')
-    st.markdown(chips, unsafe_allow_html=True)
+        icon, label = ALERT_CFG.get(atype, ("", atype))
+        col.badge(f"{label} ({len(alist)})", icon=icon or None,
+                  color=LEVEL_BADGE.get(worst["level"], "gray"))  # type: ignore[arg-type]
 elif met_ok > 0:
-    st.success("✅ Aucun indicateur météo significatif sur les 7 prochains jours.")
+    st.success("Aucun indicateur météo significatif sur les 7 prochains jours.")
 
 tab_labels: list = []
 tab_data:   list = []
@@ -842,7 +855,7 @@ if tab_labels:
     for tab, alist in zip(tabs, tab_data):
         with tab:
             if tab is tabs[-1] and not vc_ok:
-                st.warning("⚠️ API Vigicrue injoignable — statut crues **non vérifié** "
+                st.warning("API Vigicrue injoignable — statut crues **non vérifié** "
                            "(réessaie dans quelques minutes).")
             elif not alist:
                 st.info("Aucune crue en vigilance actuellement sur ces cours d'eau."
@@ -894,25 +907,25 @@ if auto_refresh:
     st.markdown(f'<meta http-equiv="refresh" content="{refresh_seconds}">', unsafe_allow_html=True)
 
 # ── 2bis. INCENDIES TEMPS RÉEL — NASA FIRMS ─────────────────────────────────
-st.subheader(f"🛰️🔥 Détections incendie temps réel — NASA FIRMS (rayon {FIRMS_RADIUS_KM*1000:.0f} m autour de la LGV SEA)")
+st.subheader(f"🔥 Détections incendie temps réel — NASA FIRMS (rayon {FIRMS_RADIUS_KM*1000:.0f} m autour de la LGV SEA)")
 
 lgv_polyline = build_lgv_pk_polyline(snapshot.get("lgv_lines"))
 firms_alerts, firms_err = load_firms_alerts(lgv_polyline, day_range=firms_day_range)
 
 if firms_err == "missing_key":
     st.warning(
-        "🔑 Clé FIRMS manquante. Crée une clé gratuite sur "
+        "Clé FIRMS manquante. Crée une clé gratuite sur "
         "[firms.modaps.eosdis.nasa.gov/api/map_key](https://firms.modaps.eosdis.nasa.gov/api/map_key/), "
         "puis renseigne-la dans `.streamlit/secrets.toml` (`FIRMS_MAP_KEY = \"...\"`) "
         "ou la variable d'environnement `FIRMS_MAP_KEY`."
     )
 elif firms_err == "invalid_key":
-    st.error("🔑 Clé FIRMS invalide — vérifie `FIRMS_MAP_KEY`.")
+    st.error("Clé FIRMS invalide — vérifie `FIRMS_MAP_KEY`.")
 elif firms_err == "fetch_failed":
-    st.warning("⚠️ FIRMS injoignable actuellement (réseau/API) — statut incendie **non vérifié** "
+    st.warning("FIRMS injoignable actuellement (réseau/API) — statut incendie **non vérifié** "
                "(ce n'est pas un « aucun feu détecté », réessaie dans quelques minutes).")
 elif firms_alerts:
-    st.error(f"🔥 {len(firms_alerts)} détection(s) FIRMS à moins de "
+    st.error(f"{len(firms_alerts)} détection(s) FIRMS à moins de "
              f"{FIRMS_RADIUS_KM*1000:.0f} m de la LGV SEA ({firms_window_label.lower()}).")
     df_firms = pd.DataFrame(firms_alerts).rename(columns={
         "pk_km": "PK (km)", "distance_m": "Distance LGV (m)",
@@ -925,7 +938,7 @@ elif firms_alerts:
         use_container_width=True, hide_index=True,
     )
 else:
-    st.success(f"✅ Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
+    st.success(f"Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
                f"de la LGV SEA ({firms_window_label.lower()}).")
 
 st.caption(
@@ -942,26 +955,24 @@ st.subheader("🧭 Points de vigilance — surveillance ligne LGV SEA")
 risk_sectors = (sectors_df[sectors_df["risk_level"] == "ELEVE"]
                 if "risk_level" in sectors_df.columns else pd.DataFrame())
 
-_chip = lambda bg, txt: (
-    f'<span style="display:inline-block;margin:3px 4px;padding:3px 10px;border-radius:20px;'
-    f'background:{bg};color:white;font-size:12px;font-weight:600">{txt}</span>')
-
-_GREY = "#9ca3af"  # non vérifié — jamais confondu avec le vert "aucune alerte"
 _firms_unverified = firms_err in ("fetch_failed", "invalid_key", "missing_key")
 
-st.markdown(
-    _chip(_GREY if not mf_ok else ("#dc2626" if mf_alerts else "#16a34a"),
-          "🛡️ non vérifié" if not mf_ok else f"🛡️ {len(mf_alerts)} vigilance(s) officielle(s) MF") +
-    _chip("#dc2626" if len(risk_sectors) else "#16a34a",
-          f"🏗️ {len(risk_sectors)} secteur(s) à risque structurel élevé") +
-    _chip(_GREY if met_ok == 0 else ("#ea580c" if active_met else "#16a34a"),
-          "🌦️ non vérifié" if met_ok == 0 else f"🌦️ {len(active_met)} alerte(s) météo active(s)") +
-    _chip(_GREY if not vc_ok else ("#3b82f6" if vc_active else "#16a34a"),
-          "🏞️ non vérifié" if not vc_ok else f"🏞️ {len(vc_active)} vigilance(s) crue") +
-    _chip(_GREY if _firms_unverified else ("#dc2626" if firms_alerts else "#16a34a"),
-          "🛰️🔥 non vérifié" if _firms_unverified else f"🛰️🔥 {len(firms_alerts)} détection(s) FIRMS < 500 m"),
-    unsafe_allow_html=True,
-)
+vig_cols = st.columns(5)
+vig_cols[0].badge(
+    "Vigilance MF — non vérifié" if not mf_ok else f"Vigilance MF ({len(mf_alerts)})",
+    icon="🛡️", color="gray" if not mf_ok else ("red" if mf_alerts else "green"))  # type: ignore[arg-type]
+vig_cols[1].badge(
+    f"Risque structurel ({len(risk_sectors)})",
+    icon="🏗️", color="red" if len(risk_sectors) else "green")
+vig_cols[2].badge(
+    "Météo — non vérifié" if met_ok == 0 else f"Météo ({len(active_met)})",
+    icon="🌦️", color="gray" if met_ok == 0 else ("orange" if active_met else "green"))  # type: ignore[arg-type]
+vig_cols[3].badge(
+    "Vigicrue — non vérifié" if not vc_ok else f"Vigicrue ({len(vc_active)})",
+    icon="🏞️", color="gray" if not vc_ok else ("blue" if vc_active else "green"))  # type: ignore[arg-type]
+vig_cols[4].badge(
+    "FIRMS — non vérifié" if _firms_unverified else f"FIRMS ({len(firms_alerts)})",
+    icon="🔥", color="gray" if _firms_unverified else ("red" if firms_alerts else "green"))  # type: ignore[arg-type]
 
 if not risk_sectors.empty:
     with st.expander(f"🏗️ Secteurs à risque structurel élevé ({len(risk_sectors)}) — analyse géotechnique/IA"):
@@ -989,10 +1000,10 @@ if mf_alerts or active_met or vc_active or firms_alerts:
         for a in firms_alerts:
             alert_card(a)
 elif not mf_ok or met_ok == 0 or not vc_ok or _firms_unverified:
-    st.warning("⚠️ Au moins une source (vigilance MF, météo, crues ou incendie) n'a pas pu être vérifiée "
+    st.warning("Au moins une source (vigilance MF, météo, crues ou incendie) n'a pas pu être vérifiée "
                "— voir le détail ci-dessus. Ne pas interpréter comme « aucune alerte ».")
 else:
-    st.success("✅ Aucune alerte météo, crue ou incendie active actuellement.")
+    st.success("Aucune alerte météo, crue ou incendie active actuellement.")
 
 st.divider()
 
@@ -1044,7 +1055,7 @@ else:
             height=max(320, len(bar_df) * 26 + 60),
             xaxis=dict(title="Cumul pluie (mm)", zeroline=True),
             yaxis=dict(tickfont=dict(size=11)),
-            plot_bgcolor="white", paper_bgcolor="white",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(t=10, b=30, l=10, r=90),
         )
         st.plotly_chart(fig_top, use_container_width=True)
@@ -1066,7 +1077,7 @@ else:
             )
         fig_curve.update_layout(
             height=340, xaxis=dict(title=""), yaxis=dict(title="Pluie/jour (mm)"),
-            plot_bgcolor="white", paper_bgcolor="white",
+            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             legend=dict(orientation="h", y=1.15),
             margin=dict(t=35, b=20, l=20, r=20),
         )
@@ -1149,7 +1160,7 @@ if selected_multi and not sectors_df.empty:
                 xaxis=dict(title=f"Cumul pluie (mm)", zeroline=True),
                 yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
                 height=height,
-                plot_bgcolor="white", paper_bgcolor="white",
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                 margin=dict(t=10, b=30, l=10, r=90),
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -1158,7 +1169,7 @@ if selected_multi and not sectors_df.empty:
 
             _missing = sorted(set(selected_multi) - set(df_cmp["commune_name"]))
             if _missing:
-                st.warning(f"⚠️ Pas de donnée pluvio récupérée pour : {', '.join(_missing)} "
+                st.warning(f"Pas de donnée pluvio récupérée pour : {', '.join(_missing)} "
                            "— absentes du graphique ci-dessus, pas de valeur à 0 supposée.")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
@@ -1199,7 +1210,7 @@ if not fc_df.empty:
         yaxis3=dict(title="T°C",       overlaying="y", side="right",
                     position=0.92,     showgrid=False, anchor="free"),
         legend=dict(orientation="h", y=1.12), height=290,
-        plot_bgcolor="white", paper_bgcolor="white",
+        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(t=30, b=20, l=20, r=80), xaxis=dict(tickangle=-20),
     )
     st.plotly_chart(fig2, use_container_width=True)
@@ -1217,7 +1228,7 @@ if not monthly_df.empty:
     )
     fig3.update_traces(texttemplate="%{text:.0f}", textposition="outside")
     fig3.update_layout(coloraxis_showscale=False, height=260,
-                       plot_bgcolor="white", paper_bgcolor="white",
+                       plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                        margin=dict(t=20,b=20,l=20,r=20), xaxis=dict(tickangle=-30))
     st.plotly_chart(fig3, use_container_width=True)
 else:
