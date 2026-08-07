@@ -26,6 +26,20 @@ FIRMS_SOURCES  = ["VIIRS_NOAA21_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"]  # r
 FIRMS_BBOX     = "-0.7,44.75,1.0,47.5"  # west,south,east,north — corridor LGV SEA + marge
 FIRMS_RADIUS_KM = 0.5
 
+# Vigilance météo officielle Météo-France, republiée en open data (sans clé) sur Opendatasoft —
+# mêmes bulletins que vigilance.meteofrance.fr, source de référence utilisée par SNCF/préfectures.
+MF_VIGILANCE_URL     = "https://public.opendatasoft.com/api/records/1.0/search/"
+MF_VIGILANCE_DATASET = "weatherref-france-vigilance-meteo-departement"
+MF_PHENOMENON_LABELS = {
+    "pluie":              ("🌧️", "Pluie-inondation"),
+    "orages":             ("⛈️", "Orages"),
+    "canicule":           ("🌡️", "Canicule"),
+    "vent":               ("💨", "Vent violent"),
+    "neige / verglas":    ("❄️", "Neige-verglas"),
+    "vagues submersion":  ("🌊", "Vagues-submersion"),
+}
+MF_COLOR_TO_LEVEL = {"vert": "VERT", "jaune": "JAUNE", "orange": "ORANGE", "rouge": "ROUGE"}
+
 DEPS = {
     "37": {"nom": "Indre-et-Loire",   "lat": 47.38, "lon":  0.69},
     "86": {"nom": "Vienne",            "lat": 46.58, "lon":  0.34},
@@ -43,6 +57,7 @@ ALERT_CFG = {
     "VENT":       ("💨",  "Vent violent"),
     "VIGICRUE":   ("🏞️",  "Vigilance crue"),
     "FEU_FIRMS":  ("🛰️🔥", "Détection incendie FIRMS"),
+    "MF_VIGILANCE": ("🛡️", "Vigilance officielle Météo-France"),
 }
 LEVEL_COLOR = {"ROUGE":"#dc2626","ORANGE":"#ea580c","JAUNE":"#eab308","VERT":"#16a34a","INFO":"#3b82f6"}
 LEVEL_EMOJI = {"ROUGE":"🔴","ORANGE":"🟠","JAUNE":"🟡","VERT":"🟢","INFO":"🔵"}
@@ -63,100 +78,160 @@ def rain_color_mm(mm: float) -> str:
 
 
 @st.cache_data(ttl=900)
-def load_snapshot():
+def _fetch_snapshot_raw() -> dict:
+    r = requests.get(SNAPSHOT_URL, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+def load_snapshot() -> dict:
+    """Seules les réponses réussies sont mises en cache (via _fetch_snapshot_raw) :
+    un échec réseau ponctuel n'immobilise pas l'appli 15 min, il est retenté au
+    prochain rerun au lieu de rester figé jusqu'à expiration du TTL."""
     try:
-        r = requests.get(SNAPSHOT_URL, timeout=20)
-        r.raise_for_status()
-        return r.json()
+        return _fetch_snapshot_raw()
     except Exception as e:
         return {"_error": str(e)}
 
 
 @st.cache_data(ttl=1800)
-def load_weather_alerts_all() -> list:
-    """Alertes dérivées des prévisions Open-Meteo pour les 6 départements LGV SEA."""
+def _fetch_mf_vigilance_raw(dep_codes: tuple) -> list:
+    q = " OR ".join(f"domain_id:{d}" for d in dep_codes)
+    r = requests.get(MF_VIGILANCE_URL, params={
+        "dataset": MF_VIGILANCE_DATASET, "q": q, "rows": 100,
+    }, timeout=15)
+    r.raise_for_status()
+    return r.json().get("records", [])
+
+
+def load_meteofrance_vigilance() -> tuple[list, bool]:
+    """Vigilance officielle Météo-France (aujourd'hui J / demain J1) par département,
+    republiée en open data sans clé — mêmes bulletins que vigilance.meteofrance.fr.
+    Retourne (alertes non-vertes, ok). ok=False seulement si l'API n'a pas pu être
+    interrogée du tout (à ne pas confondre avec une vigilance verte légitime)."""
+    try:
+        records = _fetch_mf_vigilance_raw(tuple(sorted(DEPS.keys())))
+    except Exception:
+        return [], False
+
     alerts = []
-    for dep, info in DEPS.items():
+    for rec in records:
+        f = rec.get("fields", {})
+        dep = f.get("domain_id")
+        if dep not in DEPS:
+            continue
+        level = MF_COLOR_TO_LEVEL.get((f.get("color") or "").lower())
+        if not level or level == "VERT":
+            continue
+        phen = f.get("phenomenon", "")
+        icon, label = MF_PHENOMENON_LABELS.get(phen, ("⚠️", phen.capitalize() or "Phénomène"))
+        jour = "aujourd'hui" if f.get("echeance") == "J" else "demain"
+        alerts.append(dict(
+            dep=dep, type="MF_VIGILANCE", level=level, phenomenon=phen,
+            msg=f"{icon} Dép.{dep} ({DEPS[dep]['nom']}) — {label} : vigilance {level.lower()} ({jour})",
+        ))
+
+    alerts.sort(key=lambda a: (-LEVEL_RANK.get(a["level"], 0), a["dep"]))
+    return alerts, True
+
+
+@st.cache_data(ttl=1800)
+def _fetch_dept_forecast_raw(dep: str) -> dict:
+    info = DEPS[dep]
+    r = requests.get(FORECAST_URL, params={
+        "latitude": info["lat"], "longitude": info["lon"],
+        "daily": ("precipitation_sum,temperature_2m_max,"
+                  "weathercode,wind_speed_10m_max"),
+        "forecast_days": 7, "timezone": "Europe/Paris",
+    }, timeout=15)
+    r.raise_for_status()
+    return r.json().get("daily", {})
+
+
+def load_weather_alerts_all() -> tuple[list, int, int]:
+    """Alertes dérivées des prévisions Open-Meteo pour les 6 départements LGV SEA.
+    Retourne (alertes, nb_dept_ok, nb_dept_total) : si nb_dept_ok == 0, l'appelant
+    doit afficher un avertissement plutôt qu'un silencieux "aucune alerte"
+    (chaque département étant récupéré via une fonction cachée séparée, l'échec
+    de l'un n'empêche pas les autres d'être servis depuis leur propre cache)."""
+    alerts = []
+    ok_count = 0
+    for dep in DEPS:
         try:
-            r = requests.get(FORECAST_URL, params={
-                "latitude": info["lat"], "longitude": info["lon"],
-                "daily": ("precipitation_sum,temperature_2m_max,"
-                          "weathercode,wind_speed_10m_max"),
-                "forecast_days": 7, "timezone": "Europe/Paris",
-            }, timeout=15)
-            r.raise_for_status()
-            daily   = r.json().get("daily", {})
-            dates   = daily.get("time", [])
-            precips = daily.get("precipitation_sum",        [0]*7)
-            tmaxes  = daily.get("temperature_2m_max",       [0]*7)
-            wcodes  = daily.get("weathercode",              [0]*7)
-            winds   = daily.get("wind_speed_10m_max",       [0]*7)
-            rain7   = sum(p or 0 for p in precips)
-
-            seen_fire = False
-            for i, date in enumerate(dates):
-                p = precips[i] or 0
-                t = tmaxes[i]  or 0
-                w = wcodes[i]  or 0
-                v = winds[i]   or 0
-                d_str = date[5:]  # MM-DD
-
-                # ⛈️ Orages (WMO codes 80-82 averses, 95-99 orages)
-                if w >= 99:
-                    alerts.append(dict(dep=dep, date=date, type="ORAGE", level="ROUGE",
-                        msg=f"Dép.{dep} le {d_str} — Orages violents avec grêle"))
-                elif w >= 95:
-                    alerts.append(dict(dep=dep, date=date, type="ORAGE", level="ORANGE",
-                        msg=f"Dép.{dep} le {d_str} — Orages"))
-                elif w in (80, 81, 82):
-                    alerts.append(dict(dep=dep, date=date, type="ORAGE", level="JAUNE",
-                        msg=f"Dép.{dep} le {d_str} — Averses orageuses"))
-
-                # 🌊 Inondation (précipitations intenses)
-                if p >= 60:
-                    alerts.append(dict(dep=dep, date=date, type="INONDATION", level="ROUGE",
-                        msg=f"Dép.{dep} le {d_str} — Pluies diluviennes : {p:.0f} mm"))
-                elif p >= 30:
-                    alerts.append(dict(dep=dep, date=date, type="INONDATION", level="ORANGE",
-                        msg=f"Dép.{dep} le {d_str} — Pluies intenses : {p:.0f} mm"))
-                elif p >= 15:
-                    alerts.append(dict(dep=dep, date=date, type="INONDATION", level="JAUNE",
-                        msg=f"Dép.{dep} le {d_str} — Pluies soutenues : {p:.0f} mm"))
-
-                # 🌡️ Canicule
-                if t >= 40:
-                    alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ROUGE",
-                        msg=f"Dép.{dep} le {d_str} — Canicule extrême : {t:.0f}°C"))
-                elif t >= 36:
-                    alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ROUGE",
-                        msg=f"Dép.{dep} le {d_str} — Canicule : {t:.0f}°C"))
-                elif t >= 33:
-                    alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ORANGE",
-                        msg=f"Dép.{dep} le {d_str} — Forte chaleur : {t:.0f}°C"))
-
-                # 💨 Vent violent
-                if v >= 100:
-                    alerts.append(dict(dep=dep, date=date, type="VENT", level="ROUGE",
-                        msg=f"Dép.{dep} le {d_str} — Vents très violents : {v:.0f} km/h"))
-                elif v >= 80:
-                    alerts.append(dict(dep=dep, date=date, type="VENT", level="ORANGE",
-                        msg=f"Dép.{dep} le {d_str} — Vents violents : {v:.0f} km/h"))
-                elif v >= 60:
-                    alerts.append(dict(dep=dep, date=date, type="VENT", level="JAUNE",
-                        msg=f"Dép.{dep} le {d_str} — Vents forts : {v:.0f} km/h"))
-
-                # 🔥 Risque incendie (chaleur + sécheresse + vent)
-                if not seen_fire and t >= 30 and rain7 < 10 and v >= 25:
-                    lvl = "ROUGE" if (t >= 35 and rain7 < 5 and v >= 35) else "ORANGE"
-                    alerts.append(dict(dep=dep, date=date, type="INCENDIE", level=lvl,
-                        msg=f"Dép.{dep} — Risque incendie : {t:.0f}°C, "
-                            f"vent {v:.0f} km/h, pluie 7j {rain7:.0f} mm"))
-                    seen_fire = True
-
+            daily = _fetch_dept_forecast_raw(dep)
+            ok_count += 1
         except Exception:
             continue
 
-    return sorted(alerts, key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["date"]))
+        dates   = daily.get("time", [])
+        precips = daily.get("precipitation_sum",        [0]*7)
+        tmaxes  = daily.get("temperature_2m_max",       [0]*7)
+        wcodes  = daily.get("weathercode",              [0]*7)
+        winds   = daily.get("wind_speed_10m_max",       [0]*7)
+        rain7   = sum(p or 0 for p in precips)
+
+        seen_fire = False
+        for i, date in enumerate(dates):
+            p = precips[i] or 0
+            t = tmaxes[i]  or 0
+            w = wcodes[i]  or 0
+            v = winds[i]   or 0
+            d_str = date[5:]  # MM-DD
+
+            # ⛈️ Orages (WMO codes 80-82 averses, 95-99 orages)
+            if w >= 99:
+                alerts.append(dict(dep=dep, date=date, type="ORAGE", level="ROUGE",
+                    msg=f"Dép.{dep} le {d_str} — Orages violents avec grêle"))
+            elif w >= 95:
+                alerts.append(dict(dep=dep, date=date, type="ORAGE", level="ORANGE",
+                    msg=f"Dép.{dep} le {d_str} — Orages"))
+            elif w in (80, 81, 82):
+                alerts.append(dict(dep=dep, date=date, type="ORAGE", level="JAUNE",
+                    msg=f"Dép.{dep} le {d_str} — Averses orageuses"))
+
+            # 🌊 Inondation (précipitations intenses)
+            if p >= 60:
+                alerts.append(dict(dep=dep, date=date, type="INONDATION", level="ROUGE",
+                    msg=f"Dép.{dep} le {d_str} — Pluies diluviennes : {p:.0f} mm"))
+            elif p >= 30:
+                alerts.append(dict(dep=dep, date=date, type="INONDATION", level="ORANGE",
+                    msg=f"Dép.{dep} le {d_str} — Pluies intenses : {p:.0f} mm"))
+            elif p >= 15:
+                alerts.append(dict(dep=dep, date=date, type="INONDATION", level="JAUNE",
+                    msg=f"Dép.{dep} le {d_str} — Pluies soutenues : {p:.0f} mm"))
+
+            # 🌡️ Canicule
+            if t >= 40:
+                alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ROUGE",
+                    msg=f"Dép.{dep} le {d_str} — Canicule extrême : {t:.0f}°C"))
+            elif t >= 36:
+                alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ROUGE",
+                    msg=f"Dép.{dep} le {d_str} — Canicule : {t:.0f}°C"))
+            elif t >= 33:
+                alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ORANGE",
+                    msg=f"Dép.{dep} le {d_str} — Forte chaleur : {t:.0f}°C"))
+
+            # 💨 Vent violent
+            if v >= 100:
+                alerts.append(dict(dep=dep, date=date, type="VENT", level="ROUGE",
+                    msg=f"Dép.{dep} le {d_str} — Vents très violents : {v:.0f} km/h"))
+            elif v >= 80:
+                alerts.append(dict(dep=dep, date=date, type="VENT", level="ORANGE",
+                    msg=f"Dép.{dep} le {d_str} — Vents violents : {v:.0f} km/h"))
+            elif v >= 60:
+                alerts.append(dict(dep=dep, date=date, type="VENT", level="JAUNE",
+                    msg=f"Dép.{dep} le {d_str} — Vents forts : {v:.0f} km/h"))
+
+            # 🔥 Risque incendie (chaleur + sécheresse + vent)
+            if not seen_fire and t >= 30 and rain7 < 10 and v >= 25:
+                lvl = "ROUGE" if (t >= 35 and rain7 < 5 and v >= 35) else "ORANGE"
+                alerts.append(dict(dep=dep, date=date, type="INCENDIE", level=lvl,
+                    msg=f"Dép.{dep} — Risque incendie : {t:.0f}°C, "
+                        f"vent {v:.0f} km/h, pluie 7j {rain7:.0f} mm"))
+                seen_fire = True
+
+    alerts.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["date"]))
+    return alerts, ok_count, len(DEPS)
 
 
 def _normalize(s: str) -> str:
@@ -180,10 +255,15 @@ _DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
 
 
 @st.cache_data(ttl=1800)
-def load_vigicrue_rivers() -> list:
-    """Vigilance crues des cours d'eau à proximité de la LGV SEA (API Vigicrue XML)."""
+def load_vigicrue_rivers() -> tuple[list, bool]:
+    """Vigilance crues des cours d'eau à proximité de la LGV SEA (API Vigicrue XML).
+    Retourne (alertes, ok). ok=False uniquement si l'API n'a jamais pu être
+    interrogée avec succès — sans ce distinguo, une panne réseau et un "aucune
+    crue en cours" légitime produiraient le même résultat vide, donc le même
+    message rassurant à tort."""
     VC_LEVEL = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
     results: list = []
+    parsed_ok = False
 
     # TypEntVigiCru=3 = tronçons (sections de cours d'eau) — principal format Vigicrue v2
     for params in [{"TypEntVigiCru": 3}, {}]:
@@ -200,6 +280,7 @@ def load_vigicrue_rivers() -> list:
                 continue
 
             root = ET.fromstring(content)
+            parsed_ok = True
             found = False
 
             for elem in root.iter():
@@ -257,10 +338,7 @@ def load_vigicrue_rivers() -> list:
     # Sort: highest level first, then by name
     dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
 
-    if not dedup:
-        dedup.append(dict(riviere="", dep="", level="INFO", type="VIGICRUE",
-            msg="API Vigicrue indisponible ou aucune crue en cours sur les cours d'eau LGV SEA"))
-    return dedup
+    return dedup, parsed_ok
 
 
 def get_firms_map_key() -> str | None:
@@ -328,34 +406,59 @@ def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | Non
 
 
 @st.cache_data(ttl=900)
+def _fetch_firms_source_raw(key: str, source: str, day_range: int) -> pd.DataFrame:
+    url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX, day_range=day_range)
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    txt = r.text.strip()
+    if "invalid" in txt.lower()[:200]:
+        raise ValueError("invalid_key")
+    if not txt or "<html" in txt.lower()[:200]:
+        raise RuntimeError("unexpected_response")
+    df = pd.read_csv(io.StringIO(txt))
+    if "latitude" not in df.columns:
+        raise RuntimeError("unexpected_response")
+    df["source"] = source
+    return df
+
+
 def load_firms_hotspots(day_range: int = 1) -> tuple[pd.DataFrame, str | None]:
-    """Détections actives FIRMS (VIIRS NRT) sur la bbox du corridor LGV SEA."""
+    """Détections actives FIRMS (VIIRS NRT) sur la bbox du corridor LGV SEA.
+    Distingue explicitement « aucune détection » (chaque source a répondu, 0 résultat)
+    de « échec de la vérification » (aucune source n'a pu être interrogée) — sans quoi
+    une panne réseau/API afficherait à tort un statut "aucun feu" rassurant mais faux."""
     key = get_firms_map_key()
     if not key:
         return pd.DataFrame(), "missing_key"
 
     frames = []
+    ok_count = 0
     for source in FIRMS_SOURCES:
-        url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX, day_range=day_range)
         try:
-            r = requests.get(url, timeout=20)
-            r.raise_for_status()
-            txt = r.text.strip()
-            if not txt or "<html" in txt.lower() or txt.lower().startswith(("invalid", "error")):
-                if "invalid" in txt.lower():
-                    return pd.DataFrame(), "invalid_key"
-                continue
-            df = pd.read_csv(io.StringIO(txt))
-            if df.empty or "latitude" not in df.columns:
-                continue
-            df["source"] = source
-            frames.append(df)
+            df = _fetch_firms_source_raw(key, source, day_range)
+            ok_count += 1
+            if not df.empty:
+                frames.append(df)
+        except ValueError:
+            return pd.DataFrame(), "invalid_key"
         except Exception:
             continue
 
+    if ok_count == 0:
+        return pd.DataFrame(), "fetch_failed"
     if not frames:
         return pd.DataFrame(), None
     return pd.concat(frames, ignore_index=True), None
+
+
+FIRMS_CONF_LABELS = {"l": "Faible", "n": "Nominale", "h": "Élevée"}
+
+
+def _firms_conf_label(raw) -> str:
+    """VIIRS renvoie un code lettre (l/n/h) peu lisible tel quel — MODIS renvoie un %
+    numérique déjà clair. On ne traduit que le premier cas, l'autre passe inchangé."""
+    s = str(raw).strip().lower()
+    return FIRMS_CONF_LABELS.get(s, str(raw))
 
 
 @st.cache_data(ttl=900)
@@ -386,7 +489,7 @@ def load_firms_alerts(_polyline: list, day_range: int = 1,
         acq_date = str(row.get("acq_date", "") or "")
         acq_time = str(row.get("acq_time", "") or "").zfill(4)
         heure    = f"{acq_time[:2]}:{acq_time[2:]}" if len(acq_time) == 4 else acq_time
-        conf     = row.get("confidence", "")
+        conf     = _firms_conf_label(row.get("confidence", ""))
         frp      = row.get("frp", None)
         dist_m   = dist_km * 1000
 
@@ -405,23 +508,32 @@ def load_firms_alerts(_polyline: list, day_range: int = 1,
 
 
 @st.cache_data(ttl=3600)
+def _fetch_commune_daily_series_raw(lat: float, lon: float, days: int) -> dict:
+    end   = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+    r = requests.get(ARCHIVE_URL, params={
+        "latitude": lat, "longitude": lon,
+        "start_date": str(start), "end_date": str(end),
+        "daily": "precipitation_sum", "timezone": "Europe/Paris",
+    }, timeout=20)
+    r.raise_for_status()
+    return r.json().get("daily", {})
+
+
 def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
-    """Série journalière de pluie (Open-Meteo ERA5) sur les `days` derniers jours."""
+    """Série journalière de pluie sur les `days` derniers jours — API archive ERA5
+    (réanalyse), pas l'API prévision : son paramètre `past_days` renvoie pour les
+    1-2 derniers jours une sortie modèle non recalée sur l'observé, constatée jusqu'à
+    11x plus élevée que l'ERA5 le même jour (45,6 mm vs 4,0 mm), ce qui gonflait
+    artificiellement les cumuls du classement TOP 20."""
     try:
-        r = requests.get(FORECAST_URL, params={
-            "latitude": lat, "longitude": lon,
-            "daily": "precipitation_sum",
-            "past_days": days, "forecast_days": 0,
-            "timezone": "Europe/Paris",
-        }, timeout=15)
-        r.raise_for_status()
-        daily = r.json().get("daily", {})
-        df = pd.DataFrame({"date": daily.get("time", []),
-                            "pluie_mm": daily.get("precipitation_sum", [])})
-        df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
-        return df
+        daily = _fetch_commune_daily_series_raw(lat, lon, days)
     except Exception:
         return pd.DataFrame()
+    df = pd.DataFrame({"date": daily.get("time", []),
+                        "pluie_mm": daily.get("precipitation_sum", [])})
+    df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
+    return df
 
 
 @st.cache_data(ttl=3600)
@@ -487,16 +599,20 @@ def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
 
 
 @st.cache_data(ttl=3600)
-def load_forecast_dep(dep: str) -> dict:
+def _fetch_forecast_dep_raw(dep: str) -> dict:
     d = DEPS[dep]
+    r = requests.get(FORECAST_URL, params={
+        "latitude": d["lat"], "longitude": d["lon"],
+        "daily": "precipitation_sum,weathercode",
+        "forecast_days": 7, "timezone": "Europe/Paris",
+    }, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+def load_forecast_dep(dep: str) -> dict:
     try:
-        r = requests.get(FORECAST_URL, params={
-            "latitude": d["lat"], "longitude": d["lon"],
-            "daily": "precipitation_sum,weathercode",
-            "forecast_days": 7, "timezone": "Europe/Paris",
-        }, timeout=15)
-        r.raise_for_status()
-        return r.json()
+        return _fetch_forecast_dep_raw(dep)
     except Exception:
         return {}
 
@@ -605,16 +721,23 @@ RAIN_LABELS = {
     "JAUNE":  ("Pluie modérée",   "#eab308", "🟡"),
     "ORANGE": ("Pluies fortes",   "#ea580c", "🟠"),
     "ROUGE":  ("Pluies très fortes","#dc2626","🔴"),
+    "INDETERMINE": ("Indisponible", "#9ca3af", "❓"),
 }
-dep_rain_data: dict = {}   # dep -> {max, total, lvl, color, emoji}
+dep_rain_data: dict = {}   # dep -> {max, total, lvl, color, emoji, ok}
 for _dep in DEPS:
     _fc    = load_forecast_dep(_dep)
+    _ok    = bool(_fc)
     _rains = [v for v in _fc.get("daily", {}).get("precipitation_sum", []) if v is not None]
     _max   = max(_rains) if _rains else 0.0
     _total = sum(_rains)
-    _lvl, _color, _emoji = rain_risk(_max)
+    if _ok:
+        _lvl, _color, _emoji = rain_risk(_max)
+    else:
+        # Échec de récupération distinct d'un "peu de pluie" légitime — sans ce
+        # marqueur, une panne Open-Meteo afficherait à tort une carte verte rassurante.
+        _lvl, _color, _emoji = "INDETERMINE", "#9ca3af", "❓"
     dep_rain_data[_dep] = {"max": _max, "total": _total,
-                            "lvl": _lvl, "color": _color, "emoji": _emoji}
+                            "lvl": _lvl, "color": _color, "emoji": _emoji, "ok": _ok}
 
 
 def nearest_dep(lat: float, lon: float) -> str:
@@ -629,6 +752,8 @@ dep_cols = st.columns(len(DEPS))
 for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
     d = dep_rain_data[dep]
     lvl_label, color, emoji = RAIN_LABELS[d["lvl"]]
+    detail = (f"max {d['max']:.0f} mm/j · {d['total']:.0f} mm" if d["ok"]
+              else "Open-Meteo indisponible")
     col_w.markdown(
         f'<div style="padding:10px 6px;border-radius:8px;border:2px solid {color};'
         f'text-align:center;background:{color}14">'
@@ -636,19 +761,50 @@ for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
         f'<b style="font-size:13px">Dép. {dep}</b><br>'
         f'<span style="font-size:11px;color:#666">{info["nom"]}</span><br>'
         f'<b style="color:{color};font-size:12px">{lvl_label}</b><br>'
-        f'<span style="font-size:12px">max {d["max"]:.0f} mm/j · {d["total"]:.0f} mm</span>'
+        f'<span style="font-size:12px">{detail}</span>'
         f'</div>', unsafe_allow_html=True)
 
-# ── 2. INDICATEURS MÉTÉO ─────────────────────────────────────────────────────
-st.subheader("📊 Indicateurs météo — 7 prochains jours")
+# ── 1bis. VIGILANCE OFFICIELLE MÉTÉO-FRANCE ─────────────────────────────────
+st.subheader("🛡️ Vigilance officielle Météo-France (aujourd'hui / demain)")
 
-met_alerts = load_weather_alerts_all()
-vc_alerts  = load_vigicrue_rivers()
+mf_alerts, mf_ok = load_meteofrance_vigilance()
+
+if not mf_ok:
+    st.warning("⚠️ Vigilance Météo-France injoignable — statut **non vérifié** "
+               "(réessaie dans quelques minutes).")
+elif mf_alerts:
+    st.error(f"🛡️ {len(mf_alerts)} vigilance(s) active(s) sur les départements du corridor LGV SEA.")
+    for a in mf_alerts:
+        alert_card(a)
+else:
+    st.success("✅ Vigilance verte sur les 6 départements du corridor (aujourd'hui et demain).")
+
+st.caption(
+    "Source officielle : [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) — "
+    "données republiées en open data (sans clé), mêmes bulletins que l'appli officielle. "
+    "Les « indicateurs météo » ci-dessous sont une estimation complémentaire sur 7 jours, "
+    "pas une vigilance officielle."
+)
+
+st.divider()
+
+# ── 2. INDICATEURS MÉTÉO ─────────────────────────────────────────────────────
+st.subheader("📊 Indicateurs météo — 7 prochains jours (estimation indicative, 7 jours)")
+
+met_alerts, met_ok, met_total = load_weather_alerts_all()
+vc_alerts, vc_ok = load_vigicrue_rivers()
 
 active_met = [a for a in met_alerts if a["level"] in ("ROUGE","ORANGE","JAUNE")]
 by_met: dict = defaultdict(list)
 for a in active_met:
     by_met[a["type"]].append(a)
+
+if met_ok == 0:
+    st.warning("⚠️ Open-Meteo injoignable — indicateurs météo **non vérifiés** actuellement "
+               "(ce n'est pas un « aucune alerte », réessaie dans quelques minutes).")
+elif met_ok < met_total:
+    st.caption(f"ℹ️ Prévisions récupérées pour {met_ok}/{met_total} départements — "
+               "le reste sera réessayé au prochain rafraîchissement.")
 
 if active_met:
     chips = ""
@@ -660,7 +816,7 @@ if active_met:
                   f'border-radius:20px;background:{color};color:white;font-size:12px;font-weight:600">'
                   f'{icon} {label} ({len(alist)})</span>')
     st.markdown(chips, unsafe_allow_html=True)
-else:
+elif met_ok > 0:
     st.success("✅ Aucun indicateur météo significatif sur les 7 prochains jours.")
 
 tab_labels: list = []
@@ -672,7 +828,12 @@ for atype in ("ORAGE", "INONDATION", "CANICULE", "INCENDIE", "VENT"):
         tab_data.append(by_met[atype])
 
 vc_active = [a for a in vc_alerts if a["level"] in ("ROUGE","ORANGE","JAUNE")]
-vc_label  = "🏞️ Vigicrue" + (f" ⚠ {len(vc_active)}" if vc_active else " ✅")
+if not vc_ok:
+    vc_label = "🏞️ Vigicrue ❓"
+elif vc_active:
+    vc_label = f"🏞️ Vigicrue ⚠ {len(vc_active)}"
+else:
+    vc_label = "🏞️ Vigicrue ✅"
 tab_labels.append(vc_label)
 tab_data.append(vc_alerts)
 
@@ -680,8 +841,12 @@ if tab_labels:
     tabs = st.tabs(tab_labels)
     for tab, alist in zip(tabs, tab_data):
         with tab:
-            if not alist:
-                st.info("Aucune donnée.")
+            if tab is tabs[-1] and not vc_ok:
+                st.warning("⚠️ API Vigicrue injoignable — statut crues **non vérifié** "
+                           "(réessaie dans quelques minutes).")
+            elif not alist:
+                st.info("Aucune crue en vigilance actuellement sur ces cours d'eau."
+                         if tab is tabs[-1] else "Aucune donnée.")
             for a in alist:
                 alert_card(a)
 
@@ -716,6 +881,18 @@ with st.sidebar:
     firms_window_label = st.selectbox("Fenêtre de détection", ["Dernières 24h","Dernières 48h","Dernières 72h"])
     firms_day_range = {"Dernières 24h":1, "Dernières 48h":2, "Dernières 72h":3}[firms_window_label]
 
+    st.subheader("🔄 Actualisation")
+    auto_refresh = st.checkbox("Rafraîchissement automatique", value=True)
+    if auto_refresh:
+        _refresh_label = st.selectbox("Intervalle", ["5 min", "10 min", "15 min"], index=1)
+        refresh_seconds = {"5 min": 300, "10 min": 600, "15 min": 900}[_refresh_label]
+        st.caption("⚠️ Recharge la page entière (réinitialise filtres/sélections). "
+                   "La fraîcheur réelle des données reste bornée par leur propre cache "
+                   "(15-60 min selon la source), pas par cet intervalle.")
+
+if auto_refresh:
+    st.markdown(f'<meta http-equiv="refresh" content="{refresh_seconds}">', unsafe_allow_html=True)
+
 # ── 2bis. INCENDIES TEMPS RÉEL — NASA FIRMS ─────────────────────────────────
 st.subheader(f"🛰️🔥 Détections incendie temps réel — NASA FIRMS (rayon {FIRMS_RADIUS_KM*1000:.0f} m autour de la LGV SEA)")
 
@@ -731,6 +908,9 @@ if firms_err == "missing_key":
     )
 elif firms_err == "invalid_key":
     st.error("🔑 Clé FIRMS invalide — vérifie `FIRMS_MAP_KEY`.")
+elif firms_err == "fetch_failed":
+    st.warning("⚠️ FIRMS injoignable actuellement (réseau/API) — statut incendie **non vérifié** "
+               "(ce n'est pas un « aucun feu détecté », réessaie dans quelques minutes).")
 elif firms_alerts:
     st.error(f"🔥 {len(firms_alerts)} détection(s) FIRMS à moins de "
              f"{FIRMS_RADIUS_KM*1000:.0f} m de la LGV SEA ({firms_window_label.lower()}).")
@@ -765,15 +945,21 @@ risk_sectors = (sectors_df[sectors_df["risk_level"] == "ELEVE"]
 _chip = lambda bg, txt: (
     f'<span style="display:inline-block;margin:3px 4px;padding:3px 10px;border-radius:20px;'
     f'background:{bg};color:white;font-size:12px;font-weight:600">{txt}</span>')
+
+_GREY = "#9ca3af"  # non vérifié — jamais confondu avec le vert "aucune alerte"
+_firms_unverified = firms_err in ("fetch_failed", "invalid_key", "missing_key")
+
 st.markdown(
+    _chip(_GREY if not mf_ok else ("#dc2626" if mf_alerts else "#16a34a"),
+          "🛡️ non vérifié" if not mf_ok else f"🛡️ {len(mf_alerts)} vigilance(s) officielle(s) MF") +
     _chip("#dc2626" if len(risk_sectors) else "#16a34a",
           f"🏗️ {len(risk_sectors)} secteur(s) à risque structurel élevé") +
-    _chip("#ea580c" if active_met else "#16a34a",
-          f"🌦️ {len(active_met)} alerte(s) météo active(s)") +
-    _chip("#3b82f6" if vc_active else "#16a34a",
-          f"🏞️ {len(vc_active)} vigilance(s) crue") +
-    _chip("#dc2626" if firms_alerts else "#16a34a",
-          f"🛰️🔥 {len(firms_alerts)} détection(s) FIRMS < 500 m"),
+    _chip(_GREY if met_ok == 0 else ("#ea580c" if active_met else "#16a34a"),
+          "🌦️ non vérifié" if met_ok == 0 else f"🌦️ {len(active_met)} alerte(s) météo active(s)") +
+    _chip(_GREY if not vc_ok else ("#3b82f6" if vc_active else "#16a34a"),
+          "🏞️ non vérifié" if not vc_ok else f"🏞️ {len(vc_active)} vigilance(s) crue") +
+    _chip(_GREY if _firms_unverified else ("#dc2626" if firms_alerts else "#16a34a"),
+          "🛰️🔥 non vérifié" if _firms_unverified else f"🛰️🔥 {len(firms_alerts)} détection(s) FIRMS < 500 m"),
     unsafe_allow_html=True,
 )
 
@@ -792,14 +978,19 @@ if not risk_sectors.empty:
                 lambda v: ", ".join(v) if isinstance(v, list) else v)
         st.dataframe(_disp_risk, use_container_width=True, hide_index=True, height=280)
 
-if active_met or vc_active or firms_alerts:
-    with st.expander("⚠️ Détail des alertes actives (météo, crues, incendie)", expanded=True):
+if mf_alerts or active_met or vc_active or firms_alerts:
+    with st.expander("⚠️ Détail des alertes actives (vigilance MF, météo, crues, incendie)", expanded=True):
+        for a in mf_alerts:
+            alert_card(a)
         for a in sorted(active_met, key=lambda x: -LEVEL_RANK.get(x["level"], 0)):
             alert_card(a)
         for a in vc_active:
             alert_card(a)
         for a in firms_alerts:
             alert_card(a)
+elif not mf_ok or met_ok == 0 or not vc_ok or _firms_unverified:
+    st.warning("⚠️ Au moins une source (vigilance MF, météo, crues ou incendie) n'a pas pu être vérifiée "
+               "— voir le détail ci-dessus. Ne pas interpréter comme « aucune alerte ».")
 else:
     st.success("✅ Aucune alerte météo, crue ou incendie active actuellement.")
 
@@ -811,9 +1002,16 @@ st.subheader("🌧 TOP 20 communes — cumul de précipitation le plus élevé (
 with st.spinner("Chargement pluvio 30 jours pour toutes les communes du corridor…"):
     all_rain_df = load_all_communes_daily_rain(sectors_df, days=30)
 
+_n_communes_total = (sectors_df["commune_name"].dropna().nunique()
+                      if "commune_name" in sectors_df.columns else 0)
+_n_communes_ok = all_rain_df["commune_name"].nunique() if not all_rain_df.empty else 0
+
 if all_rain_df.empty:
     st.info("Données pluvio indisponibles pour le classement.")
 else:
+    if _n_communes_total and _n_communes_ok < _n_communes_total:
+        st.caption(f"⚠️ Données récupérées pour {_n_communes_ok}/{_n_communes_total} communes du corridor "
+                   "— le classement ci-dessous ne porte que sur les communes disponibles.")
     all_rain_df = all_rain_df.copy()
     all_rain_df["date"] = pd.to_datetime(all_rain_df["date"]).dt.date
     d_min, d_max = all_rain_df["date"].min(), all_rain_df["date"].max()
@@ -881,7 +1079,8 @@ else:
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
                 use_container_width=True, hide_index=True,
             )
-    st.caption("Source : Open-Meteo (série journalière, 30 jours) · une requête par commune, mise en cache 1h.")
+    st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
+               "une requête par commune, mise en cache 1h.")
 
 st.divider()
 
@@ -956,6 +1155,11 @@ if selected_multi and not sectors_df.empty:
             st.plotly_chart(fig, use_container_width=True)
             _src = "AROME Météo-France 1,3 km" if periode == "24h" else "ERA5 near real-time"
             st.caption(f"Source : Open-Meteo {_src} · {date_str}")
+
+            _missing = sorted(set(selected_multi) - set(df_cmp["commune_name"]))
+            if _missing:
+                st.warning(f"⚠️ Pas de donnée pluvio récupérée pour : {', '.join(_missing)} "
+                           "— absentes du graphique ci-dessus, pas de valeur à 0 supposée.")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
 comm_df = (sectors_df if selected_one == "— Toutes —"
