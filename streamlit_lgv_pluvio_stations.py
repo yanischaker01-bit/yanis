@@ -21,10 +21,12 @@ ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
-FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}"
+FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}/{date}"
 FIRMS_SOURCES  = ["VIIRS_NOAA21_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"]  # résolution ~375 m
 FIRMS_BBOX     = "-0.7,44.75,1.0,47.5"  # west,south,east,north — corridor LGV SEA + marge
 FIRMS_RADIUS_KM = 0.5
+FIRMS_MAX_DAY_RANGE = 10   # limite de l'API area (une seule requête par source)
+FIRMS_MAX_LOOKBACK_DAYS = 60  # au-delà, le NRT n'est plus garanti disponible
 
 # Vigilance météo officielle Météo-France, republiée en open data (sans clé) sur Opendatasoft —
 # mêmes bulletins que vigilance.meteofrance.fr, source de référence utilisée par SNCF/préfectures.
@@ -408,8 +410,9 @@ def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | Non
 
 
 @st.cache_data(ttl=300)
-def _fetch_firms_source_raw(key: str, source: str, day_range: int) -> pd.DataFrame:
-    url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX, day_range=day_range)
+def _fetch_firms_source_raw(key: str, source: str, day_range: int, date_str: str) -> pd.DataFrame:
+    url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX,
+                                 day_range=day_range, date=date_str)
     r = requests.get(url, timeout=20)
     r.raise_for_status()
     txt = r.text.strip()
@@ -424,8 +427,10 @@ def _fetch_firms_source_raw(key: str, source: str, day_range: int) -> pd.DataFra
     return df
 
 
-def load_firms_hotspots(day_range: int = 1) -> tuple[pd.DataFrame, str | None]:
-    """Détections actives FIRMS (VIIRS NRT) sur la bbox du corridor LGV SEA.
+def load_firms_hotspots(day_range: int = 1, end_date=None) -> tuple[pd.DataFrame, str | None]:
+    """Détections FIRMS (VIIRS NRT) sur la bbox du corridor LGV SEA, sur `day_range`
+    jours se terminant le `end_date` (par défaut aujourd'hui — permet de remonter
+    dans le temps, jusqu'à `FIRMS_MAX_LOOKBACK_DAYS` en arrière).
     Distingue explicitement « aucune détection » (chaque source a répondu, 0 résultat)
     de « échec de la vérification » (aucune source n'a pu être interrogée) — sans quoi
     une panne réseau/API afficherait à tort un statut "aucun feu" rassurant mais faux."""
@@ -433,11 +438,12 @@ def load_firms_hotspots(day_range: int = 1) -> tuple[pd.DataFrame, str | None]:
     if not key:
         return pd.DataFrame(), "missing_key"
 
+    date_str = (end_date or datetime.now(timezone.utc).date()).isoformat()
     frames = []
     ok_count = 0
     for source in FIRMS_SOURCES:
         try:
-            df = _fetch_firms_source_raw(key, source, day_range)
+            df = _fetch_firms_source_raw(key, source, day_range, date_str)
             ok_count += 1
             if not df.empty:
                 frames.append(df)
@@ -464,10 +470,10 @@ def _firms_conf_label(raw) -> str:
 
 
 @st.cache_data(ttl=300)
-def load_firms_alerts(_polyline: list, day_range: int = 1,
+def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
                        radius_km: float = FIRMS_RADIUS_KM) -> tuple[list, str | None]:
     """Détections FIRMS filtrées à moins de `radius_km` de la LGV SEA, avec PK et distance."""
-    df, err = load_firms_hotspots(day_range)
+    df, err = load_firms_hotspots(day_range, end_date)
     if err:
         return [], err
     if df.empty or not _polyline:
@@ -891,8 +897,18 @@ with st.sidebar:
     periode  = st.selectbox("📅 Période pluvio", ["24h","7 jours","30 jours","Mois courant"])
 
     st.subheader("🔥 Incendies FIRMS")
-    firms_window_label = st.selectbox("Fenêtre de détection", ["Dernières 24h","Dernières 48h","Dernières 72h"])
-    firms_day_range = {"Dernières 24h":1, "Dernières 48h":2, "Dernières 72h":3}[firms_window_label]
+    _today_date = datetime.now(timezone.utc).date()
+    firms_end_date = st.date_input(
+        "Jusqu'au", value=_today_date,
+        min_value=_today_date - timedelta(days=FIRMS_MAX_LOOKBACK_DAYS),
+        max_value=_today_date,
+        help="Choisis une date passée pour consulter l'historique FIRMS au lieu du temps réel.",
+    )
+    firms_day_range = st.slider("Fenêtre (jours avant cette date)", 1, FIRMS_MAX_DAY_RANGE, 1)
+    firms_is_live = firms_end_date == _today_date
+    if not firms_is_live:
+        st.caption("📜 Mode historique — le rafraîchissement automatique ne changera rien "
+                   "à une date passée, seul un rerun manuel peut en changer les données.")
 
     st.subheader("🔄 Actualisation")
     auto_refresh = st.checkbox("Rafraîchissement automatique", value=True)
@@ -906,11 +922,26 @@ with st.sidebar:
 if auto_refresh:
     st.markdown(f'<meta http-equiv="refresh" content="{refresh_seconds}">', unsafe_allow_html=True)
 
-# ── 2bis. INCENDIES TEMPS RÉEL — NASA FIRMS ─────────────────────────────────
-st.subheader(f"🔥 Détections incendie temps réel — NASA FIRMS (rayon {FIRMS_RADIUS_KM*1000:.0f} m autour de la LGV SEA)")
+# ── 2bis. INCENDIES — NASA FIRMS ────────────────────────────────────────────
+_firms_start_date = firms_end_date - timedelta(days=firms_day_range - 1)
+if firms_is_live and firms_day_range <= 3:
+    firms_window_label = f"dernières {firms_day_range * 24} h"
+elif firms_is_live:
+    firms_window_label = f"derniers {firms_day_range} jours"
+elif _firms_start_date == firms_end_date:
+    firms_window_label = firms_end_date.strftime('%d/%m/%Y')
+else:
+    firms_window_label = (f"{_firms_start_date.strftime('%d/%m/%Y')} → "
+                           f"{firms_end_date.strftime('%d/%m/%Y')}")
+
+_firms_title = ("temps réel" if firms_is_live
+                else f"historique · {firms_window_label}")
+st.subheader(f"🔥 Détections incendie {_firms_title} — NASA FIRMS "
+             f"(rayon {FIRMS_RADIUS_KM*1000:.0f} m autour de la LGV SEA)")
 
 lgv_polyline = build_lgv_pk_polyline(snapshot.get("lgv_lines"))
-firms_alerts, firms_err = load_firms_alerts(lgv_polyline, day_range=firms_day_range)
+firms_alerts, firms_err = load_firms_alerts(lgv_polyline, day_range=firms_day_range,
+                                             end_date=firms_end_date)
 
 if firms_err == "missing_key":
     st.warning(
@@ -926,7 +957,7 @@ elif firms_err == "fetch_failed":
                "(ce n'est pas un « aucun feu détecté », réessaie dans quelques minutes).")
 elif firms_alerts:
     st.error(f"{len(firms_alerts)} détection(s) FIRMS à moins de "
-             f"{FIRMS_RADIUS_KM*1000:.0f} m de la LGV SEA ({firms_window_label.lower()}).")
+             f"{FIRMS_RADIUS_KM*1000:.0f} m de la LGV SEA ({firms_window_label}).")
     df_firms = pd.DataFrame(firms_alerts).rename(columns={
         "pk_km": "PK (km)", "distance_m": "Distance LGV (m)",
         "date": "Date", "heure": "Heure (UTC)",
@@ -939,15 +970,20 @@ elif firms_alerts:
     )
 else:
     st.success(f"Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
-               f"de la LGV SEA ({firms_window_label.lower()}).")
+               f"de la LGV SEA ({firms_window_label}).")
 
-st.caption(
-    "Source : NASA FIRMS · VIIRS NOAA-20/NOAA-21/S-NPP (résolution ~375 m) · "
-    "[firms.modaps.eosdis.nasa.gov/map](https://firms.modaps.eosdis.nasa.gov/map) — "
-    "PK et distance calculés par projection sur le tracé LGV SEA. "
+_firms_freshness = (
     "Vérifié toutes les 5 min ici, mais un satellite ne survole un même point que "
     "2 fois par jour environ, avec 1 à 3 h de traitement avant publication : "
     "actualiser plus souvent ne fait pas apparaître une détection plus tôt que ça."
+    if firms_is_live else
+    "Requête historique figée sur la période choisie — les résultats ne changeront "
+    "pas au fil des rafraîchissements."
+)
+st.caption(
+    "Source : NASA FIRMS · VIIRS NOAA-20/NOAA-21/S-NPP (résolution ~375 m) · "
+    "[firms.modaps.eosdis.nasa.gov/map](https://firms.modaps.eosdis.nasa.gov/map) — "
+    "PK et distance calculés par projection sur le tracé LGV SEA. " + _firms_freshness
 )
 
 st.divider()
@@ -955,42 +991,21 @@ st.divider()
 # ── 2ter. POINTS DE VIGILANCE — SYNTHÈSE LGV SEA ────────────────────────────
 st.subheader("🧭 Points de vigilance — surveillance ligne LGV SEA")
 
-risk_sectors = (sectors_df[sectors_df["risk_level"] == "ELEVE"]
-                if "risk_level" in sectors_df.columns else pd.DataFrame())
-
 _firms_unverified = firms_err in ("fetch_failed", "invalid_key", "missing_key")
 
-vig_cols = st.columns(5)
+vig_cols = st.columns(4)
 vig_cols[0].badge(
     "Vigilance MF — non vérifié" if not mf_ok else f"Vigilance MF ({len(mf_alerts)})",
     icon="🛡️", color="gray" if not mf_ok else ("red" if mf_alerts else "green"))  # type: ignore[arg-type]
 vig_cols[1].badge(
-    f"Risque structurel ({len(risk_sectors)})",
-    icon="🏗️", color="red" if len(risk_sectors) else "green")
-vig_cols[2].badge(
     "Météo — non vérifié" if met_ok == 0 else f"Météo ({len(active_met)})",
     icon="🌦️", color="gray" if met_ok == 0 else ("orange" if active_met else "green"))  # type: ignore[arg-type]
-vig_cols[3].badge(
+vig_cols[2].badge(
     "Vigicrue — non vérifié" if not vc_ok else f"Vigicrue ({len(vc_active)})",
     icon="🏞️", color="gray" if not vc_ok else ("blue" if vc_active else "green"))  # type: ignore[arg-type]
-vig_cols[4].badge(
+vig_cols[3].badge(
     "FIRMS — non vérifié" if _firms_unverified else f"FIRMS ({len(firms_alerts)})",
     icon="🔥", color="gray" if _firms_unverified else ("red" if firms_alerts else "green"))  # type: ignore[arg-type]
-
-if not risk_sectors.empty:
-    with st.expander(f"🏗️ Secteurs à risque structurel élevé ({len(risk_sectors)}) — analyse géotechnique/IA"):
-        _cols = [c for c in ["pk_km","commune_name","departement_name","ai_pred_risk_level",
-                              "ai_pred_score","ai_dominant_soil_type","ai_top_factors"]
-                 if c in risk_sectors.columns]
-        _disp_risk = risk_sectors[_cols].sort_values("pk_km").rename(columns={
-            "pk_km":"PK (km)", "commune_name":"Commune", "departement_name":"Département",
-            "ai_pred_risk_level":"Risque IA", "ai_pred_score":"Score IA",
-            "ai_dominant_soil_type":"Sol dominant", "ai_top_factors":"Facteurs déterminants",
-        })
-        if "Facteurs déterminants" in _disp_risk.columns:
-            _disp_risk["Facteurs déterminants"] = _disp_risk["Facteurs déterminants"].apply(
-                lambda v: ", ".join(v) if isinstance(v, list) else v)
-        st.dataframe(_disp_risk, use_container_width=True, hide_index=True, height=280)
 
 if mf_alerts or active_met or vc_active or firms_alerts:
     with st.expander("⚠️ Détail des alertes actives (vigilance MF, météo, crues, incendie)", expanded=True):
