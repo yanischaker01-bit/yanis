@@ -407,7 +407,7 @@ def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | Non
     return best_pk, math.sqrt(best_dist2) if best_dist2 is not None else None
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=300)
 def _fetch_firms_source_raw(key: str, source: str, day_range: int) -> pd.DataFrame:
     url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX, day_range=day_range)
     r = requests.get(url, timeout=20)
@@ -463,7 +463,7 @@ def _firms_conf_label(raw) -> str:
     return FIRMS_CONF_LABELS.get(s, str(raw))
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=300)
 def load_firms_alerts(_polyline: list, day_range: int = 1,
                        radius_km: float = FIRMS_RADIUS_KM) -> tuple[list, str | None]:
     """Détections FIRMS filtrées à moins de `radius_km` de la LGV SEA, avec PK et distance."""
@@ -942,9 +942,12 @@ else:
                f"de la LGV SEA ({firms_window_label.lower()}).")
 
 st.caption(
-    "Source : NASA FIRMS · VIIRS NOAA-20/NOAA-21/S-NPP (quasi temps réel, résolution ~375 m) · "
+    "Source : NASA FIRMS · VIIRS NOAA-20/NOAA-21/S-NPP (résolution ~375 m) · "
     "[firms.modaps.eosdis.nasa.gov/map](https://firms.modaps.eosdis.nasa.gov/map) — "
-    "PK et distance calculés par projection sur le tracé LGV SEA."
+    "PK et distance calculés par projection sur le tracé LGV SEA. "
+    "Vérifié toutes les 5 min ici, mais un satellite ne survole un même point que "
+    "2 fois par jour environ, avec 1 à 3 h de traitement avant publication : "
+    "actualiser plus souvent ne fait pas apparaître une détection plus tôt que ça."
 )
 
 st.divider()
