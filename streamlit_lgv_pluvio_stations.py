@@ -260,88 +260,132 @@ _DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
 
 @st.cache_data(ttl=1800)
 def load_vigicrue_rivers() -> tuple[list, bool]:
-    """Vigilance crues des cours d'eau à proximité de la LGV SEA (API Vigicrue XML).
-    Retourne (alertes, ok). ok=False uniquement si l'API n'a jamais pu être
-    interrogée avec succès — sans ce distinguo, une panne réseau et un "aucune
-    crue en cours" légitime produiraient le même résultat vide, donc le même
-    message rassurant à tort."""
-    VC_LEVEL = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
-    results: list = []
-    parsed_ok = False
+    """Charge la vigilance crues officielle pour les cours d'eau LGV SEA.
 
-    # TypEntVigiCru=3 = tronçons (sections de cours d'eau) — principal format Vigicrue v2
-    for params in [{"TypEntVigiCru": 3}, {}]:
+    L'ancien appel ``/services/2/InfoVigiCrue.xml`` n'est pas un endpoint
+    public valide. L'API documentee expose le referentiel en JSON sous
+    ``/services/v1.1/TerEntVigiCru.json``. On charge la liste des territoires,
+    puis leur detail afin de recuperer les troncons et leur niveau de vigilance.
+    """
+    api_url = "https://www.vigicrues.gouv.fr/services/v1.1/TerEntVigiCru.json"
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "LGV-PluvioStations/1.0 (+https://lgvpluviostations.streamlit.app/)",
+    }
+    level_by_number = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
+    level_by_name = {
+        "vert": "VERT", "green": "VERT",
+        "jaune": "JAUNE", "yellow": "JAUNE",
+        "orange": "ORANGE",
+        "rouge": "ROUGE", "red": "ROUGE",
+    }
+
+    def walk(value):
+        """Parcourt tous les dictionnaires d'une reponse JSON imbriquee."""
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk(child)
+
+    def first(item: dict, keys: tuple[str, ...]):
+        for key in keys:
+            value = item.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    def vigilance_level(item: dict) -> str | None:
+        raw = first(item, (
+            "NivVigiCru", "NivVigiCruHydro", "NivVig",
+            "NiveauVigilance", "CdCouleur", "Couleur", "couleur",
+        ))
+        if raw is None:
+            return None
+        normalized = _normalize(str(raw)).strip()
+        if normalized in level_by_name:
+            return level_by_name[normalized]
         try:
-            r = requests.get(
-                "https://www.vigicrues.gouv.fr/services/2/InfoVigiCrue.xml",
-                params=params, timeout=15,
-                headers={"Accept": "application/xml,text/xml,*/*"},
+            return level_by_number.get(int(float(normalized)))
+        except (TypeError, ValueError):
+            return None
+
+    results: list = []
+    successful_responses = 0
+
+    try:
+        response = requests.get(api_url, headers=headers, timeout=(5, 25))
+        response.raise_for_status()
+        territories_payload = response.json()
+        successful_responses += 1
+    except (requests.RequestException, ValueError):
+        return [], False
+
+    territories = territories_payload.get("ListEntVigiCru", [])
+    if not isinstance(territories, list):
+        return [], False
+
+    for territory in territories:
+        if not isinstance(territory, dict):
+            continue
+        code = territory.get("CdEntVigiCru")
+        entity_type = territory.get("TypEntVigiCru", "5")
+        if not code:
+            continue
+        try:
+            response = requests.get(
+                api_url,
+                params={"CdEntVigiCru": code, "TypEntVigiCru": entity_type},
+                headers=headers,
+                timeout=(5, 25),
             )
-            if r.status_code != 200:
-                continue
-            content = r.content.strip()
-            if not content.startswith(b"<"):
-                continue
-
-            root = ET.fromstring(content)
-            parsed_ok = True
-            found = False
-
-            for elem in root.iter():
-                # Name: Vigicrue v2 uses LibTroncon or NomTroncon; fallback to others
-                name = ""
-                for attr in ("LibTroncon", "NomTroncon", "NomEntVigiCru",
-                             "LibEntVigiCru", "NomCoursDeau", "Nom", "lib"):
-                    name = elem.get(attr, "")
-                    if name:
-                        break
-                if not name:
-                    continue
-
-                # Vigilance level: NivVigiCru is standard in v2
-                niv_raw = ""
-                for attr in ("NivVigiCru", "NivVigiCruHydro", "NivVig", "couleur"):
-                    niv_raw = elem.get(attr, "")
-                    if niv_raw:
-                        break
-                if not niv_raw:
-                    continue
-                try:
-                    niv = int(float(niv_raw))
-                except ValueError:
-                    continue
-
-                dep_raw = (elem.get("CdDep") or elem.get("CdEntVigiCru")
-                           or elem.get("CDDep") or "")
-                name_norm = _normalize(name)
-                is_lgv = any(rv in name_norm for rv in RIVERS_LGV)
-                dep_ok = (not dep_raw) or (dep_raw in _DEP_OK)
-
-                if is_lgv and dep_ok:
-                    lvl = VC_LEVEL.get(niv, "VERT")
-                    results.append(dict(
-                        riviere=name, dep=dep_raw, level=lvl, type="VIGICRUE",
-                        msg=f"{name} — vigilance {lvl.lower()}",
-                    ))
-                    found = True
-
-            if found:
-                break
-        except Exception:
+            response.raise_for_status()
+            payload = response.json()
+            successful_responses += 1
+        except (requests.RequestException, ValueError):
             continue
 
-    # Deduplicate
+        for item in walk(payload):
+            name = first(item, (
+                "LbEntVigiCru", "LibEntVigiCru", "NomEntVigiCru",
+                "LibTroncon", "NomTroncon", "NomCoursDeau", "Nom", "lib",
+            ))
+            level = vigilance_level(item)
+            if not name or not level:
+                continue
+
+            name = str(name).strip()
+            name_norm = _normalize(name)
+            if not any(river in name_norm for river in RIVERS_LGV):
+                continue
+
+            dep_raw = first(item, ("CdDep", "CDDep", "CodeDepartement"))
+            dep = str(dep_raw).zfill(2) if dep_raw not in (None, "") else ""
+            if dep and dep not in _DEP_OK:
+                continue
+
+            results.append({
+                "riviere": name,
+                "dep": dep,
+                "level": level,
+                "type": "VIGICRUE",
+                "msg": f"{name} — vigilance {level.lower()}",
+            })
+
+    # Une reponse API valide sans alerte LGV est un resultat legitime.
+    parsed_ok = successful_responses > 0
+
     seen: set = set()
     dedup: list = []
     for item in results:
-        key = (_normalize(item["riviere"])[:25], item["level"])
+        key = (_normalize(item["riviere"]), item["level"])
         if key not in seen:
             seen.add(key)
             dedup.append(item)
 
-    # Sort: highest level first, then by name
     dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
-
     return dedup, parsed_ok
 
 
