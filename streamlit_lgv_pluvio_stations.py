@@ -734,6 +734,54 @@ def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
 
 
 
+# Charte graphique commune aux graphiques météo/pluviométrie.
+# Cette couche de présentation est indépendante du traitement NASA FIRMS.
+CHART_COLORS = {
+    "blue": "#2563eb", "cyan": "#0891b2", "teal": "#0f766e",
+    "orange": "#f97316", "red": "#dc2626", "slate": "#475569",
+}
+CHART_GRID = "#e2e8f0"
+CHART_TEXT = "#334155"
+
+
+def style_weather_chart(fig: go.Figure, *, height: int = 340,
+                        hovermode: str = "x unified") -> go.Figure:
+    """Applique une présentation homogène sans modifier les données du graphe."""
+    fig.update_layout(
+        height=height,
+        hovermode=hovermode,
+        font=dict(family="Arial, sans-serif", size=12, color=CHART_TEXT),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        margin=dict(t=48, b=48, l=56, r=44),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02,
+            xanchor="left", x=0, bgcolor="rgba(255,255,255,0.85)",
+        ),
+        hoverlabel=dict(bgcolor="white", font_size=12, font_color="#0f172a"),
+        transition=dict(duration=250),
+    )
+    fig.update_xaxes(
+        showgrid=False, showline=True, linecolor="#cbd5e1",
+        tickcolor="#cbd5e1", automargin=True, title=None,
+    )
+    fig.update_yaxes(
+        showgrid=True, gridcolor=CHART_GRID, gridwidth=1,
+        zeroline=True, zerolinecolor="#cbd5e1", automargin=True,
+    )
+    return fig
+
+
+def show_weather_chart(fig: go.Figure, *, height: int = 340,
+                       hovermode: str = "x unified") -> None:
+    """Affiche un graphe météo responsive avec une barre d'outils allégée."""
+    style_weather_chart(fig, height=height, hovermode=hovermode)
+    st.plotly_chart(
+        fig, use_container_width=True,
+        config={"displayModeBar": False, "responsive": True},
+    )
+
+
 def safe_df(records) -> pd.DataFrame:
     if isinstance(records, list) and records:
         try:
@@ -744,14 +792,39 @@ def safe_df(records) -> pd.DataFrame:
 
 
 def alert_card(a: dict):
+    """Carte d'alerte plus lisible. FIRMS conserve volontairement son rendu initial."""
     lvl   = a.get("level", "")
     atype = a.get("type", "")
     icon  = a.get("icon") or ALERT_CFG.get(atype, ("", ""))[0] or None
-    c_badge, c_msg = st.columns([1, 7], vertical_alignment="center")
-    with c_badge:
-        st.badge(LEVEL_LABEL.get(lvl, lvl or "Info"), color=LEVEL_BADGE.get(lvl, "gray"))  # type: ignore[arg-type]
-    with c_msg:
-        st.markdown(f"{icon}  {a.get('msg','')}" if icon else a.get("msg", ""))
+
+    # Ne pas modifier la présentation ni le comportement des alertes NASA FIRMS.
+    if atype == "FEU_FIRMS":
+        c_badge, c_msg = st.columns([1, 7], vertical_alignment="center")
+        with c_badge:
+            st.badge(LEVEL_LABEL.get(lvl, lvl or "Info"), color=LEVEL_BADGE.get(lvl, "gray"))  # type: ignore[arg-type]
+        with c_msg:
+            st.markdown(f"{icon}  {a.get('msg','')}" if icon else a.get("msg", ""))
+        return
+
+    label = ALERT_CFG.get(atype, ("", atype.replace("_", " ").title()))[1]
+    color = LEVEL_COLOR.get(lvl, LEVEL_COLOR["INFO"])
+    date_label = a.get("date", "")
+    dep_label = f"Dép. {a['dep']}" if a.get("dep") else ""
+    meta = " · ".join(str(v) for v in (label, dep_label, date_label) if v)
+
+    with st.container(border=True):
+        c_icon, c_body, c_level = st.columns([0.45, 6.4, 1.15], vertical_alignment="center")
+        with c_icon:
+            st.markdown(f"<div style='font-size:1.45rem;text-align:center'>{icon or 'ℹ️'}</div>", unsafe_allow_html=True)
+        with c_body:
+            st.markdown(f"**{meta or label}**")
+            st.caption(str(a.get("msg", "")))
+        with c_level:
+            st.markdown(
+                f"<div style='border-left:4px solid {color};padding-left:.55rem;font-weight:700;color:{color}'>"
+                f"{LEVEL_LABEL.get(lvl, lvl or 'Info')}</div>",
+                unsafe_allow_html=True,
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1120,7 +1193,7 @@ else:
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(t=10, b=30, l=10, r=90),
         )
-        st.plotly_chart(fig_top, use_container_width=True)
+        show_weather_chart(fig_top, height=420, hovermode="closest")
 
         # Courbes journalières : top 3 en couleur (identité), le reste du TOP 20 en gris (contexte)
         HIGHLIGHT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
@@ -1143,7 +1216,7 @@ else:
             legend=dict(orientation="h", y=1.15),
             margin=dict(t=35, b=20, l=20, r=20),
         )
-        st.plotly_chart(fig_curve, use_container_width=True)
+        show_weather_chart(fig_curve, height=390)
         st.caption("Courbes : les 3 communes les plus arrosées de ce TOP 20 sont mises en évidence "
                    "(couleur + légende) · les 17 autres apparaissent en gris clair pour le contexte.")
 
@@ -1225,7 +1298,7 @@ if selected_multi and not sectors_df.empty:
                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                 margin=dict(t=10, b=30, l=10, r=90),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            show_weather_chart(fig, height=360, hovermode="closest")
             _src = "AROME Météo-France 1,3 km" if periode == "24h" else "ERA5 near real-time"
             st.caption(f"Source : Open-Meteo {_src} · {date_str}")
 
@@ -1275,7 +1348,7 @@ if not fc_df.empty:
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(t=30, b=20, l=20, r=80), xaxis=dict(tickangle=-20),
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    show_weather_chart(fig2, height=380)
 else:
     st.info("Prévisions indisponibles.")
 
@@ -1289,10 +1362,16 @@ if not monthly_df.empty:
         labels={"mois":"Mois","pluie_mm":"Pluie (mm)"}, text="pluie_mm",
     )
     fig3.update_traces(texttemplate="%{text:.0f}", textposition="outside")
+    monthly_mean = float(monthly_df["pluie_mm"].mean())
+    fig3.add_hline(
+        y=monthly_mean, line_dash="dash", line_color=CHART_COLORS["teal"],
+        annotation_text=f"Moyenne : {monthly_mean:.0f} mm",
+        annotation_position="top left",
+    )
     fig3.update_layout(coloraxis_showscale=False, height=260,
                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                        margin=dict(t=20,b=20,l=20,r=20), xaxis=dict(tickangle=-30))
-    st.plotly_chart(fig3, use_container_width=True)
+    show_weather_chart(fig3, height=350, hovermode="closest")
 else:
     st.info("Historique indisponible.")
 
