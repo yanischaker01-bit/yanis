@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -16,20 +17,23 @@ import requests
 import streamlit as st
 from streamlit_folium import st_folium
 
+# ════════════════════════════════════════════════════════════════════════════
+# 1. CONFIGURATION & CONSTANTES
+# ════════════════════════════════════════════════════════════════════════════
+
 SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
-# NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
+# NASA FIRMS
 FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}/{date}"
-FIRMS_SOURCES  = ["VIIRS_NOAA21_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"]  # résolution ~375 m
-FIRMS_BBOX     = "-0.7,44.75,1.0,47.5"  # west,south,east,north — corridor LGV SEA + marge
+FIRMS_SOURCES  = ["VIIRS_NOAA21_NRT", "VIIRS_NOAA20_NRT", "VIIRS_SNPP_NRT"]
+FIRMS_BBOX     = "-0.7,44.75,1.0,47.5"
 FIRMS_RADIUS_KM = 0.5
-FIRMS_MAX_DAY_RANGE = 10   # limite de l'API area (une seule requête par source)
-FIRMS_MAX_LOOKBACK_DAYS = 60  # au-delà, le NRT n'est plus garanti disponible
+FIRMS_MAX_DAY_RANGE = 10
+FIRMS_MAX_LOOKBACK_DAYS = 60
 
-# Vigilance météo officielle Météo-France, republiée en open data (sans clé) sur Opendatasoft —
-# mêmes bulletins que vigilance.meteofrance.fr, source de référence utilisée par SNCF/préfectures.
+# Météo-France Vigilance
 MF_VIGILANCE_URL     = "https://public.opendatasoft.com/api/records/1.0/search/"
 MF_VIGILANCE_DATASET = "weatherref-france-vigilance-meteo-departement"
 MF_PHENOMENON_LABELS = {
@@ -42,6 +46,7 @@ MF_PHENOMENON_LABELS = {
 }
 MF_COLOR_TO_LEVEL = {"vert": "VERT", "jaune": "JAUNE", "orange": "ORANGE", "rouge": "ROUGE"}
 
+# Départements LGV SEA
 DEPS = {
     "37": {"nom": "Indre-et-Loire",   "lat": 47.38, "lon":  0.69},
     "86": {"nom": "Vienne",            "lat": 46.58, "lon":  0.34},
@@ -64,9 +69,71 @@ ALERT_CFG = {
 LEVEL_COLOR = {"ROUGE":"#dc2626","ORANGE":"#ea580c","JAUNE":"#eab308","VERT":"#16a34a","INFO":"#3b82f6"}
 LEVEL_RANK  = {"ROUGE":4,"ORANGE":3,"JAUNE":2,"VERT":1,"INFO":0}
 LEVEL_LABEL = {"ROUGE":"Rouge","ORANGE":"Orange","JAUNE":"Jaune","VERT":"Vert","INFO":"Info"}
-# st.badge only accepts this fixed palette — map our 5 severity levels onto it.
 LEVEL_BADGE = {"ROUGE":"red","ORANGE":"orange","JAUNE":"yellow","VERT":"green","INFO":"gray"}
 
+# Cours d'eau LGV SEA
+_RIVERS_RAW = [
+    "vienne", "clain", "charente", "boutonne", "seugne", "touvre",
+    "dronne", "isle", "dordogne", "garonne", "thouet", "sevre",
+    "indre", "cher", "creuse", "ciron", "jalles", "estey",
+    "leyre", "midouze", "brion", "anglin",
+]
+RIVERS_LGV = [_normalize(r) for r in _RIVERS_RAW]
+_DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
+
+CHART_COLORS = {
+    "blue": "#2563eb", "cyan": "#0891b2", "teal": "#0f766e",
+    "orange": "#f97316", "red": "#dc2626", "slate": "#475569",
+}
+CHART_GRID = "#e2e8f0"
+CHART_TEXT = "#334155"
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2. FONCTIONS UTILITAIRES (retry, normalisation, etc.)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _normalize(s: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFD", s.lower())
+        if unicodedata.category(c) != "Mn"
+    )
+
+def http_get_with_retry(url, params=None, max_retries=3, timeout=15, **kwargs):
+    """Requête HTTP avec backoff exponentiel et validation basique de la réponse."""
+    last_exception = None
+    for attempt in range(max_retries):
+        try:
+            r = requests.get(url, params=params, timeout=timeout, **kwargs)
+            r.raise_for_status()
+            # Si la réponse est vide ou contient un message d'erreur connu, on la considère comme invalide.
+            content = r.text.strip()
+            if not content:
+                raise ValueError("Réponse vide")
+            if "invalid" in content.lower()[:200]:
+                raise ValueError("invalid_key")
+            if "<html" in content.lower()[:200]:
+                raise RuntimeError("Réponse HTML inattendue")
+            return r
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            last_exception = e
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s
+    raise last_exception or RuntimeError("Échec inconnu")
+
+def safe_extract_daily(data: dict) -> pd.DataFrame | None:
+    """Extrait et valide les données quotidiennes d'Open-Meteo."""
+    if not isinstance(data, dict):
+        return None
+    times = data.get("time")
+    rains = data.get("precipitation_sum")
+    if not times or not rains or len(times) != len(rains):
+        return None
+    df = pd.DataFrame({"date": times, "pluie_mm": rains})
+    df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
+    # Rejeter les valeurs aberrantes (pluie négative)
+    df.loc[df["pluie_mm"] < 0, "pluie_mm"] = 0.0
+    return df
 
 def rain_risk(max_mm: float):
     if max_mm >= 60: return "ROUGE",  "#dc2626", "🔴"
@@ -80,39 +147,38 @@ def rain_color_mm(mm: float) -> str:
     if mm >= 10: return "#3b82f6"
     return "#93c5fd"
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi    = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
+    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
+
+# ════════════════════════════════════════════════════════════════════════════
+# 3. CHARGEMENT DES DONNÉES (avec retry, fallback et niveaux de confiance)
+# ════════════════════════════════════════════════════════════════════════════
 
 @st.cache_data(ttl=900)
 def _fetch_snapshot_raw() -> dict:
-    r = requests.get(SNAPSHOT_URL, timeout=20)
-    r.raise_for_status()
+    r = http_get_with_retry(SNAPSHOT_URL, timeout=20)
     return r.json()
 
-
 def load_snapshot() -> dict:
-    """Seules les réponses réussies sont mises en cache (via _fetch_snapshot_raw) :
-    un échec réseau ponctuel n'immobilise pas l'appli 15 min, il est retenté au
-    prochain rerun au lieu de rester figé jusqu'à expiration du TTL."""
     try:
         return _fetch_snapshot_raw()
     except Exception as e:
         return {"_error": str(e)}
 
-
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=1800)  # 30 min (bulletin MF actualisé 2x/jour)
 def _fetch_mf_vigilance_raw(dep_codes: tuple) -> list:
     q = " OR ".join(f"domain_id:{d}" for d in dep_codes)
-    r = requests.get(MF_VIGILANCE_URL, params={
+    r = http_get_with_retry(MF_VIGILANCE_URL, params={
         "dataset": MF_VIGILANCE_DATASET, "q": q, "rows": 100,
     }, timeout=15)
-    r.raise_for_status()
     return r.json().get("records", [])
 
-
 def load_meteofrance_vigilance() -> tuple[list, bool]:
-    """Vigilance officielle Météo-France (aujourd'hui J / demain J1) par département,
-    republiée en open data sans clé — mêmes bulletins que vigilance.meteofrance.fr.
-    Retourne (alertes non-vertes, ok). ok=False seulement si l'API n'a pas pu être
-    interrogée du tout (à ne pas confondre avec une vigilance verte légitime)."""
     try:
         records = _fetch_mf_vigilance_raw(tuple(sorted(DEPS.keys())))
     except Exception:
@@ -138,26 +204,18 @@ def load_meteofrance_vigilance() -> tuple[list, bool]:
     alerts.sort(key=lambda a: (-LEVEL_RANK.get(a["level"], 0), a["dep"]))
     return alerts, True
 
-
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=7200)  # 2h (prévisions mises à jour toutes les 6h)
 def _fetch_dept_forecast_raw(dep: str) -> dict:
     info = DEPS[dep]
-    r = requests.get(FORECAST_URL, params={
+    r = http_get_with_retry(FORECAST_URL, params={
         "latitude": info["lat"], "longitude": info["lon"],
         "daily": ("precipitation_sum,temperature_2m_max,"
                   "weathercode,wind_speed_10m_max"),
         "forecast_days": 7, "timezone": "Europe/Paris",
     }, timeout=15)
-    r.raise_for_status()
     return r.json().get("daily", {})
 
-
 def load_weather_alerts_all() -> tuple[list, int, int]:
-    """Alertes dérivées des prévisions Open-Meteo pour les 6 départements LGV SEA.
-    Retourne (alertes, nb_dept_ok, nb_dept_total) : si nb_dept_ok == 0, l'appelant
-    doit afficher un avertissement plutôt qu'un silencieux "aucune alerte"
-    (chaque département étant récupéré via une fonction cachée séparée, l'échec
-    de l'un n'empêche pas les autres d'être servis depuis leur propre cache)."""
     alerts = []
     ok_count = 0
     for dep in DEPS:
@@ -180,9 +238,8 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
             t = tmaxes[i]  or 0
             w = wcodes[i]  or 0
             v = winds[i]   or 0
-            d_str = date[5:]  # MM-DD
+            d_str = date[5:]
 
-            # ⛈️ Orages (WMO codes 80-82 averses, 95-99 orages)
             if w >= 99:
                 alerts.append(dict(dep=dep, date=date, type="ORAGE", level="ROUGE",
                     msg=f"Dép.{dep} le {d_str} — Orages violents avec grêle"))
@@ -193,7 +250,6 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
                 alerts.append(dict(dep=dep, date=date, type="ORAGE", level="JAUNE",
                     msg=f"Dép.{dep} le {d_str} — Averses orageuses"))
 
-            # 🌊 Inondation (précipitations intenses)
             if p >= 60:
                 alerts.append(dict(dep=dep, date=date, type="INONDATION", level="ROUGE",
                     msg=f"Dép.{dep} le {d_str} — Pluies diluviennes : {p:.0f} mm"))
@@ -204,7 +260,6 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
                 alerts.append(dict(dep=dep, date=date, type="INONDATION", level="JAUNE",
                     msg=f"Dép.{dep} le {d_str} — Pluies soutenues : {p:.0f} mm"))
 
-            # 🌡️ Canicule
             if t >= 40:
                 alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ROUGE",
                     msg=f"Dép.{dep} le {d_str} — Canicule extrême : {t:.0f}°C"))
@@ -215,7 +270,6 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
                 alerts.append(dict(dep=dep, date=date, type="CANICULE", level="ORANGE",
                     msg=f"Dép.{dep} le {d_str} — Forte chaleur : {t:.0f}°C"))
 
-            # 💨 Vent violent
             if v >= 100:
                 alerts.append(dict(dep=dep, date=date, type="VENT", level="ROUGE",
                     msg=f"Dép.{dep} le {d_str} — Vents très violents : {v:.0f} km/h"))
@@ -226,7 +280,6 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
                 alerts.append(dict(dep=dep, date=date, type="VENT", level="JAUNE",
                     msg=f"Dép.{dep} le {d_str} — Vents forts : {v:.0f} km/h"))
 
-            # 🔥 Risque incendie (chaleur + sécheresse + vent)
             if not seen_fire and t >= 30 and rain7 < 10 and v >= 25:
                 lvl = "ROUGE" if (t >= 35 and rain7 < 5 and v >= 35) else "ORANGE"
                 alerts.append(dict(dep=dep, date=date, type="INCENDIE", level=lvl,
@@ -237,36 +290,8 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
     alerts.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["date"]))
     return alerts, ok_count, len(DEPS)
 
-
-def _normalize(s: str) -> str:
-    """Lowercase + strip accents for robust name matching."""
-    return "".join(
-        c for c in unicodedata.normalize("NFD", s.lower())
-        if unicodedata.category(c) != "Mn"
-    )
-
-# Cours d'eau traversés ou longés par la LGV SEA Tours→Bordeaux
-_RIVERS_RAW = [
-    "vienne", "clain", "charente", "boutonne", "seugne", "touvre",
-    "dronne", "isle", "dordogne", "garonne", "thouet", "sevre",
-    "indre", "cher", "creuse", "ciron", "jalles", "estey",
-    "leyre", "midouze", "brion", "anglin",
-]
-RIVERS_LGV = [_normalize(r) for r in _RIVERS_RAW]
-
-# Departments along LGV SEA (filter unrelated rivers with same name elsewhere)
-_DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
-
-
 @st.cache_data(ttl=1800)
 def load_vigicrue_rivers() -> tuple[list, bool]:
-    """Charge la vigilance crues officielle pour les cours d'eau LGV SEA.
-
-    L'ancien appel ``/services/2/InfoVigiCrue.xml`` n'est pas un endpoint
-    public valide. L'API documentee expose le referentiel en JSON sous
-    ``/services/v1.1/TerEntVigiCru.json``. On charge la liste des territoires,
-    puis leur detail afin de recuperer les troncons et leur niveau de vigilance.
-    """
     api_url = "https://www.vigicrues.gouv.fr/services/v1.1/TerEntVigiCru.json"
     headers = {
         "Accept": "application/json",
@@ -281,7 +306,6 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
     }
 
     def walk(value):
-        """Parcourt tous les dictionnaires d'une reponse JSON imbriquee."""
         if isinstance(value, dict):
             yield value
             for child in value.values():
@@ -316,11 +340,10 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
     successful_responses = 0
 
     try:
-        response = requests.get(api_url, headers=headers, timeout=(5, 25))
-        response.raise_for_status()
+        response = http_get_with_retry(api_url, headers=headers, timeout=(5, 25))
         territories_payload = response.json()
         successful_responses += 1
-    except (requests.RequestException, ValueError):
+    except Exception:
         return [], False
 
     territories = territories_payload.get("ListEntVigiCru", [])
@@ -335,16 +358,15 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
         if not code:
             continue
         try:
-            response = requests.get(
+            response = http_get_with_retry(
                 api_url,
                 params={"CdEntVigiCru": code, "TypEntVigiCru": entity_type},
                 headers=headers,
                 timeout=(5, 25),
             )
-            response.raise_for_status()
             payload = response.json()
             successful_responses += 1
-        except (requests.RequestException, ValueError):
+        except Exception:
             continue
 
         for item in walk(payload):
@@ -374,9 +396,7 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
                 "msg": f"{name} — vigilance {level.lower()}",
             })
 
-    # Une reponse API valide sans alerte LGV est un resultat legitime.
     parsed_ok = successful_responses > 0
-
     seen: set = set()
     dedup: list = []
     for item in results:
@@ -388,10 +408,8 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
     dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
     return dedup, parsed_ok
 
-
+# FIRMS
 def get_firms_map_key() -> str | None:
-    """Clé API FIRMS : st.secrets['FIRMS_MAP_KEY'] ou variable d'env FIRMS_MAP_KEY.
-    Clé gratuite : https://firms.modaps.eosdis.nasa.gov/api/map_key/"""
     try:
         key = st.secrets.get("FIRMS_MAP_KEY")
         if key:
@@ -400,65 +418,11 @@ def get_firms_map_key() -> str | None:
         pass
     return os.environ.get("FIRMS_MAP_KEY")
 
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371.0088
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi    = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlambda / 2) ** 2
-    return 2 * R * math.asin(min(1.0, math.sqrt(a)))
-
-
-@st.cache_data(ttl=3600)
-def build_lgv_pk_polyline(_lgv_lines) -> list[tuple[float, float, float]]:
-    """[(lat, lon, pk_km cumulé), ...] à partir du 1er tracé LGV du snapshot.
-    Le cumul de distance haversine le long du tracé colle au pk_km réel (écart < 100 m)."""
-    if not _lgv_lines:
-        return []
-    seg = _lgv_lines[0]
-    pts = [(p["lat"], p["lon"]) for p in seg if isinstance(p, dict) and "lat" in p and "lon" in p]
-    if len(pts) < 2:
-        return []
-    out = [(pts[0][0], pts[0][1], 0.0)]
-    cum = 0.0
-    for (lat1, lon1), (lat2, lon2) in zip(pts, pts[1:]):
-        cum += _haversine_km(lat1, lon1, lat2, lon2)
-        out.append((lat2, lon2, cum))
-    return out
-
-
-def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | None, float | None]:
-    """Retourne (pk_km, distance_km) du point le plus proche du tracé LGV.
-    Projection sur chaque segment en repère métrique local (correction cos(latitude))."""
-    if len(polyline) < 2:
-        return None, None
-    best_dist2 = None
-    best_pk    = None
-    for (lat1, lon1, pk1), (lat2, lon2, pk2) in zip(polyline, polyline[1:]):
-        lat_mid = (lat1 + lat2) / 2.0
-        kx = 111.320 * math.cos(math.radians(lat_mid))
-        ky = 111.320
-        x1, y1 = lon1 * kx, lat1 * ky
-        x2, y2 = lon2 * kx, lat2 * ky
-        xp, yp = lon * kx, lat * ky
-        dx, dy = x2 - x1, y2 - y1
-        seg_len2 = dx * dx + dy * dy
-        t = 0.0 if seg_len2 == 0 else max(0.0, min(1.0, ((xp - x1) * dx + (yp - y1) * dy) / seg_len2))
-        cx, cy = x1 + t * dx, y1 + t * dy
-        dist2 = (xp - cx) ** 2 + (yp - cy) ** 2
-        if best_dist2 is None or dist2 < best_dist2:
-            best_dist2 = dist2
-            best_pk = pk1 + t * (pk2 - pk1)
-    return best_pk, math.sqrt(best_dist2) if best_dist2 is not None else None
-
-
 @st.cache_data(ttl=300)
 def _fetch_firms_source_raw(key: str, source: str, day_range: int, date_str: str) -> pd.DataFrame:
     url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX,
                                  day_range=day_range, date=date_str)
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
+    r = http_get_with_retry(url, timeout=20)
     txt = r.text.strip()
     if "invalid" in txt.lower()[:200]:
         raise ValueError("invalid_key")
@@ -470,14 +434,7 @@ def _fetch_firms_source_raw(key: str, source: str, day_range: int, date_str: str
     df["source"] = source
     return df
 
-
 def load_firms_hotspots(day_range: int = 1, end_date=None) -> tuple[pd.DataFrame, str | None]:
-    """Détections FIRMS (VIIRS NRT) sur la bbox du corridor LGV SEA, sur `day_range`
-    jours se terminant le `end_date` (par défaut aujourd'hui — permet de remonter
-    dans le temps, jusqu'à `FIRMS_MAX_LOOKBACK_DAYS` en arrière).
-    Distingue explicitement « aucune détection » (chaque source a répondu, 0 résultat)
-    de « échec de la vérification » (aucune source n'a pu être interrogée) — sans quoi
-    une panne réseau/API afficherait à tort un statut "aucun feu" rassurant mais faux."""
     key = get_firms_map_key()
     if not key:
         return pd.DataFrame(), "missing_key"
@@ -502,21 +459,52 @@ def load_firms_hotspots(day_range: int = 1, end_date=None) -> tuple[pd.DataFrame
         return pd.DataFrame(), None
     return pd.concat(frames, ignore_index=True), None
 
-
 FIRMS_CONF_LABELS = {"l": "Faible", "n": "Nominale", "h": "Élevée"}
 
-
 def _firms_conf_label(raw) -> str:
-    """VIIRS renvoie un code lettre (l/n/h) peu lisible tel quel — MODIS renvoie un %
-    numérique déjà clair. On ne traduit que le premier cas, l'autre passe inchangé."""
     s = str(raw).strip().lower()
     return FIRMS_CONF_LABELS.get(s, str(raw))
 
+@st.cache_data(ttl=300)
+def build_lgv_pk_polyline(_lgv_lines) -> list[tuple[float, float, float]]:
+    if not _lgv_lines:
+        return []
+    seg = _lgv_lines[0]
+    pts = [(p["lat"], p["lon"]) for p in seg if isinstance(p, dict) and "lat" in p and "lon" in p]
+    if len(pts) < 2:
+        return []
+    out = [(pts[0][0], pts[0][1], 0.0)]
+    cum = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(pts, pts[1:]):
+        cum += _haversine_km(lat1, lon1, lat2, lon2)
+        out.append((lat2, lon2, cum))
+    return out
+
+def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | None, float | None]:
+    if len(polyline) < 2:
+        return None, None
+    best_dist2 = None
+    best_pk    = None
+    for (lat1, lon1, pk1), (lat2, lon2, pk2) in zip(polyline, polyline[1:]):
+        lat_mid = (lat1 + lat2) / 2.0
+        kx = 111.320 * math.cos(math.radians(lat_mid))
+        ky = 111.320
+        x1, y1 = lon1 * kx, lat1 * ky
+        x2, y2 = lon2 * kx, lat2 * ky
+        xp, yp = lon * kx, lat * ky
+        dx, dy = x2 - x1, y2 - y1
+        seg_len2 = dx * dx + dy * dy
+        t = 0.0 if seg_len2 == 0 else max(0.0, min(1.0, ((xp - x1) * dx + (yp - y1) * dy) / seg_len2))
+        cx, cy = x1 + t * dx, y1 + t * dy
+        dist2 = (xp - cx) ** 2 + (yp - cy) ** 2
+        if best_dist2 is None or dist2 < best_dist2:
+            best_dist2 = dist2
+            best_pk = pk1 + t * (pk2 - pk1)
+    return best_pk, math.sqrt(best_dist2) if best_dist2 is not None else None
 
 @st.cache_data(ttl=300)
 def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
                        radius_km: float = FIRMS_RADIUS_KM) -> tuple[list, str | None]:
-    """Détections FIRMS filtrées à moins de `radius_km` de la LGV SEA, avec PK et distance."""
     df, err = load_firms_hotspots(day_range, end_date)
     if err:
         return [], err
@@ -558,39 +546,38 @@ def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
     alerts.sort(key=lambda a: a["pk_km"])
     return alerts, None
 
+# ─── DONNÉES PLUVIOMÉTRIQUES FIABILISÉES (avec source et confiance) ───
 
 @st.cache_data(ttl=3600)
-def _fetch_commune_daily_series_raw(lat: float, lon: float, days: int) -> dict:
-    end   = datetime.now(timezone.utc).date()
-    start = end - timedelta(days=days - 1)
-    r = requests.get(ARCHIVE_URL, params={
+def _fetch_archive_rain_raw(lat: float, lon: float, start_date, end_date, model=None) -> dict | None:
+    params = {
         "latitude": lat, "longitude": lon,
-        "start_date": str(start), "end_date": str(end),
+        "start_date": str(start_date), "end_date": str(end_date),
         "daily": "precipitation_sum", "timezone": "Europe/Paris",
-    }, timeout=20)
-    r.raise_for_status()
-    return r.json().get("daily", {})
-
+    }
+    if model:
+        params["models"] = model
+    try:
+        r = http_get_with_retry(ARCHIVE_URL, params=params, timeout=20)
+        return r.json().get("daily", {})
+    except Exception:
+        return None
 
 def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
-    """Série journalière de pluie sur les `days` derniers jours — API archive ERA5
-    (réanalyse), pas l'API prévision : son paramètre `past_days` renvoie pour les
-    1-2 derniers jours une sortie modèle non recalée sur l'observé, constatée jusqu'à
-    11x plus élevée que l'ERA5 le même jour (45,6 mm vs 4,0 mm), ce qui gonflait
-    artificiellement les cumuls du classement TOP 20."""
-    try:
-        daily = _fetch_commune_daily_series_raw(lat, lon, days)
-    except Exception:
-        return pd.DataFrame()
-    df = pd.DataFrame({"date": daily.get("time", []),
-                        "pluie_mm": daily.get("precipitation_sum", [])})
-    df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
-    return df
+    """Série journalière : essaie d'abord ERA5‑Land (plus récent), puis ERA5 standard."""
+    end   = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
 
+    # Essayer ERA5-Land (délai plus court, résolution 0.1°)
+    for model in ["era5_land", None]:  # None = ERA5 standard
+        daily = _fetch_archive_rain_raw(lat, lon, start, end, model=model)
+        df = safe_extract_daily(daily)
+        if df is not None and not df.empty:
+            return df
+    return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def load_all_communes_daily_rain(_sectors_df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
-    """Série journalière de pluie pour chaque commune du corridor (1 requête/commune, cache 1h)."""
     if _sectors_df.empty or "commune_name" not in _sectors_df.columns:
         return pd.DataFrame()
     coords = (_sectors_df.dropna(subset=["latitude", "longitude"])
@@ -608,40 +595,36 @@ def load_all_communes_daily_rain(_sectors_df: pd.DataFrame, days: int = 30) -> p
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
 
-
-@st.cache_data(ttl=900)
-def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
-    """Cumul pluie.
-    24h  → API prévision Open-Meteo, AROME Météo-France 1,3 km si dispo, sinon
-           blend — la veille est un cycle déjà bouclé, pas une sortie modèle
-           non recalée (vérifié : identique à l'ERA5 sur un cas testé).
-    7j+  → API archive ERA5 (réanalyse), pas l'API prévision : son paramètre
-           `past_days` a été mesuré jusqu'à 2x plus élevé que l'ERA5 sur le
-           même point (46,4 mm vs 21,9 mm sur 7 j ; 71,1 mm vs 54,6 mm sur 30 j),
-           le même défaut que celui corrigé pour le TOP 20.
+@st.cache_data(ttl=1800)
+def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> dict:
+    """
+    Retourne {'value': float, 'source': str, 'confidence': str}
+    - 24h  : priorité AROME (modèle haute résolution), fallback ECMWF
+    - 7j/30j : priorité ERA5-Land, fallback ERA5
     """
     today = datetime.now(timezone.utc).date()
     lat_r, lon_r = round(lat, 4), round(lon, 4)
 
     if periode == "24h":
-        for model in ["meteofrance_arome_france", None]:
+        # Essayer AROME (modèle à 1.3 km pour la France)
+        for model in ["meteofrance_arome_france", "ecmwf_ifs"]:
             try:
-                params = {
+                r = http_get_with_retry(FORECAST_URL, params={
                     "latitude": lat_r, "longitude": lon_r,
                     "daily": "precipitation_sum",
                     "past_days": 1, "forecast_days": 0,
+                    "models": model,
                     "timezone": "Europe/Paris",
-                }
-                if model:
-                    params["models"] = model
-                r = requests.get(FORECAST_URL, params=params, timeout=15)
-                r.raise_for_status()
-                vals = r.json()["daily"]["precipitation_sum"]
-                if vals and any(v is not None for v in vals):
-                    return round(sum(v for v in vals if v is not None), 1)
+                }, timeout=12)
+                daily = r.json().get("daily", {})
+                df = safe_extract_daily(daily)
+                if df is not None and not df.empty:
+                    val = float(df["pluie_mm"].sum())
+                    conf = "élevée" if model == "meteofrance_arome_france" else "moyenne"
+                    return {"value": round(val, 1), "source": model, "confidence": conf}
             except Exception:
                 continue
-        return float("nan")
+        return {"value": float("nan"), "source": "aucune", "confidence": "inconnue"}
 
     if periode == "7 jours":
         days = 7
@@ -650,103 +633,80 @@ def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
     else:
         days = today.day - 1
     if days <= 0:
-        return 0.0
+        return {"value": 0.0, "source": "période nulle", "confidence": "élevée"}
 
     start = today - timedelta(days=days)
     end   = today - timedelta(days=1)
-    try:
-        r = requests.get(ARCHIVE_URL, params={
-            "latitude": lat_r, "longitude": lon_r,
-            "start_date": str(start), "end_date": str(end),
-            "daily": "precipitation_sum", "timezone": "Europe/Paris",
-        }, timeout=20)
-        r.raise_for_status()
-        vals = r.json()["daily"]["precipitation_sum"]
-        if vals:
-            return round(sum(v for v in vals if v is not None), 1)
-    except Exception:
-        pass
-    return float("nan")
+    # Essayer ERA5-Land puis ERA5 standard
+    for model in ["era5_land", None]:
+        daily = _fetch_archive_rain_raw(lat_r, lon_r, start, end, model=model)
+        df = safe_extract_daily(daily)
+        if df is not None and not df.empty:
+            val = float(df["pluie_mm"].sum())
+            src = "era5_land" if model else "era5"
+            conf = "élevée" if model else "bonne"
+            return {"value": round(val, 1), "source": src, "confidence": conf}
 
+    return {"value": float("nan"), "source": "aucune", "confidence": "inconnue"}
 
 @st.cache_data(ttl=3600)
-def _fetch_forecast_dep_raw(dep: str) -> dict:
-    d = DEPS[dep]
-    r = requests.get(FORECAST_URL, params={
-        "latitude": d["lat"], "longitude": d["lon"],
-        "daily": "precipitation_sum,weathercode",
-        "forecast_days": 7, "timezone": "Europe/Paris",
-    }, timeout=15)
-    r.raise_for_status()
-    return r.json()
-
-
 def load_forecast_dep(dep: str) -> dict:
     try:
-        return _fetch_forecast_dep_raw(dep)
+        return _fetch_dept_forecast_raw(dep)
     except Exception:
         return {}
-
 
 @st.cache_data(ttl=3600)
 def load_forecast_coord(lat: float, lon: float) -> pd.DataFrame:
     try:
-        r = requests.get(FORECAST_URL, params={
+        r = http_get_with_retry(FORECAST_URL, params={
             "latitude": lat, "longitude": lon,
             "daily": "precipitation_sum,precipitation_probability_max,temperature_2m_max",
             "forecast_days": 7, "timezone": "Europe/Paris",
         }, timeout=15)
-        r.raise_for_status()
         daily = r.json().get("daily", {})
-        return pd.DataFrame({
+        df = pd.DataFrame({
             "date":     daily.get("time", []),
             "pluie_mm": daily.get("precipitation_sum", []),
             "proba_%":  daily.get("precipitation_probability_max", []),
             "tmax":     daily.get("temperature_2m_max", []),
         })
+        df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0)
+        df["tmax"]     = pd.to_numeric(df["tmax"], errors="coerce").fillna(0)
+        return df
     except Exception:
         return pd.DataFrame()
-
 
 @st.cache_data(ttl=3600)
 def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
     end   = datetime.now(timezone.utc).date()
     start = (end.replace(day=1) - timedelta(days=365)).replace(day=1)
-    try:
-        r = requests.get(ARCHIVE_URL, params={
-            "latitude": lat, "longitude": lon,
-            "start_date": str(start), "end_date": str(end),
-            "daily": "precipitation_sum", "timezone": "Europe/Paris",
-        }, timeout=20)
-        r.raise_for_status()
-        data  = r.json()
-        dates = data["daily"]["time"]
-        rain  = data["daily"]["precipitation_sum"]
-        monthly: dict = defaultdict(float)
-        for d, v in zip(dates, rain):
-            if v is not None:
-                monthly[d[:7]] += v
-        return pd.DataFrame([{"mois": m, "pluie_mm": round(v, 1)}
-                              for m, v in sorted(monthly.items())])
-    except Exception:
-        return pd.DataFrame()
+    # On utilise ERA5-Land pour l'historique récent (si disponible)
+    for model in ["era5_land", None]:
+        daily = _fetch_archive_rain_raw(lat, lon, start, end, model=model)
+        df = safe_extract_daily(daily)
+        if df is not None and not df.empty:
+            monthly: dict = defaultdict(float)
+            for _, row in df.iterrows():
+                monthly[row["date"][:7]] += row["pluie_mm"]
+            return pd.DataFrame([{"mois": m, "pluie_mm": round(v, 1)}
+                                 for m, v in sorted(monthly.items())])
+    return pd.DataFrame()
 
+# ════════════════════════════════════════════════════════════════════════════
+# 4. FONCTIONS D'AFFICHAGE (UI)
+# ════════════════════════════════════════════════════════════════════════════
 
-
-
-# Charte graphique commune aux graphiques météo/pluviométrie.
-# Cette couche de présentation est indépendante du traitement NASA FIRMS.
-CHART_COLORS = {
-    "blue": "#2563eb", "cyan": "#0891b2", "teal": "#0f766e",
-    "orange": "#f97316", "red": "#dc2626", "slate": "#475569",
-}
-CHART_GRID = "#e2e8f0"
-CHART_TEXT = "#334155"
-
+def safe_df(records) -> pd.DataFrame:
+    if isinstance(records, list) and records:
+        try:
+            return pd.DataFrame(records)
+        except Exception:
+            pass
+    return pd.DataFrame()
 
 def style_weather_chart(fig: go.Figure, *, height: int = 340,
                         hovermode: str = "x unified") -> go.Figure:
-    """Applique une présentation homogène sans modifier les données du graphe."""
     fig.update_layout(
         height=height,
         hovermode=hovermode,
@@ -771,33 +731,19 @@ def style_weather_chart(fig: go.Figure, *, height: int = 340,
     )
     return fig
 
-
 def show_weather_chart(fig: go.Figure, *, height: int = 340,
                        hovermode: str = "x unified") -> None:
-    """Affiche un graphe météo responsive avec une barre d'outils allégée."""
     style_weather_chart(fig, height=height, hovermode=hovermode)
     st.plotly_chart(
         fig, use_container_width=True,
         config={"displayModeBar": False, "responsive": True},
     )
 
-
-def safe_df(records) -> pd.DataFrame:
-    if isinstance(records, list) and records:
-        try:
-            return pd.DataFrame(records)
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-
 def alert_card(a: dict):
-    """Carte d'alerte plus lisible. FIRMS conserve volontairement son rendu initial."""
     lvl   = a.get("level", "")
     atype = a.get("type", "")
     icon  = a.get("icon") or ALERT_CFG.get(atype, ("", ""))[0] or None
 
-    # Ne pas modifier la présentation ni le comportement des alertes NASA FIRMS.
     if atype == "FEU_FIRMS":
         c_badge, c_msg = st.columns([1, 7], vertical_alignment="center")
         with c_badge:
@@ -826,14 +772,16 @@ def alert_card(a: dict):
                 unsafe_allow_html=True,
             )
 
+# ════════════════════════════════════════════════════════════════════════════
+# 5. APPLICATION STREAMLIT
+# ════════════════════════════════════════════════════════════════════════════
 
-# ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="LGV SEA – Pluviométrie", page_icon="🌧", layout="wide")
-st.title("🌧 LGV SEA – Pluviométrie")
+st.title("🌧 LGV SEA – Pluviométrie (fiabilisé)")
 
 col_title, col_btn = st.columns([5, 1])
 col_title.caption(
-    "📡 Données météo : **Open-Meteo** (modèles ERA5 + ECMWF) · "
+    "📡 Données météo : **Open-Meteo** (modèles AROME, ECMWF, ERA5‑Land/ERA5) · "
     "Crues : **Vigicrue** · Données non officielles — "
     "pour les alertes officielles : "
     "[vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) · "
@@ -855,7 +803,7 @@ for col in ["weather_max_24h_mm","weather_max_7d_mm","weather_max_30d_mm",
     if col in sectors_df.columns:
         sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
 
-# Pre-compute dept forecast rain (used for map coloring + dept cards)
+# ─── Pré-calcul par département ─────────────────────────────────────────────
 RAIN_LABELS = {
     "VERT":   "Peu de pluie",
     "JAUNE":  "Pluie modérée",
@@ -863,7 +811,7 @@ RAIN_LABELS = {
     "ROUGE":  "Pluies très fortes",
     "INDETERMINE": "Indisponible",
 }
-dep_rain_data: dict = {}   # dep -> {max, total, lvl, color, emoji, ok}
+dep_rain_data: dict = {}
 for _dep in DEPS:
     _fc    = load_forecast_dep(_dep)
     _ok    = bool(_fc)
@@ -873,22 +821,17 @@ for _dep in DEPS:
     if _ok:
         _lvl, _color, _emoji = rain_risk(_max)
     else:
-        # Échec de récupération distinct d'un "peu de pluie" légitime — sans ce
-        # marqueur, une panne Open-Meteo afficherait à tort une carte verte rassurante.
         _lvl, _color, _emoji = "INDETERMINE", "#9ca3af", "❓"
     dep_rain_data[_dep] = {"max": _max, "total": _total,
-                            "lvl": _lvl, "color": _color, "emoji": _emoji, "ok": _ok}
-
+                           "lvl": _lvl, "color": _color, "emoji": _emoji, "ok": _ok}
 
 def nearest_dep(lat: float, lon: float) -> str:
-    """Return dep code nearest to a lat/lon (for map coloring)."""
     return min(DEPS.keys(),
                key=lambda d: (DEPS[d]["lat"] - lat) ** 2 + (DEPS[d]["lon"] - lon) ** 2)
 
-
-# ── 1. PLUIE PRÉVUE PAR DÉPARTEMENT ─────────────────────────────────────────
+# ── 1. PLUIE PRÉVUE PAR DÉPARTEMENT ──────────────────────────────────────────
 st.subheader("Pluie prévue 7 jours par département")
-st.caption("Source : Open-Meteo")
+st.caption("Source : Open-Meteo (modèle blend ECMWF/IFS)")
 dep_cols = st.columns(len(DEPS))
 for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
     d = dep_rain_data[dep]
@@ -920,11 +863,8 @@ else:
 
 st.caption(
     "Source officielle : [vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) — "
-    "données republiées en open data (sans clé), mêmes bulletins que l'appli officielle. "
-    "Les « indicateurs météo » ci-dessous sont une estimation complémentaire sur 7 jours, "
-    "pas une vigilance officielle."
+    "données republiées en open data (sans clé), mêmes bulletins que l'appli officielle."
 )
-
 st.divider()
 
 # ── 2. INDICATEURS MÉTÉO ─────────────────────────────────────────────────────
@@ -992,7 +932,6 @@ st.divider()
 communes = (sorted(sectors_df["commune_name"].dropna().unique())
             if "commune_name" in sectors_df.columns else [])
 
-# Communes par défaut : répartition géographique nord→sud sur la LGV SEA
 def _find_commune(kw: str) -> str | None:
     k = unicodedata.normalize("NFD", kw.lower()).encode("ascii", "ignore").decode()
     return next((c for c in communes
@@ -1089,20 +1028,15 @@ else:
     st.success(f"Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
                f"de la LGV SEA ({firms_window_label}).")
 
-_firms_freshness = (
-    "Vérifié toutes les 5 min ici, mais un satellite ne survole un même point que "
-    "2 fois par jour environ, avec 1 à 3 h de traitement avant publication : "
-    "actualiser plus souvent ne fait pas apparaître une détection plus tôt que ça."
-    if firms_is_live else
-    "Requête historique figée sur la période choisie — les résultats ne changeront "
-    "pas au fil des rafraîchissements."
-)
 st.caption(
     "Source : NASA FIRMS · VIIRS NOAA-20/NOAA-21/S-NPP (résolution ~375 m) · "
     "[firms.modaps.eosdis.nasa.gov/map](https://firms.modaps.eosdis.nasa.gov/map) — "
-    "PK et distance calculés par projection sur le tracé LGV SEA. " + _firms_freshness
+    "PK et distance calculés par projection sur le tracé LGV SEA. "
+    + ("Vérifié toutes les 5 min, mais un satellite ne survole un même point que "
+       "2 fois par jour environ, avec 1 à 3 h de traitement avant publication."
+       if firms_is_live else
+       "Requête historique figée sur la période choisie.")
 )
-
 st.divider()
 
 # ── 2ter. POINTS DE VIGILANCE — SYNTHÈSE LGV SEA ────────────────────────────
@@ -1195,7 +1129,7 @@ else:
         )
         show_weather_chart(fig_top, height=420, hovermode="closest")
 
-        # Courbes journalières : top 3 en couleur (identité), le reste du TOP 20 en gris (contexte)
+        # Courbes journalières
         HIGHLIGHT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
         fig_curve = go.Figure()
         for commune in reversed(top20_communes):
@@ -1225,12 +1159,11 @@ else:
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
                 use_container_width=True, hide_index=True,
             )
-    st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
-               "une requête par commune, mise en cache 1h.")
+    st.caption("Source : Open-Meteo ERA5‑Land / ERA5 (réanalyse) · une requête par commune, cache 1h.")
 
 st.divider()
 
-# ── 3. COMPARAISON COMMUNES ─────────────────────────────────────────────────
+# ── 3. COMPARAISON COMMUNES (AVEC SOURCE ET CONFIANCE) ──────────────────────
 if selected_multi and not sectors_df.empty:
     _today = datetime.now(timezone.utc).date()
     if periode == "24h":
@@ -1255,8 +1188,13 @@ if selected_multi and not sectors_df.empty:
                     continue
                 lat = round(float(loc["latitude"].mean()), 4)
                 lon = round(float(loc["longitude"].mean()), 4)
-                rain = load_commune_rain_ometo(lat, lon, periode)
-                rows.append({"commune_name": commune, "rain_mm": rain})
+                rain_info = load_commune_rain_ometo(lat, lon, periode)
+                rows.append({
+                    "commune_name": commune,
+                    "rain_mm": rain_info.get("value", float("nan")),
+                    "source": rain_info.get("source", "inconnue"),
+                    "confidence": rain_info.get("confidence", "inconnue")
+                })
 
         df_cmp = (pd.DataFrame(rows)
                   .dropna(subset=["rain_mm"])
@@ -1274,6 +1212,11 @@ if selected_multi and not sectors_df.empty:
                 date_str = f"{(today - timedelta(days=30)).strftime('%d/%m')} → {(today - timedelta(days=1)).strftime('%d/%m/%Y')}"
             else:
                 date_str = f"1er → {(today - timedelta(days=1)).strftime('%d/%m/%Y')}"
+
+            # Ajout de la source/confiance dans le caption
+            sources = df_cmp["source"].unique()
+            confs = df_cmp["confidence"].unique()
+            st.caption(f"🔍 Source : {', '.join(sources)} — confiance : {', '.join(confs)} · {date_str}")
 
             df_cmp["label"] = df_cmp["rain_mm"].apply(
                 lambda v: "Sec" if v == 0 else f"{v:.1f} mm")
@@ -1299,13 +1242,10 @@ if selected_multi and not sectors_df.empty:
                 margin=dict(t=10, b=30, l=10, r=90),
             )
             show_weather_chart(fig, height=360, hovermode="closest")
-            _src = "AROME Météo-France 1,3 km" if periode == "24h" else "ERA5 near real-time"
-            st.caption(f"Source : Open-Meteo {_src} · {date_str}")
 
             _missing = sorted(set(selected_multi) - set(df_cmp["commune_name"]))
             if _missing:
-                st.warning(f"Pas de donnée pluvio récupérée pour : {', '.join(_missing)} "
-                           "— absentes du graphique ci-dessus, pas de valeur à 0 supposée.")
+                st.warning(f"Pas de donnée pluvio récupérée pour : {', '.join(_missing)}")
 
 # ── 4. PRÉVISIONS 7J ────────────────────────────────────────────────────────
 comm_df = (sectors_df if selected_one == "— Toutes —"
@@ -1321,7 +1261,7 @@ st.subheader(f"🔮 Prévisions 7 jours — {label_loc}")
 fc_df = load_forecast_coord(lat_c, lon_c)
 if not fc_df.empty:
     fc_df["pluie_mm"] = pd.to_numeric(fc_df["pluie_mm"], errors="coerce").fillna(0)
-    fc_df["tmax"]     = pd.to_numeric(fc_df["tmax"],     errors="coerce").fillna(0)
+    fc_df["tmax"]     = pd.to_numeric(fc_df["tmax"], errors="coerce").fillna(0)
     fc_df["color"]    = fc_df["pluie_mm"].apply(rain_color_mm)
     fig2 = go.Figure()
     fig2.add_bar(x=fc_df["date"], y=fc_df["pluie_mm"],
@@ -1349,6 +1289,7 @@ if not fc_df.empty:
         margin=dict(t=30, b=20, l=20, r=80), xaxis=dict(tickangle=-20),
     )
     show_weather_chart(fig2, height=380)
+    st.caption("Source : Open-Meteo (modèle blend ECMWF/IFS) — confiance bonne pour J1–J3, modérée pour J4–J7")
 else:
     st.info("Prévisions indisponibles.")
 
@@ -1372,6 +1313,7 @@ if not monthly_df.empty:
                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                        margin=dict(t=20,b=20,l=20,r=20), xaxis=dict(tickangle=-30))
     show_weather_chart(fig3, height=350, hovermode="closest")
+    st.caption("Source : Open-Meteo ERA5‑Land / ERA5 (réanalyse) — données recalées, fiabilité élevée")
 else:
     st.info("Historique indisponible.")
 
@@ -1385,26 +1327,28 @@ if not map_df.empty:
     )
 
     if selected_one != "— Toutes —":
-        # Single commune: fetch Open-Meteo rain and color markers
         loc_single = map_df.dropna(subset=["latitude","longitude"])
         if not loc_single.empty:
             lat_s = round(float(loc_single["latitude"].mean()), 4)
             lon_s = round(float(loc_single["longitude"].mean()), 4)
-            rain_s = load_commune_rain_ometo(lat_s, lon_s, periode)
+            rain_info = load_commune_rain_ometo(lat_s, lon_s, periode)
+            rain_s = rain_info.get("value", float("nan"))
             rain_label_s = f"{rain_s:.1f} mm" if not pd.isna(rain_s) else "N/A"
+            source_s = rain_info.get("source", "")
+            conf_s = rain_info.get("confidence", "")
             col_s = rain_color_mm(rain_s) if not pd.isna(rain_s) else "#9ca3af"
         for _, row in map_df.dropna(subset=["latitude","longitude"]).iterrows():
             folium.CircleMarker(
                 [float(row["latitude"]), float(row["longitude"])],
                 radius=7, color=col_s, fill=True, fill_opacity=0.85, weight=1.5,
-                tooltip=f"{row.get('commune_name','')} PK {row.get('pk_km','')} km — {rain_label_s} ({periode})",
+                tooltip=f"{row.get('commune_name','')} PK {row.get('pk_km','')} km — {rain_label_s} ({periode}) | {source_s}",
                 popup=folium.Popup(
                     f"<b>{row.get('commune_name','')} — PK {row.get('pk_km','')} km</b><br>"
                     f"Cumul {periode} : <b>{rain_label_s}</b><br>"
-                    f"<small>Source : Open-Meteo AROME 1,3 km</small>", max_width=250),
+                    f"Source : {source_s} (confiance {conf_s})<br>"
+                    f"<small>Données Open-Meteo</small>", max_width=250),
             ).add_to(m)
     else:
-        # All communes: color by nearest dept's forecast (no per-sector API calls)
         for _, row in map_df.dropna(subset=["latitude","longitude"]).iterrows():
             rlat = float(row["latitude"]); rlon = float(row["longitude"])
             dep  = nearest_dep(rlat, rlon)
@@ -1446,8 +1390,8 @@ if not map_df.empty:
 
     st_folium(m, use_container_width=True, height=450, returned_objects=[])
     if selected_one == "— Toutes —":
-        st.caption("Couleur = prévision pluie 7j par département (Open-Meteo). "
-                   "Sélectionner une commune pour voir son cumul mesuré.")
+        st.caption("Couleur = prévision pluie 7j par département (Open‑Meteo). "
+                   "Sélectionner une commune pour voir son cumul mesuré avec source et confiance.")
 else:
     st.info("Pas de données de localisation.")
 
@@ -1457,15 +1401,17 @@ show_cols = [c for c in ["commune_name","pk_km"] if c in comm_df.columns]
 disp = comm_df[show_cols].rename(columns={"commune_name":"Commune","pk_km":"PK (km)"})
 
 if selected_one != "— Toutes —" and not disp.empty:
-    # Add Open-Meteo rain for the selected commune
     loc_t = comm_df.dropna(subset=["latitude","longitude"]) if "latitude" in comm_df.columns else pd.DataFrame()
     if not loc_t.empty:
         lat_t = round(float(loc_t["latitude"].mean()), 4)
         lon_t = round(float(loc_t["longitude"].mean()), 4)
-        rain_t = load_commune_rain_ometo(lat_t, lon_t, periode)
-        disp[f"Cumul {periode} (mm)"] = rain_t if not pd.isna(rain_t) else None
-        _src_lbl = "AROME 1,3 km" if periode == "24h" else "ERA5 near real-time"
-        st.caption(f"Pluie : Open-Meteo {_src_lbl} · cumul {periode}")
+        rain_info = load_commune_rain_ometo(lat_t, lon_t, periode)
+        rain_t = rain_info.get("value", None)
+        disp[f"Cumul {periode} (mm)"] = rain_t if rain_t is not None else "N/A"
+        disp["Source"] = rain_info.get("source", "inconnue")
+        disp["Confiance"] = rain_info.get("confidence", "inconnue")
+        _src_lbl = "AROME" if periode == "24h" else "ERA5-Land/ERA5"
+        st.caption(f"Pluie : Open-Meteo {_src_lbl} · cumul {periode} · source et confiance affichées dans le tableau")
 elif not disp.empty:
     st.caption("ℹ️ Voir **Comparaison communes** ci-dessus pour les données pluvio fiables (Open-Meteo).")
 
