@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import folium
 import pandas as pd
@@ -35,17 +36,72 @@ FACTOR_LABELS = {
 CHART_LAYOUT = dict(plot_bgcolor="white", paper_bgcolor="white", margin=dict(t=20, b=20, l=20, r=20))
 
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_snapshot():
-    last_err: Exception | None = None
-    for _ in range(2):
+    """Charge le snapshot le plus récent, local ou distant.
+
+    Le fichier local permet à l'application de fonctionner même si GitHub Pages
+    est momentanément indisponible. Le fichier distant permet de récupérer la
+    dernière collecte publiée par GitHub Actions.
+    """
+    candidates = []
+    errors = []
+
+    local_paths = [
+        Path(__file__).resolve().parent / "reports" / "streamlit_snapshot_latest.json",
+        Path.cwd() / "reports" / "streamlit_snapshot_latest.json",
+    ]
+
+    for path in local_paths:
         try:
-            r = requests.get(SNAPSHOT_URL, timeout=20)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-    return {"_error": str(last_err) if last_err else "erreur inconnue"}
+            if path.is_file() and path.stat().st_size > 0:
+                with path.open("r", encoding="utf-8") as file:
+                    payload = file.read()
+                data = requests.models.complexjson.loads(payload)
+                if isinstance(data, dict) and data:
+                    candidates.append(("local", str(path), data))
+                    break
+        except Exception as error:
+            errors.append(f"Local {path}: {error}")
+
+    try:
+        response = requests.get(
+            SNAPSHOT_URL,
+            timeout=(10, 30),
+            headers={
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "User-Agent": "LGV-SEA-Monitoring/1.0",
+            },
+            params={"v": int(datetime.now(timezone.utc).timestamp() // 300)},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or not data:
+            raise ValueError("réponse JSON vide ou de format inattendu")
+        candidates.append(("distant", SNAPSHOT_URL, data))
+    except Exception as error:
+        errors.append(f"Distant {SNAPSHOT_URL}: {error}")
+
+    if not candidates:
+        return {
+            "_error": "Aucun snapshot valide n'a pu être chargé.",
+            "_details": errors,
+        }
+
+    def timestamp_value(candidate):
+        raw = candidate[2].get("timestamp_utc", "")
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
+
+    source_type, source_name, selected = max(candidates, key=timestamp_value)
+    selected = dict(selected)
+    selected["_snapshot_source"] = source_type
+    selected["_snapshot_location"] = source_name
+    selected["_load_warnings"] = errors
+    return selected
 
 
 def safe_df(records) -> pd.DataFrame:
@@ -72,7 +128,7 @@ def safe_float(value, default: float = 0.0) -> float:
 @st.cache_data(ttl=3600)
 def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
     end = datetime.now(timezone.utc).date()
-    start = (end.replace(day=1) - timedelta(days=365)).replace(day=1)
+    start = datetime(2021, 1, 1).date()
     try:
         r = requests.get(ARCHIVE_URL, params={
             "latitude": lat, "longitude": lon,
@@ -195,6 +251,13 @@ if not isinstance(snapshot, dict) or "_error" in snapshot:
 
 ts = snapshot.get("timestamp_utc", "")
 age_min = data_age_minutes(ts) if ts else None
+if snapshot.get("_load_warnings"):
+    with st.expander("État des sources de données", expanded=False):
+        st.caption(f"Source utilisée : {snapshot.get('_snapshot_source', 'inconnue')}")
+        st.caption(f"Emplacement : {snapshot.get('_snapshot_location', 'inconnu')}")
+        for warning in snapshot.get("_load_warnings", []):
+            st.warning(warning)
+
 if ts:
     caption = f"Données : {ts[:16].replace('T', ' ')} UTC"
     if age_min is not None:
@@ -252,7 +315,7 @@ st.divider()
 # ── Sidebar ──────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Filtres")
-    if st.button("🔄 Rafraîchir", use_container_width=True):
+    if st.button("🔄 Rafraîchir", width="stretch"):
         st.cache_data.clear()
         st.rerun()
 
@@ -321,7 +384,7 @@ with tab_carte:
                     popup=folium.Popup(popup, max_width=280),
                 ).add_to(m)
             st.caption("Couleur = niveau de risque prédit par l'IA (glissement). Taille = probabilité.")
-            st_folium(m, use_container_width=True, height=480, returned_objects=[])
+            st_folium(m, width=1400, height=520, returned_objects=[])
         except Exception as e:
             st.warning(f"Carte indisponible pour le moment ({e}).")
 
@@ -355,7 +418,7 @@ with tab_analyses:
             fig.add_hline(y=85, line_dash="dash", line_color="#7f1d1d", annotation_text="Seuil critique")
             fig.update_layout(xaxis_title="PK (km)", yaxis_title="Probabilité IA (%) / Score mesuré",
                                height=320, legend=dict(orientation="h", y=1.12), **CHART_LAYOUT)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         except Exception as e:
             st.warning(f"Profil indisponible ({e}).")
 
@@ -372,7 +435,7 @@ with tab_analyses:
                               name="Prédiction IA", marker_color="#3b82f6")
             fig_dist.update_layout(barmode="group", yaxis_title="Nombre de secteurs", height=280,
                                     legend=dict(orientation="h", y=1.15), **CHART_LAYOUT)
-            st.plotly_chart(fig_dist, use_container_width=True)
+            st.plotly_chart(fig_dist, width="stretch")
         except Exception as e:
             st.warning(f"Répartition indisponible ({e}).")
     else:
@@ -398,7 +461,7 @@ with tab_analyses:
                 fig_factors.add_bar(x=factors_df["secteurs"], y=factors_df["facteur"], orientation="h",
                                      marker_color="#7c3aed")
                 fig_factors.update_layout(xaxis_title="Nombre de secteurs concernés", height=280, **CHART_LAYOUT)
-                st.plotly_chart(fig_factors, use_container_width=True)
+                st.plotly_chart(fig_factors, width="stretch")
         except Exception as e:
             st.warning(f"Facteurs indisponibles ({e}).")
     else:
@@ -407,7 +470,7 @@ with tab_analyses:
 # ── Historique ───────────────────────────────────────────────────────────
 with tab_hist:
     hist_label = selected if selected != "— Toutes —" else "LGV SEA (centroïde)"
-    st.markdown(f"**Historique pluviométrique 12 mois — {hist_label}**")
+    st.markdown(f"**Historique pluviométrique depuis 2021 — {hist_label}**")
     if map_df.empty:
         st.info("Pas de localisation pour l'historique.")
     else:
@@ -423,7 +486,7 @@ with tab_hist:
                                   marker_color="#3b82f6", text=monthly_df["pluie_mm"], textposition="outside")
                 fig_hist.update_layout(xaxis_title="Mois", yaxis_title="Pluie (mm)", height=300,
                                         xaxis=dict(tickangle=-30), **CHART_LAYOUT)
-                st.plotly_chart(fig_hist, use_container_width=True)
+                st.plotly_chart(fig_hist, width="stretch")
         except Exception as e:
             st.warning(f"Historique indisponible ({e}).")
 
@@ -529,7 +592,7 @@ with tab_secteurs:
                 "Risque",
                 key=lambda s: s.map(lambda x: RISK_RANK.get(str(x), 0)),
                 ascending=False, na_position="last")
-        st.dataframe(disp, use_container_width=True, hide_index=True, height=360)
+        st.dataframe(disp, width="stretch", hide_index=True, height=360)
 
 # ── Communes ────────────────────────────────────────────────────────────
 with tab_communes:
@@ -553,7 +616,7 @@ with tab_communes:
         if "Proba IA max" in disp_cr.columns:
             disp_cr["Proba IA max"] = fmt_pct(disp_cr["Proba IA max"])
         st.markdown("**Classement communes**")
-        st.dataframe(disp_cr, use_container_width=True, hide_index=True, height=380)
+        st.dataframe(disp_cr, width="stretch", hide_index=True, height=380)
 
         if {"commune_name", "commune_note"}.issubset(cr.columns):
             st.markdown("**Top 10 communes les plus à risque**")
@@ -570,7 +633,7 @@ with tab_communes:
                     fig_top.update_layout(xaxis_title="Note de risque (/100)", yaxis=dict(autorange="reversed"),
                                            height=340, margin=dict(t=20, b=20, l=20, r=40),
                                            plot_bgcolor="white", paper_bgcolor="white")
-                    st.plotly_chart(fig_top, use_container_width=True)
+                    st.plotly_chart(fig_top, width="stretch")
             except Exception as e:
                 st.warning(f"Graphe top communes indisponible ({e}).")
 
