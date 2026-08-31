@@ -4,7 +4,9 @@ on:
   push:
     branches:
       - main
+
   workflow_dispatch:
+
   schedule:
     - cron: "15 * * * *"
 
@@ -19,69 +21,286 @@ concurrency:
 
 jobs:
   build:
+    name: Collecte et construction du dashboard
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run dashboard generation
+      - name: Create required directories
         run: |
-          python run_once_dashboard.py || (sleep 20 && python run_once_dashboard.py) || true
-
-      - name: Fetch carte LGV SEA from gh-pages
-        run: |
-          git fetch origin gh-pages
+          mkdir -p data
+          mkdir -p reports
           mkdir -p site
-          git archive origin/gh-pages | tar -x -C site/
 
-      - name: Add dashboard and snapshot
+      - name: Initialize and collect monitoring data
         run: |
-          mkdir -p site/dashboard/reports site/reports
-          if [ ! -f reports/lgv_dashboard_latest.html ]; then
-            echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
-          fi
-          if [ ! -f reports/streamlit_snapshot_latest.json ]; then
-            echo "{}" > reports/streamlit_snapshot_latest.json
-          fi
-          cp reports/lgv_dashboard_latest.html site/dashboard/index.html
-          cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
-          cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
-          cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
+          python run_collection.py \
+            --once \
+            --max-distance-km 25 \
+            --verbose
 
-      - name: Wake Streamlit pluvio app
-        env:
-          STREAMLIT_APP_URL: https://lgvpluviostations.streamlit.app/
+      - name: Generate dashboard and Streamlit snapshot
         run: |
-          curl -L --silent --show-error --max-time 120 "$STREAMLIT_APP_URL" > /dev/null || true
+          python run_once_dashboard.py
+
+      - name: Verify generated files
+        run: |
+          if [ ! -s reports/lgv_dashboard_latest.html ]; then
+            echo "::error::Le dashboard HTML est absent ou vide."
+            exit 1
+          fi
+
+          if [ ! -s reports/streamlit_snapshot_latest.json ]; then
+            echo "::error::Le snapshot Streamlit est absent ou vide."
+            exit 1
+          fi
+
+          echo "Fichiers générés :"
+          ls -lh reports/
+
+      - name: Validate Streamlit snapshot
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          snapshot_path = Path(
+              "reports/streamlit_snapshot_latest.json"
+          )
+
+          if not snapshot_path.exists():
+              print(
+                  "::error::Le fichier "
+                  "reports/streamlit_snapshot_latest.json "
+                  "n'existe pas."
+              )
+              sys.exit(1)
+
+          if snapshot_path.stat().st_size == 0:
+              print("::error::Le snapshot est vide.")
+              sys.exit(1)
+
+          try:
+              with snapshot_path.open(
+                  "r",
+                  encoding="utf-8",
+              ) as file:
+                  snapshot = json.load(file)
+
+          except json.JSONDecodeError as error:
+              print(
+                  f"::error::Le snapshot JSON est invalide : {error}"
+              )
+              sys.exit(1)
+
+          if not isinstance(snapshot, dict):
+              print(
+                  "::error::Le contenu du snapshot "
+                  "n'est pas un objet JSON."
+              )
+              sys.exit(1)
+
+          if not snapshot:
+              print(
+                  "::error::Le snapshot contient uniquement un objet vide."
+              )
+              sys.exit(1)
+
+          timestamp = snapshot.get("timestamp_utc")
+
+          if not timestamp:
+              print(
+                  "::error::Le champ timestamp_utc "
+                  "est absent du snapshot."
+              )
+              sys.exit(1)
+
+          try:
+              snapshot_datetime = datetime.fromisoformat(
+                  str(timestamp).replace("Z", "+00:00")
+              )
+
+              if snapshot_datetime.tzinfo is None:
+                  snapshot_datetime = snapshot_datetime.replace(
+                      tzinfo=timezone.utc
+                  )
+
+              snapshot_datetime = snapshot_datetime.astimezone(
+                  timezone.utc
+              )
+
+          except ValueError as error:
+              print(
+                  f"::error::Timestamp UTC invalide : {error}"
+              )
+              sys.exit(1)
+
+          now = datetime.now(timezone.utc)
+
+          age_hours = (
+              now - snapshot_datetime
+          ).total_seconds() / 3600
+
+          print(f"Date actuelle UTC : {now.isoformat()}")
+          print(f"Date du snapshot : {snapshot_datetime.isoformat()}")
+          print(f"Âge du snapshot : {age_hours:.2f} heure(s)")
+
+          if age_hours < -1:
+              print(
+                  "::error::La date du snapshot est située "
+                  "dans le futur."
+              )
+              sys.exit(1)
+
+          if age_hours > 3:
+              print(
+                  "::error::Le snapshot a plus de trois heures. "
+                  "Le déploiement est annulé."
+              )
+              sys.exit(1)
+
+          sectors = snapshot.get("sectors")
+
+          if not sectors:
+              print(
+                  "::warning::Le snapshot ne contient "
+                  "aucune donnée secteur."
+              )
+
+          print("Snapshot valide et suffisamment récent.")
+          PY
+
+      - name: Fetch existing LGV site from gh-pages
+        run: |
+          if git ls-remote --exit-code \
+            --heads origin gh-pages > /dev/null 2>&1
+          then
+            git fetch origin gh-pages
+            git archive origin/gh-pages | tar -x -C site/
+            echo "Contenu existant de gh-pages récupéré."
+          else
+            echo "Branche gh-pages absente."
+            echo "Le site sera construit à partir des fichiers générés."
+          fi
+
+      - name: Add dashboard and snapshot to site
+        run: |
+          mkdir -p site/dashboard/reports
+          mkdir -p site/reports
+
+          cp \
+            reports/lgv_dashboard_latest.html \
+            site/dashboard/index.html
+
+          cp \
+            reports/lgv_dashboard_latest.html \
+            site/dashboard/reports/lgv_dashboard_latest.html
+
+          cp \
+            reports/streamlit_snapshot_latest.json \
+            site/dashboard/reports/streamlit_snapshot_latest.json
+
+          cp \
+            reports/streamlit_snapshot_latest.json \
+            site/reports/streamlit_snapshot_latest.json
+
+      - name: Verify published snapshot
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          source_path = Path(
+              "reports/streamlit_snapshot_latest.json"
+          )
+
+          published_path = Path(
+              "site/reports/streamlit_snapshot_latest.json"
+          )
+
+          with source_path.open(
+              "r",
+              encoding="utf-8",
+          ) as file:
+              source = json.load(file)
+
+          with published_path.open(
+              "r",
+              encoding="utf-8",
+          ) as file:
+              published = json.load(file)
+
+          source_timestamp = source.get("timestamp_utc")
+          published_timestamp = published.get("timestamp_utc")
+
+          print(f"Source : {source_timestamp}")
+          print(f"Publication : {published_timestamp}")
+
+          if source_timestamp != published_timestamp:
+              raise ValueError(
+                  "Le snapshot publié ne correspond pas "
+                  "au snapshot généré."
+              )
+
+          print("Copie du snapshot vérifiée.")
+          PY
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
         with:
           enablement: true
 
-      - name: Upload artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
+    name: Publication GitHub Pages
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     runs-on: ubuntu-latest
     needs: build
+
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Wake Streamlit monitoring app
+        env:
+          STREAMLIT_APP_URL: "https://lgv-sea-monitoring-meteo-gc.streamlit.app/"
+        run: |
+          echo "Réveil de l'application Streamlit : $STREAMLIT_APP_URL"
+
+          curl \
+            --location \
+            --silent \
+            --show-error \
+            --max-time 120 \
+            --retry 2 \
+            --retry-delay 10 \
+            "$STREAMLIT_APP_URL" \
+            > /dev/null \
+            || echo "::warning::L'application Streamlit n'a pas répondu."
