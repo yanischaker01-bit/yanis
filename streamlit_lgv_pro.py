@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import folium
 import pandas as pd
@@ -35,16 +36,37 @@ FACTOR_LABELS = {
 CHART_LAYOUT = dict(plot_bgcolor="white", paper_bgcolor="white", margin=dict(t=20, b=20, l=20, r=20))
 
 
-@st.cache_data(ttl=900)
-def load_snapshot():
+@st.cache_data(ttl=300, show_spinner=False)
+def load_snapshot(refresh_token: int = 0):
+    """Charge le dernier snapshot en limitant les caches GitHub/CDN.
+
+    refresh_token change lors d'un rafraichissement manuel afin de forcer
+    une nouvelle requete. Cela ne modifie pas la date du snapshot si le
+    fichier source n'a pas ete regenere.
+    """
     last_err: Exception | None = None
-    for _ in range(2):
+    for attempt in range(2):
         try:
-            r = requests.get(SNAPSHOT_URL, timeout=20)
+            cache_buster = int(datetime.now(timezone.utc).timestamp())
+            r = requests.get(
+                SNAPSHOT_URL,
+                params={"v": cache_buster, "refresh": refresh_token},
+                headers={
+                    "Cache-Control": "no-cache, no-store, max-age=0",
+                    "Pragma": "no-cache",
+                    "User-Agent": "LGV-SEA-Monitoring/1.0",
+                },
+                timeout=25,
+            )
             r.raise_for_status()
-            return r.json()
+            payload = r.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Le snapshot JSON n'est pas un objet valide")
+            return payload
         except Exception as e:
             last_err = e
+            if attempt == 0:
+                continue
     return {"_error": str(last_err) if last_err else "erreur inconnue"}
 
 
@@ -165,9 +187,65 @@ def humanize_alert_message(message: str, lookup: dict) -> str:
 def data_age_minutes(timestamp_utc: str) -> float | None:
     try:
         dt = datetime.fromisoformat(timestamp_utc.replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 60.0
+        return max(0.0, age)
     except Exception:
         return None
+
+
+def format_data_age(age_minutes: float | None) -> str:
+    if age_minutes is None:
+        return "age inconnu"
+    if age_minutes < 60:
+        return f"il y a {age_minutes:.0f} min"
+    age_hours = age_minutes / 60.0
+    if age_hours < 48:
+        return f"il y a {age_hours:.1f} h"
+    return f"il y a {age_hours / 24.0:.1f} jours"
+
+
+def display_data_freshness(timestamp_utc: str, age_minutes: float | None) -> bool:
+    """Affiche la fraicheur et retourne True uniquement si le snapshot est exploitable."""
+    if not timestamp_utc or age_minutes is None:
+        st.error("Date des donnees inconnue. Les alertes internes sont suspendues.")
+        return False
+
+    try:
+        dt_utc = datetime.fromisoformat(timestamp_utc.replace("Z", "+00:00"))
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        dt_local = dt_utc.astimezone(ZoneInfo("Europe/Paris"))
+        local_label = dt_local.strftime("%d/%m/%Y a %H:%M")
+        utc_label = dt_utc.astimezone(timezone.utc).strftime("%d/%m/%Y a %H:%M UTC")
+    except Exception:
+        local_label = timestamp_utc
+        utc_label = timestamp_utc
+
+    age_label = format_data_age(age_minutes)
+    if age_minutes <= STALE_MINUTES:
+        st.success(f"Donnees a jour : {local_label} heure locale ({utc_label}), {age_label}.")
+        return True
+
+    if age_minutes <= 24 * 60:
+        st.warning(
+            f"Actualisation retardee : derniere donnee le {local_label} heure locale "
+            f"({utc_label}), {age_label}. Les resultats doivent etre verifies."
+        )
+        return False
+
+    st.error(
+        f"Donnees obsoletes : derniere actualisation le {local_label} heure locale "
+        f"({utc_label}), {age_label}. Les indicateurs, probabilites et alertes internes "
+        "issus du snapshot sont suspendus."
+    )
+    st.info(
+        "Le bouton Rafraichir force une nouvelle lecture du fichier JSON. "
+        "Si la date ne change pas, le processus qui genere streamlit_snapshot_latest.json "
+        "doit etre relance ou repare."
+    )
+    return False
 
 
 st.set_page_config(page_title="LGV SEA – Pluvio & glissements", page_icon="🌧", layout="wide")
@@ -185,7 +263,10 @@ st.markdown(
 )
 st.title("🌧 LGV SEA – Pluviométrie & prédiction glissements")
 
-snapshot = load_snapshot()
+if "snapshot_refresh_token" not in st.session_state:
+    st.session_state.snapshot_refresh_token = 0
+
+snapshot = load_snapshot(st.session_state.snapshot_refresh_token)
 
 if not isinstance(snapshot, dict) or "_error" in snapshot:
     err = snapshot.get("_error", "format inattendu") if isinstance(snapshot, dict) else "format inattendu"
@@ -195,11 +276,7 @@ if not isinstance(snapshot, dict) or "_error" in snapshot:
 
 ts = snapshot.get("timestamp_utc", "")
 age_min = data_age_minutes(ts) if ts else None
-if ts:
-    caption = f"Données : {ts[:16].replace('T', ' ')} UTC"
-    if age_min is not None:
-        caption += f" (il y a {age_min:.0f} min)" if age_min < 120 else f" (il y a {age_min / 60:.1f} h)"
-    st.caption(caption)
+snapshot_fresh = display_data_freshness(ts, age_min)
 
 sectors_payload = safe_dict(snapshot.get("sectors"))
 sectors_df = safe_df(sectors_payload.get("sectors", []))
@@ -234,7 +311,12 @@ k4.metric("Probabilité IA moyenne", f"{safe_float(sector_summary.get('ai_mean_p
 k5.metric("Secteurs sol fragile", int(sector_summary.get("fragile_soil_sectors", 0)))
 
 st.subheader("🚨 Alertes secteurs")
-if not sector_alerts:
+if not snapshot_fresh:
+    st.warning(
+        "Alertes internes masquees : le snapshot depasse le seuil de "
+        f"{STALE_MINUTES / 60:.0f} h. Les vigilances officielles doivent etre consultees separement."
+    )
+elif not sector_alerts:
     st.success("Aucun secteur en alerte actuellement.")
 else:
     for a in sector_alerts:
@@ -252,7 +334,8 @@ st.divider()
 # ── Sidebar ──────────────────────────────────────────────────────────────
 with st.sidebar:
     st.subheader("Filtres")
-    if st.button("🔄 Rafraîchir", use_container_width=True):
+    if st.button("🔄 Rafraîchir les données", width="stretch"):
+        st.session_state.snapshot_refresh_token += 1
         st.cache_data.clear()
         st.rerun()
 
@@ -355,7 +438,7 @@ with tab_analyses:
             fig.add_hline(y=85, line_dash="dash", line_color="#7f1d1d", annotation_text="Seuil critique")
             fig.update_layout(xaxis_title="PK (km)", yaxis_title="Probabilité IA (%) / Score mesuré",
                                height=320, legend=dict(orientation="h", y=1.12), **CHART_LAYOUT)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
         except Exception as e:
             st.warning(f"Profil indisponible ({e}).")
 
@@ -372,7 +455,7 @@ with tab_analyses:
                               name="Prédiction IA", marker_color="#3b82f6")
             fig_dist.update_layout(barmode="group", yaxis_title="Nombre de secteurs", height=280,
                                     legend=dict(orientation="h", y=1.15), **CHART_LAYOUT)
-            st.plotly_chart(fig_dist, use_container_width=True)
+            st.plotly_chart(fig_dist, width="stretch")
         except Exception as e:
             st.warning(f"Répartition indisponible ({e}).")
     else:
@@ -398,7 +481,7 @@ with tab_analyses:
                 fig_factors.add_bar(x=factors_df["secteurs"], y=factors_df["facteur"], orientation="h",
                                      marker_color="#7c3aed")
                 fig_factors.update_layout(xaxis_title="Nombre de secteurs concernés", height=280, **CHART_LAYOUT)
-                st.plotly_chart(fig_factors, use_container_width=True)
+                st.plotly_chart(fig_factors, width="stretch")
         except Exception as e:
             st.warning(f"Facteurs indisponibles ({e}).")
     else:
@@ -423,7 +506,7 @@ with tab_hist:
                                   marker_color="#3b82f6", text=monthly_df["pluie_mm"], textposition="outside")
                 fig_hist.update_layout(xaxis_title="Mois", yaxis_title="Pluie (mm)", height=300,
                                         xaxis=dict(tickangle=-30), **CHART_LAYOUT)
-                st.plotly_chart(fig_hist, use_container_width=True)
+                st.plotly_chart(fig_hist, width="stretch")
         except Exception as e:
             st.warning(f"Historique indisponible ({e}).")
 
@@ -529,7 +612,7 @@ with tab_secteurs:
                 "Risque",
                 key=lambda s: s.map(lambda x: RISK_RANK.get(str(x), 0)),
                 ascending=False, na_position="last")
-        st.dataframe(disp, use_container_width=True, hide_index=True, height=360)
+        st.dataframe(disp, width="stretch", hide_index=True, height=360)
 
 # ── Communes ────────────────────────────────────────────────────────────
 with tab_communes:
@@ -553,7 +636,7 @@ with tab_communes:
         if "Proba IA max" in disp_cr.columns:
             disp_cr["Proba IA max"] = fmt_pct(disp_cr["Proba IA max"])
         st.markdown("**Classement communes**")
-        st.dataframe(disp_cr, use_container_width=True, hide_index=True, height=380)
+        st.dataframe(disp_cr, width="stretch", hide_index=True, height=380)
 
         if {"commune_name", "commune_note"}.issubset(cr.columns):
             st.markdown("**Top 10 communes les plus à risque**")
@@ -570,7 +653,7 @@ with tab_communes:
                     fig_top.update_layout(xaxis_title="Note de risque (/100)", yaxis=dict(autorange="reversed"),
                                            height=340, margin=dict(t=20, b=20, l=20, r=40),
                                            plot_bgcolor="white", paper_bgcolor="white")
-                    st.plotly_chart(fig_top, use_container_width=True)
+                    st.plotly_chart(fig_top, width="stretch")
             except Exception as e:
                 st.warning(f"Graphe top communes indisponible ({e}).")
 
