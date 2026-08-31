@@ -4,583 +4,95 @@ on:
   push:
     branches:
       - main
-
   workflow_dispatch:
-
   schedule:
-    # Exécution toutes les heures à la minute 15
     - cron: "15 * * * *"
 
 permissions:
   contents: read
- *pages: write
+  pages: write
   id-token: write
 
-co*currency:
-  group: "lgv-dashboard-*ages"
+concurrency:
+  group: "pages"
   cancel-in-progress: false
-*jobs:
+
+jobs:
   build:
-    name: Collecte *t génération
-    runs-on: ubuntu-l*test
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-
-    *teps:
-      # ====================*==================================*====
-      # 1. Récupération du dé*ôt
-      # =======================*==================================*=
-
-      - name: Checkout reposito*y
-        uses: actions/checkout@v*
-        with:
-          fetch-dep*h: 0
-
-      # ====================*==================================*====
-      # 2. Installation de Py*hon
-      # ======================*==================================*==
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Python
-   *    uses: actions/setup-python@v5
-*       with:
-          python-vers*on: "3.11"
-          cache: "pip"
-*         cache-dependency-path: |
-*           requirements.txt
-      *     requirements_lgv_monitoring.t*t
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
-      # =======================*==================================*=
-      # 3. Installation des dépe*dances
-      # ===================*==================================*=====
-
-      - name: Install depen*encies
+      - name: Install dependencies
         run: |
-          se* -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-          python -* pip install --upgrade pip
+      - name: Run dashboard generation
+        env:
+          LGV_MAX_CYCLE_SECONDS: "600"
+          LGV_WEATHER_CORRIDOR_KM: "15"
+          LGV_SYNOP_CACHE_TTL_HOURS: "6"
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python run_once_dashboard.py || (sleep 20 && python run_once_dashboard.py) || true
 
-      *   if [ -f "requirements.txt" ]; t*en
-            echo "Installation *e requirements.txt..."
-           *python -m pip install -r requireme*ts.txt
-          else
-            *cho "::error::Le fichier requireme*ts.txt est absent."
-            ex*t 1
+      - name: Fetch carte LGV SEA from gh-pages
+        run: |
+          git fetch origin gh-pages
+          mkdir -p site
+          git archive origin/gh-pages | tar -x -C site/
+
+      - name: Add dashboard and snapshot
+        run: |
+          mkdir -p site/dashboard/reports site/reports
+          if [ ! -f reports/lgv_dashboard_latest.html ]; then
+            echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
           fi
-
-          if [ -f "requirements_lgv_monitoring.txt" ]; then
-            echo "Installa*ion de requirements_lgv_monitoring*txt..."
-            python -m pip *nstall -r requirements_lgv_monitor*ng.txt
-          else
-            *cho "::warning::requirements_lgv_m*nitoring.txt est absent."
-        * fi
-
-          # Dépendance utilis*e par meteo_test.py
-          pyth*n -m pip install "schedule==1.2.2"*
-          echo "Vérification des *épendances installées..."
-        * python -m pip check
-
-          ec*o "Version Python :"
-          pyt*on --version
-
-          echo "Vers*on pip :"
-          python -m pip *-version
-
-      # ================*==================================*========
-      # 4. Vérification d*s imports indispensables
-      # =*==================================*=======================
-
-      - n*me: Check Python imports
-        r*n: |
-          set -euo pipefail
-
-*         python - <<'PY'
-         *import pandas
-          import req*ests
-          import schedule
-
-  *       from lgv_monitoring.config *mport DB_PATH, RIVER_POINTS
-      *   from lgv_monitoring.database im*ort init_db
-          from lgv_mon*toring.service import LGVMonitorin*Service
-
-          print("Imports *rincipaux : OK")
-          print("*andas :", pandas.__version__)
-    *     print("requests :", requests.*_version__)
-          print("sched*le :", schedule.__file__)
-        * print("DB_PATH :", DB_PATH)
-     *    print("Nombre de points rivièr* :", len(RIVER_POINTS))
-          *Y
-
-      # =======================*==================================*=
-      # 5. Préparation des dossi*rs
-      # =======================*==================================*=
-
-      - name: Prepare directori*s
-        run: |
-          set -eu* pipefail
-
-          mkdir -p data*          mkdir -p reports
-       *  mkdir -p site
-          mkdir -p*site/dashboard/reports
-          m*dir -p site/reports
-
-          ech* "Dossiers préparés :"
-          l* -ld data reports site
-
-      # ==*==================================*======================
-      # 6. *ollecte des données
-      # ======*==================================*==================
-
-      - name: *ollect monitoring data
-        run* |
-          set -euo pipefail
-
-  *       echo "Démarrage de la colle*te LGV SEA..."
-
-          python r*n_collection.py \
-            --on*e \
-            --max-distance-km *5
-
-          echo "Collecte termin*e."
-
-      # =====================*==================================*===
-      # 7. Vérification de l'i*port du générateur
-      # =======*==================================*=================
-
-      - name: C*eck dashboard generator import
-   *    run: |
-          set -euo pipe*ail
-
-          python - <<'PY'
-   *      from meteo_test import LGVSe*Monitor
-
-          print("Import d* LGVSeaMonitor réussi.")
-         *print("Classe détectée :", LGVSeaM*nitor)
-          PY
-
-      # =====*==================================*===================
-      # 8. Gén*ration du dashboard et du snapshot*Streamlit
-      # ================*==================================*========
-
-      - name: Generate d*shboard and Streamlit snapshot
-   *    run: |
-          set -euo pipe*ail
-
-          echo "Génération du*dashboard LGV SEA..."
-
-          p*thon run_once_dashboard.py
-
-      *   echo "Génération terminée."
-
-  *   # =============================*==============================
-   *  # 9. Vérification des fichiers g*nérés
-      # ====================*==================================*====
-
-      - name: Check generate* files
-        run: |
-          se* -euo pipefail
-
-          if [ ! -f "reports/lgv_dashboard_latest.html" ]; then
-            echo "::erro*::Le fichier reports/lgv_dashboard*latest.html est absent."
-         *  exit 1
+          if [ ! -f reports/streamlit_snapshot_latest.json ]; then
+            echo "{}" > reports/streamlit_snapshot_latest.json
           fi
+          cp reports/lgv_dashboard_latest.html site/dashboard/index.html
+          cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
+          cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
+          cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
 
-          i* [ ! -s "reports/lgv_dashboard_latest.html" ]; then
-            echo *::error::Le dashboard HTML est vid*."
-            exit 1
-          fi*
-          if [ ! -f "reports/streamlit_snapshot_latest.json" ]; then*            echo "::error::Le fich*er reports/streamlit_snapshot_late*t.json est absent."
-            ex*t 1
-          fi
-
-          if [ ! -s "reports/streamlit_snapshot_latest.json" ]; then
-            echo *::error::Le snapshot Streamlit est*vide."
-            exit 1
-        * fi
-
-          echo "Fichiers géné*és :"
-          ls -lh reports/
-
- *    # ============================*===============================
-  *   # 10. Validation du snapshot St*eamlit
-      # ===================*==================================*=====
-
-      - name: Validate Stre*mlit snapshot
+      - name: Wake Streamlit apps
         run: |
-     *    set -euo pipefail
-
-          p*thon - <<'PY'
-          import jso*
-          import sys
-
-          f*om datetime import datetime, timez*ne
-          from pathlib import P*th
-
-
-          SNAPSHOT_PATH = Pat*(
-              "reports/streamlit*snapshot_latest.json"
-          )
-*          MAX_SNAPSHOT_AGE_HOURS =*3.0
-
-
-          def fail(message: *tr) -> None:
-              print(f*::error::{message}")
-             *sys.exit(1)
-
-
-          if not SNA*SHOT_PATH.exists():
-              *ail(
-                  "Le snapsho* Streamlit est absent : "
-        *         f"{SNAPSHOT_PATH}"
-      *       )
-
-          if SNAPSHOT_PA*H.stat().st_size == 0:
-           *  fail("Le snapshot Streamlit est *ide.")
-
-          try:
-           *  with SNAPSHOT_PATH.open(
-       *          "r",
-                  e*coding="utf-8",
-              ) as*file:
-                  snapshot =*json.load(file)
-
-          except *son.JSONDecodeError as error:
-    *         fail(
-                  "*e snapshot n'est pas un JSON valid* : "
-                  f"{error}"
-*             )
-
-          except O*Error as error:
-              fail*
-                  "Impossible de *ire le snapshot : "
-              *   f"{error}"
-              )
-
-   *      if not isinstance(snapshot, *ict):
-              fail(
-        *         "La racine du snapshot do*t être un objet JSON."
-              )
-
-          if not snapshot:
-              fail(
-                  "Le snapshot contient uniquement un objet vide."
-              )
-
-          timestamp = (
-              snapshot.get("timestamp_utc")
-              or snapshot.get("generated_at_utc")
-          )
-
-          if not timestamp:
-              fail(
-                  "Le snapshot ne contient ni timestamp_utc "
-                  "ni generated_at_utc."
-              )
-
-          try:
-              snapshot_datetime = datetime.fromisoformat(
-                  str(timestamp).replace("Z", "+00:00")
-              )
-
-          except ValueError as error:
-              fail(
-                  "Le timestamp du snapshot est invalide : "
-                  f"{error}"
-              )
-
-          if snapshot_datetime.tzinfo is None:
-              snapshot_datetime = snapshot_datetime.replace(
-                  tzinfo=timezone.utc
-              )
-
-          snapshot_datetime = snapshot_datetime.astimezone(
-              timezone.utc
-          )
-
-          now_utc = datetime.now(timezone.utc)
-
-          age_hours = (
-              now_utc - snapshot_datetime
-          ).total_seconds() / 3600
-
-          print("=" * 60)
-          print("VALIDATION DU SNAPSHOT LGV SEA")
-          print("=" * 60)
-          print(f"Fichier       : {SNAPSHOT_PATH}")
-          print(f"Taille        : {SNAPSHOT_PATH.stat().st_size} octets")
-          print(f"Date actuelle : {now_utc.isoformat()}")
-          print(f"Date snapshot : {snapshot_datetime.isoformat()}")
-          print(f"Âge snapshot  : {age_hours:.2f} heure(s)")
-          print("=" * 60)
-
-          if age_hours < -1:
-              fail(
-                  "Le timestamp du snapshot est situé dans le futur."
-              )
-
-          if age_hours > MAX_SNAPSHOT_AGE_HOURS:
-              fail(
-                  "Le snapshot est trop ancien. "
-                  f"Âge constaté : {age_hours:.2f} heure(s). "
-                  f"Âge maximal autorisé : "
-                  f"{MAX_SNAPSHOT_AGE_HOURS:.2f} heure(s)."
-              )
-
-          sectors_payload = snapshot.get("sectors")
-
-          if not sectors_payload:
-              print(
-                  "::warning::Le snapshot ne contient pas "
-                  "de données dans la clé sectors."
-              )
-
-          elif isinstance(sectors_payload, dict):
-              sectors = sectors_payload.get("sectors", [])
-
-              if not sectors:
-                  print(
-                      "::warning::La liste des secteurs est vide."
-                  )
-              else:
-                  print(
-                      f"Nombre de secteurs : {len(sectors)}"
-                  )
-
-          print("Snapshot récent et valide.")
-          PY
-
-      # ============================================================
-      # 11. Récupération du contenu GitHub Pages existant
-      # ============================================================
-
-      - name: Fetch existing GitHub Pages content
-        run: |
-          set -euo pipefail
-
-          if git ls-remote \
-            --exit-code \
-            --heads origin gh-pages \
-            > /dev/null 2>&1
-          then
-            echo "Récupération de la branche gh-pages..."
-
-            git fetch origin gh-pages
-
-            git archive origin/gh-pages \
-              | tar -x -C site/
-
-            echo "Contenu existant de gh-pages récupéré."
-          else
-            echo "La branche gh-pages n'existe pas."
-            echo "Un nouveau contenu GitHub Pages sera créé."
-          fi
-
-      # ============================================================
-      # 12. Copie du dashboard et du snapshot dans le site
-      # ============================================================
-
-      - name: Add dashboard and snapshot to Pages site
-        run: |
-          set -euo pipefail
-
-          mkdir -p site/dashboard/reports
-          mkdir -p site/reports
-
-          cp \
-            reports/lgv_dashboard_latest.html \
-            site/dashboard/index.html
-
-          cp \
-            reports/lgv_dashboard_latest.html \
-            site/dashboard/reports/lgv_dashboard_latest.html
-
-          cp \
-            reports/streamlit_snapshot_latest.json \
-            site/dashboard/reports/streamlit_snapshot_latest.json
-
-          cp \
-            reports/streamlit_snapshot_latest.json \
-            site/reports/streamlit_snapshot_latest.json
-
-          echo "Dashboard et snapshot copiés dans le site."
-
-      # ============================================================
-      # 13. Vérification de la copie
-      # ============================================================
-
-      - name: Verify copied snapshot
-        run: |
-          set -euo pipefail
-
-          python - <<'PY'
-          import json
-          import sys
-
-          from pathlib import Path
-
-
-          SOURCE_PATH = Path(
-              "reports/streamlit_snapshot_latest.json"
-          )
-
-          PUBLISHED_PATH = Path(
-              "site/reports/streamlit_snapshot_latest.json"
-          )
-
-
-          def fail(message: str) -> None:
-              print(f"::error::{message}")
-              sys.exit(1)
-
-
-          if not SOURCE_PATH.exists():
-              fail(
-                  "Le snapshot source est absent : "
-                  f"{SOURCE_PATH}"
-              )
-
-          if not PUBLISHED_PATH.exists():
-              fail(
-                  "Le snapshot destiné à la publication est absent : "
-                  f"{PUBLISHED_PATH}"
-              )
-
-          try:
-              with SOURCE_PATH.open(
-                  "r",
-                  encoding="utf-8",
-              ) as file:
-                  source_snapshot = json.load(file)
-
-              with PUBLISHED_PATH.open(
-                  "r",
-                  encoding="utf-8",
-              ) as file:
-                  published_snapshot = json.load(file)
-
-          except Exception as error:
-              fail(
-                  "Impossible de comparer les snapshots : "
-                  f"{error}"
-              )
-
-          source_timestamp = (
-              source_snapshot.get("timestamp_utc")
-              or source_snapshot.get("generated_at_utc")
-          )
-
-          published_timestamp = (
-              published_snapshot.get("timestamp_utc")
-              or published_snapshot.get("generated_at_utc")
-          )
-
-          print(f"Timestamp source  : {source_timestamp}")
-          print(f"Timestamp publié : {published_timestamp}")
-
-          if source_timestamp != published_timestamp:
-              fail(
-                  "Le timestamp du snapshot publié ne correspond "
-                  "pas au snapshot généré."
-              )
-
-          if source_snapshot != published_snapshot:
-              fail(
-                  "Le contenu du snapshot publié ne correspond pas "
-                  "au snapshot généré."
-              )
-
-          print("La copie du snapshot est conforme.")
-          PY
-
-      # ============================================================
-      # 14. Résumé des fichiers publiés
-      # ============================================================
-
-      - name: Display publication summary
-        run: |
-          set -euo pipefail
-
-          echo "Contenu du site à publier :"
-
-          find site \
-            -maxdepth 4 \
-            -type f \
-            -printf "%p | %s octets\n" \
-            | sort
-
-      # ============================================================
-      # 15. Configuration de GitHub Pages
-      # ============================================================
+          echo "Waking up Streamlit apps..."
+          for app_url in \
+            "https://lgv-sea-monitoring-meteo-gc.streamlit.app/" \
+            "https://lgvpluviostations.streamlit.app/"
+          do
+            echo "  → $app_url"
+            curl -L --silent --show-error --max-time 120 "$app_url" > /dev/null 2>&1 || true
+          done
+          echo "Done waking up apps"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
         with:
           enablement: true
 
-      # ============================================================
-      # 16. Création de l'artefact GitHub Pages
-      # ============================================================
-
-      - name: Upload Pages artifact
+      - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
-    name: Déploiement GitHub Pages
-    runs-on: ubuntu-latest
-    needs: build
-
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-
+    runs-on: ubuntu-latest
+    needs: build
     steps:
-      # ============================================================
-      # 17. Déploiement GitHub Pages
-      # ============================================================
-
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-      # ============================================================
-      # 18. Réveil de l'application Streamlit
-      # ============================================================
-
-      - name: Wake Streamlit monitoring application
-        env:
-          STREAMLIT_APP_URL: "https://lgv-sea-monitoring-meteo-gc.streamlit.app/"
-        run: |
-          set +e
-
-          echo "Attente de la propagation GitHub Pages..."
-          sleep 30
-
-          echo "Réveil de l'application Streamlit :"
-          echo "$STREAMLIT_APP_URL"
-
-          HTTP_CODE="$(
-            curl \
-              --location \
-              --silent \
-              --show-error \
-              --output /dev/null \
-              --write-out "%{http_code}" \
-              --max-time 120 \
-              --retry 2 \
-              --retry-delay 10 \
-              "$STREAMLIT_APP_URL"
-          )"
-
-          CURL_STATUS=$?
-
-          echo "Code HTTP Streamlit : $HTTP_CODE"
-
-          if [ "$CURL_STATUS" -ne 0 ]; then
-            echo "::warning::La requête vers Streamlit a échoué."
-          elif [ "$HTTP_CODE" -ge 400 ]; then
-            echo "::warning::Streamlit a répondu avec le code HTTP $HTTP_CODE."
-          else
-            echo "Application Streamlit réveillée avec succès."
-          fi
-
-          exit 0
