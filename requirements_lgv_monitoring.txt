@@ -8,3 +8,4 @@ streamlit==1.54.0
 streamlit-folium
 typing_extensions>=4.13.2
 pyproj>=3.6
+schedule==1.2.2
