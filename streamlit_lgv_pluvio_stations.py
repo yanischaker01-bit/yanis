@@ -4,7 +4,6 @@ import io
 import math
 import os
 import unicodedata
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -24,6 +23,16 @@ ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 VIGICRUES_GEOJSON_URL = "https://www.vigicrues.gouv.fr/services/1/InfoVigiCru.geojson"
 VIGICRUES_CORRIDOR_KM = 1.0
+APP_VERSION = "2.1.0"
+
+FRENCH_MONTHS = {
+    1: "janvier", 2: "février", 3: "mars", 4: "avril",
+    5: "mai", 6: "juin", 7: "juillet", 8: "août",
+    9: "septembre", 10: "octobre", 11: "novembre", 12: "décembre",
+}
+
+def french_month_year(value) -> str:
+    return f"{FRENCH_MONTHS[value.month]} {value.year}"
 
 # NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
 FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}/{date}"
@@ -904,6 +913,7 @@ for _kw in _DEFAULT_KW:
 _default_communes = _default_communes[:6] or (communes[:6] if len(communes) >= 6 else communes)
 
 with st.sidebar:
+    st.caption(f"Version {APP_VERSION}")
     st.subheader("📍 Communes")
     selected_multi = st.multiselect("Comparer communes", communes,
                                      default=_default_communes)
@@ -1143,7 +1153,7 @@ if selected_multi and not sectors_df.empty:
     elif periode == "30 jours":
         _titre_periode = f"30 derniers jours (jusqu'au {(_today - timedelta(days=1)).strftime('%d/%m/%Y')})"
     else:
-        _titre_periode = f"mois de {_today.strftime('%B %Y')} (jusqu'au {(_today - timedelta(days=1)).strftime('%d/%m')})"
+        _titre_periode = f"mois de {french_month_year(_today)} (jusqu'au {(_today - timedelta(days=1)).strftime('%d/%m')})"
     st.subheader(f"📊 Comparaison communes — cumul pluie {_titre_periode}")
 
     if len(selected_multi) > 12:
@@ -1227,19 +1237,20 @@ st.subheader(f"🔮 Prévisions 7 jours — {label_loc}")
 fc_df = load_forecast_coord(lat_c, lon_c)
 if not fc_df.empty:
     fc_df["pluie_mm"] = pd.to_numeric(fc_df["pluie_mm"], errors="coerce").fillna(0)
-    fc_df["tmax"]     = pd.to_numeric(fc_df["tmax"],     errors="coerce").fillna(0)
+    fc_df["tmax"]     = pd.to_numeric(fc_df["tmax"], errors="coerce")
+    fc_df["proba_%"]  = pd.to_numeric(fc_df["proba_%"], errors="coerce").clip(0, 100)
     fc_df["color"]    = fc_df["pluie_mm"].apply(rain_color_mm)
     fig2 = go.Figure()
     fig2.add_bar(x=fc_df["date"], y=fc_df["pluie_mm"],
                  marker_color=fc_df["color"].tolist(),
                  text=fc_df["pluie_mm"].apply(lambda v: f"{v:.0f}"),
                  textposition="outside", name="Pluie (mm)")
-    if "proba_%" in fc_df.columns:
+    if "proba_%" in fc_df.columns and fc_df["proba_%"].notna().any():
         fig2.add_scatter(x=fc_df["date"], y=fc_df["proba_%"],
                          mode="lines+markers", name="Proba pluie %",
                          yaxis="y2", line=dict(color="#6366f1", dash="dot"),
                          marker=dict(size=5))
-    if "tmax" in fc_df.columns:
+    if "tmax" in fc_df.columns and fc_df["tmax"].notna().any():
         fig2.add_scatter(x=fc_df["date"], y=fc_df["tmax"],
                          mode="lines+markers", name="T° max (°C)",
                          yaxis="y3", line=dict(color="#f97316", width=2),
