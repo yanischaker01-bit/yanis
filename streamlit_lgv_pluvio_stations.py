@@ -260,132 +260,88 @@ _DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
 
 @st.cache_data(ttl=1800)
 def load_vigicrue_rivers() -> tuple[list, bool]:
-    """Charge la vigilance crues officielle pour les cours d'eau LGV SEA.
-
-    L'ancien appel ``/services/2/InfoVigiCrue.xml`` n'est pas un endpoint
-    public valide. L'API documentee expose le referentiel en JSON sous
-    ``/services/v1.1/TerEntVigiCru.json``. On charge la liste des territoires,
-    puis leur detail afin de recuperer les troncons et leur niveau de vigilance.
-    """
-    api_url = "https://www.vigicrues.gouv.fr/services/v1.1/TerEntVigiCru.json"
-    headers = {
-        "Accept": "application/json",
-        "User-Agent": "LGV-PluvioStations/1.0 (+https://lgvpluviostations.streamlit.app/)",
-    }
-    level_by_number = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
-    level_by_name = {
-        "vert": "VERT", "green": "VERT",
-        "jaune": "JAUNE", "yellow": "JAUNE",
-        "orange": "ORANGE",
-        "rouge": "ROUGE", "red": "ROUGE",
-    }
-
-    def walk(value):
-        """Parcourt tous les dictionnaires d'une reponse JSON imbriquee."""
-        if isinstance(value, dict):
-            yield value
-            for child in value.values():
-                yield from walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                yield from walk(child)
-
-    def first(item: dict, keys: tuple[str, ...]):
-        for key in keys:
-            value = item.get(key)
-            if value not in (None, ""):
-                return value
-        return None
-
-    def vigilance_level(item: dict) -> str | None:
-        raw = first(item, (
-            "NivVigiCru", "NivVigiCruHydro", "NivVig",
-            "NiveauVigilance", "CdCouleur", "Couleur", "couleur",
-        ))
-        if raw is None:
-            return None
-        normalized = _normalize(str(raw)).strip()
-        if normalized in level_by_name:
-            return level_by_name[normalized]
-        try:
-            return level_by_number.get(int(float(normalized)))
-        except (TypeError, ValueError):
-            return None
-
+    """Vigilance crues des cours d'eau à proximité de la LGV SEA (API Vigicrue XML).
+    Retourne (alertes, ok). ok=False uniquement si l'API n'a jamais pu être
+    interrogée avec succès — sans ce distinguo, une panne réseau et un "aucune
+    crue en cours" légitime produiraient le même résultat vide, donc le même
+    message rassurant à tort."""
+    VC_LEVEL = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
     results: list = []
-    successful_responses = 0
+    parsed_ok = False
 
-    try:
-        response = requests.get(api_url, headers=headers, timeout=(5, 25))
-        response.raise_for_status()
-        territories_payload = response.json()
-        successful_responses += 1
-    except (requests.RequestException, ValueError):
-        return [], False
-
-    territories = territories_payload.get("ListEntVigiCru", [])
-    if not isinstance(territories, list):
-        return [], False
-
-    for territory in territories:
-        if not isinstance(territory, dict):
-            continue
-        code = territory.get("CdEntVigiCru")
-        entity_type = territory.get("TypEntVigiCru", "5")
-        if not code:
-            continue
+    # TypEntVigiCru=3 = tronçons (sections de cours d'eau) — principal format Vigicrue v2
+    for params in [{"TypEntVigiCru": 3}, {}]:
         try:
-            response = requests.get(
-                api_url,
-                params={"CdEntVigiCru": code, "TypEntVigiCru": entity_type},
-                headers=headers,
-                timeout=(5, 25),
+            r = requests.get(
+                "https://www.vigicrues.gouv.fr/services/2/InfoVigiCrue.xml",
+                params=params, timeout=15,
+                headers={"Accept": "application/xml,text/xml,*/*"},
             )
-            response.raise_for_status()
-            payload = response.json()
-            successful_responses += 1
-        except (requests.RequestException, ValueError):
+            if r.status_code != 200:
+                continue
+            content = r.content.strip()
+            if not content.startswith(b"<"):
+                continue
+
+            root = ET.fromstring(content)
+            parsed_ok = True
+            found = False
+
+            for elem in root.iter():
+                # Name: Vigicrue v2 uses LibTroncon or NomTroncon; fallback to others
+                name = ""
+                for attr in ("LibTroncon", "NomTroncon", "NomEntVigiCru",
+                             "LibEntVigiCru", "NomCoursDeau", "Nom", "lib"):
+                    name = elem.get(attr, "")
+                    if name:
+                        break
+                if not name:
+                    continue
+
+                # Vigilance level: NivVigiCru is standard in v2
+                niv_raw = ""
+                for attr in ("NivVigiCru", "NivVigiCruHydro", "NivVig", "couleur"):
+                    niv_raw = elem.get(attr, "")
+                    if niv_raw:
+                        break
+                if not niv_raw:
+                    continue
+                try:
+                    niv = int(float(niv_raw))
+                except ValueError:
+                    continue
+
+                dep_raw = (elem.get("CdDep") or elem.get("CdEntVigiCru")
+                           or elem.get("CDDep") or "")
+                name_norm = _normalize(name)
+                is_lgv = any(rv in name_norm for rv in RIVERS_LGV)
+                dep_ok = (not dep_raw) or (dep_raw in _DEP_OK)
+
+                if is_lgv and dep_ok:
+                    lvl = VC_LEVEL.get(niv, "VERT")
+                    results.append(dict(
+                        riviere=name, dep=dep_raw, level=lvl, type="VIGICRUE",
+                        msg=f"{name} — vigilance {lvl.lower()}",
+                    ))
+                    found = True
+
+            if found:
+                break
+        except Exception:
             continue
 
-        for item in walk(payload):
-            name = first(item, (
-                "LbEntVigiCru", "LibEntVigiCru", "NomEntVigiCru",
-                "LibTroncon", "NomTroncon", "NomCoursDeau", "Nom", "lib",
-            ))
-            level = vigilance_level(item)
-            if not name or not level:
-                continue
-
-            name = str(name).strip()
-            name_norm = _normalize(name)
-            if not any(river in name_norm for river in RIVERS_LGV):
-                continue
-
-            dep_raw = first(item, ("CdDep", "CDDep", "CodeDepartement"))
-            dep = str(dep_raw).zfill(2) if dep_raw not in (None, "") else ""
-            if dep and dep not in _DEP_OK:
-                continue
-
-            results.append({
-                "riviere": name,
-                "dep": dep,
-                "level": level,
-                "type": "VIGICRUE",
-                "msg": f"{name} — vigilance {level.lower()}",
-            })
-
-    # Une reponse API valide sans alerte LGV est un resultat legitime.
-    parsed_ok = successful_responses > 0
-
+    # Deduplicate
     seen: set = set()
     dedup: list = []
     for item in results:
-        key = (_normalize(item["riviere"]), item["level"])
+        key = (_normalize(item["riviere"])[:25], item["level"])
         if key not in seen:
             seen.add(key)
             dedup.append(item)
 
+    # Sort: highest level first, then by name
     dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
+
     return dedup, parsed_ok
 
 
@@ -733,6 +689,33 @@ def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
 
 
 
+
+# Style commun pour des graphiques plus clairs et homogènes
+CHART_GRID = "#e8eef5"
+CHART_TEXT = "#475569"
+CHART_BLUE = "#2563eb"
+CHART_TEAL = "#0f766e"
+
+def style_figure(fig: go.Figure, *, height: int = 340, hovermode: str = "x unified") -> go.Figure:
+    fig.update_layout(
+        height=height,
+        hovermode=hovermode,
+        font=dict(family="Arial, sans-serif", size=12, color=CHART_TEXT),
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(t=35, b=45, l=45, r=35),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hoverlabel=dict(bgcolor="white", font_size=12, font_color="#0f172a"),
+    )
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#cbd5e1",
+                     tickcolor="#cbd5e1", automargin=True)
+    fig.update_yaxes(showgrid=True, gridcolor=CHART_GRID, gridwidth=1,
+                     zeroline=True, zerolinecolor="#cbd5e1", automargin=True)
+    return fig
+
+def rain_axis_ceiling(values, minimum: float = 5.0) -> float:
+    clean = [float(v) for v in values if pd.notna(v)]
+    peak = max(clean, default=0.0)
+    return max(minimum, peak * 1.18)
 
 def safe_df(records) -> pd.DataFrame:
     if isinstance(records, list) and records:
@@ -1113,14 +1096,12 @@ else:
             textposition="outside", cliponaxis=False,
             hovertemplate="<b>%{y}</b><br>Cumul : %{x:.1f} mm<extra></extra>",
         ))
-        fig_top.update_layout(
-            height=max(320, len(bar_df) * 26 + 60),
-            xaxis=dict(title="Cumul pluie (mm)", zeroline=True),
-            yaxis=dict(tickfont=dict(size=11)),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            margin=dict(t=10, b=30, l=10, r=90),
-        )
-        st.plotly_chart(fig_top, use_container_width=True)
+        style_figure(fig_top, height=max(360, len(bar_df) * 30 + 80), hovermode="closest")
+        fig_top.update_traces(marker_line_color="white", marker_line_width=0.8)
+        fig_top.update_xaxes(title="Cumul de précipitations (mm)", rangemode="tozero")
+        fig_top.update_yaxes(title=None, showgrid=False, tickfont=dict(size=12))
+        fig_top.update_layout(showlegend=False, margin=dict(t=20, b=45, l=15, r=95))
+        st.plotly_chart(fig_top, use_container_width=True, config={"displayModeBar": False})
 
         # Courbes journalières : top 3 en couleur (identité), le reste du TOP 20 en gris (contexte)
         HIGHLIGHT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
@@ -1137,13 +1118,11 @@ else:
                 showlegend=is_top3,
                 hovertemplate=f"<b>{commune}</b><br>%{{x|%d/%m}} : %{{y:.1f}} mm<extra></extra>",
             )
-        fig_curve.update_layout(
-            height=340, xaxis=dict(title=""), yaxis=dict(title="Pluie/jour (mm)"),
-            plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", y=1.15),
-            margin=dict(t=35, b=20, l=20, r=20),
-        )
-        st.plotly_chart(fig_curve, use_container_width=True)
+        style_figure(fig_curve, height=370)
+        fig_curve.update_xaxes(title=None, tickformat="%d/%m", rangeslider_visible=False)
+        fig_curve.update_yaxes(title="Précipitations journalières (mm)", rangemode="tozero")
+        fig_curve.update_layout(legend=dict(orientation="h", y=1.04), margin=dict(t=50, b=40, l=55, r=25))
+        st.plotly_chart(fig_curve, use_container_width=True, config={"displayModeBar": False})
         st.caption("Courbes : les 3 communes les plus arrosées de ce TOP 20 sont mises en évidence "
                    "(couleur + légende) · les 17 autres apparaissent en gris clair pour le contexte.")
 
@@ -1218,14 +1197,12 @@ if selected_multi and not sectors_df.empty:
                 hovertemplate="<b>%{y}</b><br>Cumul : %{x:.1f} mm<extra></extra>",
             ))
             height = max(260, len(df_cmp) * 34 + 60)
-            fig.update_layout(
-                xaxis=dict(title=f"Cumul pluie (mm)", zeroline=True),
-                yaxis=dict(autorange="reversed", tickfont=dict(size=12)),
-                height=height,
-                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                margin=dict(t=10, b=30, l=10, r=90),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            style_figure(fig, height=height, hovermode="closest")
+            fig.update_traces(marker_line_color="white", marker_line_width=0.8)
+            fig.update_xaxes(title="Cumul de précipitations (mm)", rangemode="tozero")
+            fig.update_yaxes(title=None, autorange="reversed", showgrid=False, tickfont=dict(size=12))
+            fig.update_layout(showlegend=False, margin=dict(t=15, b=45, l=15, r=95))
+            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
             _src = "AROME Météo-France 1,3 km" if periode == "24h" else "ERA5 near real-time"
             st.caption(f"Source : Open-Meteo {_src} · {date_str}")
 
@@ -1265,17 +1242,19 @@ if not fc_df.empty:
                          mode="lines+markers", name="T° max (°C)",
                          yaxis="y3", line=dict(color="#f97316", width=2),
                          marker=dict(size=5, symbol="diamond"))
+    style_figure(fig2, height=360)
+    fig2.update_traces(hovertemplate=None)
+    fig2.update_xaxes(title=None, tickangle=0, tickformat="%a %d/%m")
+    fig2.update_yaxes(title="Pluie (mm)", rangemode="tozero", secondary_y=False)
     fig2.update_layout(
-        yaxis=dict(title="Pluie (mm)", side="left"),
-        yaxis2=dict(title="Proba %",   overlaying="y", side="right",
-                    range=[0, 110], showgrid=False),
-        yaxis3=dict(title="T°C",       overlaying="y", side="right",
-                    position=0.92,     showgrid=False, anchor="free"),
-        legend=dict(orientation="h", y=1.12), height=290,
-        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-        margin=dict(t=30, b=20, l=20, r=80), xaxis=dict(tickangle=-20),
+        yaxis2=dict(title="Probabilité (%)", overlaying="y", side="right", range=[0, 100],
+                    showgrid=False, ticksuffix=" %"),
+        yaxis3=dict(title="Température (°C)", overlaying="y", side="right", position=0.91,
+                    showgrid=False, anchor="free", ticksuffix=" °C"),
+        margin=dict(t=55, b=40, l=55, r=95),
+        bargap=0.38,
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
 else:
     st.info("Prévisions indisponibles.")
 
@@ -1288,11 +1267,23 @@ if not monthly_df.empty:
         color_continuous_scale=["#bfdbfe","#3b82f6","#1d4ed8","#1e3a8a"],
         labels={"mois":"Mois","pluie_mm":"Pluie (mm)"}, text="pluie_mm",
     )
-    fig3.update_traces(texttemplate="%{text:.0f}", textposition="outside")
-    fig3.update_layout(coloraxis_showscale=False, height=260,
-                       plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
-                       margin=dict(t=20,b=20,l=20,r=20), xaxis=dict(tickangle=-30))
-    st.plotly_chart(fig3, use_container_width=True)
+    fig3.update_traces(
+        texttemplate="%{text:.0f} mm", textposition="outside",
+        marker_line_color="white", marker_line_width=0.8,
+        hovertemplate="<b>%{x}</b><br>Cumul : %{y:.1f} mm<extra></extra>",
+    )
+    monthly_mean = float(monthly_df["pluie_mm"].mean())
+    fig3.add_hline(
+        y=monthly_mean, line_dash="dash", line_color=CHART_TEAL,
+        annotation_text=f"Moyenne : {monthly_mean:.0f} mm",
+        annotation_position="top left",
+    )
+    style_figure(fig3, height=340, hovermode="closest")
+    fig3.update_xaxes(title=None, tickangle=0)
+    fig3.update_yaxes(title="Cumul mensuel (mm)", range=[0, rain_axis_ceiling(monthly_df["pluie_mm"], 20)])
+    fig3.update_layout(coloraxis_showscale=False, showlegend=False, bargap=0.28,
+                       margin=dict(t=45, b=40, l=55, r=25))
+    st.plotly_chart(fig3, use_container_width=True, config={"displayModeBar": False})
 else:
     st.info("Historique indisponible.")
 
