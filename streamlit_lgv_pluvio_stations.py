@@ -5,7 +5,6 @@ import math
 import os
 import time
 import unicodedata
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -239,116 +238,64 @@ _DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
 
 @st.cache_data(ttl=1800)
 def load_vigicrue_rivers() -> tuple[list, bool]:
-    api_url = "https://www.vigicrues.gouv.fr/services/v1.1/TerEntVigiCru.json"
+    """Charge la vigilance crues officielle pour les cours d'eau LGV SEA.
+    Utilise le flux GeoJSON officiel de Vigicrues."""
+    url = "https://www.vigicrues.gouv.fr/services/1/InfoVigiCru.geojson"
     headers = {
         "Accept": "application/json",
         "User-Agent": "LGV-PluvioStations/1.0 (+https://lgvpluviostations.streamlit.app/)",
     }
-    level_by_number = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
-    level_by_name = {
-        "vert": "VERT", "green": "VERT",
-        "jaune": "JAUNE", "yellow": "JAUNE",
-        "orange": "ORANGE",
-        "rouge": "ROUGE", "red": "ROUGE",
-    }
-
-    def walk(value):
-        if isinstance(value, dict):
-            yield value
-            for child in value.values():
-                yield from walk(child)
-        elif isinstance(value, list):
-            for child in value:
-                yield from walk(child)
-
-    def first(item: dict, keys: tuple[str, ...]):
-        for key in keys:
-            value = item.get(key)
-            if value not in (None, ""):
-                return value
-        return None
-
-    def vigilance_level(item: dict) -> str | None:
-        raw = first(item, (
-            "NivVigiCru", "NivVigiCruHydro", "NivVig",
-            "NiveauVigilance", "CdCouleur", "Couleur", "couleur",
-        ))
-        if raw is None:
-            return None
-        normalized = _normalize(str(raw)).strip()
-        if normalized in level_by_name:
-            return level_by_name[normalized]
-        try:
-            return level_by_number.get(int(float(normalized)))
-        except (TypeError, ValueError):
-            return None
-
-    results: list = []
-    successful_responses = 0
-
+    
+    level_map = {0: "VERT", 1: "JAUNE", 2: "ORANGE", 3: "ROUGE"}
+    
     try:
-        response = requests.get(api_url, headers=headers, timeout=(5, 25))
+        response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
-        territories_payload = response.json()
-        successful_responses += 1
-    except (requests.RequestException, ValueError):
+        data = response.json()
+    except (requests.RequestException, ValueError, KeyError):
         return [], False
 
-    territories = territories_payload.get("ListEntVigiCru", [])
-    if not isinstance(territories, list):
-        return [], False
-
-    for territory in territories:
-        if not isinstance(territory, dict):
+    results = []
+    features = data.get("features", [])
+    
+    for feature in features:
+        props = feature.get("properties", {})
+        
+        # Récupération du nom du tronçon
+        name = props.get("lbentcru") or props.get("LbEntVigiCru") or ""
+        if not name:
             continue
-        code = territory.get("CdEntVigiCru")
-        entity_type = territory.get("TypEntVigiCru", "5")
-        if not code:
+            
+        # Récupération du niveau de vigilance
+        niv = props.get("NivInfViCr")
+        if niv is None:
             continue
-        try:
-            response = requests.get(
-                api_url,
-                params={"CdEntVigiCru": code, "TypEntVigiCru": entity_type},
-                headers=headers,
-                timeout=(5, 25),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            successful_responses += 1
-        except (requests.RequestException, ValueError):
+            
+        level = level_map.get(niv)
+        if not level:
+            continue
+            
+        # Filtrage par cours d'eau pertinents pour la LGV SEA
+        name_norm = _normalize(name)
+        if not any(river in name_norm for river in RIVERS_LGV):
+            continue
+            
+        # Récupération du département
+        dep = str(props.get("cddient_1", "") or "").zfill(2)
+        if dep and dep not in _DEP_OK:
             continue
 
-        for item in walk(payload):
-            name = first(item, (
-                "LbEntVigiCru", "LibEntVigiCru", "NomEntVigiCru",
-                "LibTroncon", "NomTroncon", "NomCoursDeau", "Nom", "lib",
-            ))
-            level = vigilance_level(item)
-            if not name or not level:
-                continue
+        results.append({
+            "riviere": name,
+            "dep": dep,
+            "level": level,
+            "type": "VIGICRUE",
+            "msg": f"{name} — vigilance {level.lower()}",
+        })
 
-            name = str(name).strip()
-            name_norm = _normalize(name)
-            if not any(river in name_norm for river in RIVERS_LGV):
-                continue
-
-            dep_raw = first(item, ("CdDep", "CDDep", "CodeDepartement"))
-            dep = str(dep_raw).zfill(2) if dep_raw not in (None, "") else ""
-            if dep and dep not in _DEP_OK:
-                continue
-
-            results.append({
-                "riviere": name,
-                "dep": dep,
-                "level": level,
-                "type": "VIGICRUE",
-                "msg": f"{name} — vigilance {level.lower()}",
-            })
-
-    parsed_ok = successful_responses > 0
-
-    seen: set = set()
-    dedup: list = []
+    # Déduplication
+    seen = set()
+    dedup = []
     for item in results:
         key = (_normalize(item["riviere"]), item["level"])
         if key not in seen:
@@ -356,10 +303,12 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
             dedup.append(item)
 
     dedup.sort(key=lambda x: (-LEVEL_RANK.get(x["level"], 0), x["riviere"]))
-    return dedup, parsed_ok
+    return dedup, True
 
 
 def get_firms_map_key() -> str | None:
+    """Récupère la clé FIRMS depuis les secrets Streamlit ou les variables d'environnement."""
+    # 1. Secrets Streamlit (racine)
     try:
         key = st.secrets.get("FIRMS_MAP_KEY")
         if key:
@@ -367,13 +316,17 @@ def get_firms_map_key() -> str | None:
     except Exception:
         pass
 
+    # 2. Secrets Streamlit (section nommée)
     try:
-        key = st.secrets.get("firms", {}).get("FIRMS_MAP_KEY")
-        if key:
-            return key
+        for section in ["firms", "FIRMS", "default"]:
+            if section in st.secrets:
+                key = st.secrets[section].get("FIRMS_MAP_KEY")
+                if key:
+                    return key
     except Exception:
         pass
 
+    # 3. Variables d'environnement
     key = os.environ.get("FIRMS_MAP_KEY") or os.environ.get("FIRMS_KEY")
     if key:
         return key
@@ -740,7 +693,7 @@ def show_weather_chart(fig: go.Figure, *, height: int = 340,
                        hovermode: str = "x unified") -> None:
     style_weather_chart(fig, height=height, hovermode=hovermode)
     st.plotly_chart(
-        fig, use_container_width=True,
+        fig, width='stretch',
         config={"displayModeBar": False, "responsive": True},
     )
 
@@ -1019,8 +972,9 @@ firms_alerts, firms_err = load_firms_alerts(lgv_polyline, day_range=firms_day_ra
 if firms_err == "missing_key":
     st.error(
         "🚫 **Clé FIRMS introuvable.**\n\n"
-        "Vérifie que **`FIRMS_MAP_KEY`** est bien définie dans `.streamlit/secrets.toml`\n"
-        "ou dans la variable d'environnement `FIRMS_MAP_KEY`.\n\n"
+        "Vérifie que **`FIRMS_MAP_KEY`** est bien définie :\n"
+        "- Dans `.streamlit/secrets.toml` (à la racine ou dans une section `[firms]`)\n"
+        "- Ou dans la variable d'environnement `FIRMS_MAP_KEY`\n\n"
         "**Rappel** : Crée ta clé gratuite sur "
         "[firms.modaps.eosdis.nasa.gov/api/map_key](https://firms.modaps.eosdis.nasa.gov/api/map_key/)."
     )
@@ -1040,7 +994,7 @@ elif firms_alerts:
     st.dataframe(
         df_firms[["PK (km)", "Distance LGV (m)", "Date", "Heure (UTC)",
                   "Confiance", "FRP (MW)", "Satellite"]],
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 else:
     st.success(f"Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
@@ -1179,7 +1133,7 @@ else:
         with st.expander("📋 Table du TOP 20"):
             st.dataframe(
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
-                use_container_width=True, hide_index=True,
+                width='stretch', hide_index=True,
             )
     st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
                "une requête par commune, mise en cache 1h.")
@@ -1281,7 +1235,6 @@ if not fc_df.empty:
     fc_df["proba_%"]  = pd.to_numeric(fc_df["proba_%"],  errors="coerce").fillna(0)
     fc_df["color"]    = fc_df["pluie_mm"].apply(rain_color_mm)
 
-    # Création d'une figure avec sous-grille pour axes secondaires
     fig2 = make_subplots(specs=[[{"secondary_y": True}]])
     fig2.add_bar(x=fc_df["date"], y=fc_df["pluie_mm"],
                  marker_color=fc_df["color"].tolist(),
@@ -1401,7 +1354,7 @@ if not map_df.empty:
                 f"Satellite : {a['satellite']}", max_width=250),
         ).add_to(m)
 
-    st_folium(m, use_container_width=True, height=450, returned_objects=[])
+    st_folium(m, width='stretch', height=450, returned_objects=[])
     if selected_one == "— Toutes —":
         st.caption("Couleur = prévision pluie 7j par département (Open-Meteo). "
                    "Sélectionner une commune pour voir son cumul mesuré.")
@@ -1427,4 +1380,4 @@ elif not disp.empty:
 
 if not disp.empty:
     st.dataframe(disp.sort_values("PK (km)") if "PK (km)" in disp.columns else disp,
-                 use_container_width=True, hide_index=True, height=300)
+                 width='stretch', hide_index=True, height=300)
