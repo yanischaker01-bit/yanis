@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import math
 import folium
 import pandas as pd
 import plotly.graph_objects as go
@@ -13,6 +14,9 @@ from streamlit_folium import st_folium
 SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+PIEZO_STATIONS_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/stations"
+PIEZO_CHRONIQUES_TR_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/chroniques_tr"
+PIEZO_MAX_AGE_HOURS = 72
 STALE_MINUTES = 180
 
 RISK_COLOR = {
@@ -188,6 +192,74 @@ def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
     return float("nan")
 
 
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*r*math.asin(min(1.0, math.sqrt(a)))
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_piezo_stations(bbox: tuple[float,float,float,float]) -> tuple[pd.DataFrame, str | None]:
+    try:
+        response = requests.get(PIEZO_STATIONS_URL,
+            params={"bbox": ",".join(map(str,bbox)), "size": 20000},
+            headers={"Accept":"application/json","User-Agent":"LGV-SEA-Monitoring/2.0"}, timeout=(8,35))
+        response.raise_for_status()
+        df = pd.DataFrame(response.json().get("data", []))
+        if df.empty: return df, None
+        for source,target in {"x":"longitude","y":"latitude","libelle_pe":"nom_station","nom_commune":"commune_piezo"}.items():
+            if source in df.columns and target not in df.columns: df[target]=df[source]
+        for col in ("latitude","longitude"):
+            if col in df.columns: df[col]=pd.to_numeric(df[col],errors="coerce")
+        return df.dropna(subset=["latitude","longitude"]), None
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_piezo_realtime(code_bss: str) -> tuple[pd.DataFrame, str | None]:
+    try:
+        end=datetime.now(timezone.utc); start=end-timedelta(days=14)
+        response=requests.get(PIEZO_CHRONIQUES_TR_URL, params={"code_bss":code_bss,
+            "date_debut_mesure":start.strftime("%Y-%m-%d"),"date_fin_mesure":end.strftime("%Y-%m-%d"),"size":20000},
+            headers={"Accept":"application/json","User-Agent":"LGV-SEA-Monitoring/2.0"}, timeout=(8,35))
+        response.raise_for_status()
+        df=pd.DataFrame(response.json().get("data", []))
+        if df.empty: return df, None
+        date_col=next((c for c in ("date_mesure","date_mesure_piezo") if c in df.columns),None)
+        level_col=next((c for c in ("niveau_nappe_eau","niveau_eau_ngf") if c in df.columns),None)
+        if not date_col: return pd.DataFrame(), "champ date absent"
+        df["date_mesure_dt"]=pd.to_datetime(df[date_col],errors="coerce",utc=True)
+        if level_col: df["niveau_ngf_m"]=pd.to_numeric(df[level_col],errors="coerce")
+        return df.dropna(subset=["date_mesure_dt"]).sort_values("date_mesure_dt"), None
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+def sector_expert_assessment(row) -> dict:
+    p24=max(0.0,safe_float(getattr(row,"weather_max_24h_mm",0)))
+    p7=max(0.0,safe_float(getattr(row,"weather_max_7d_mm",0)))
+    p30=max(0.0,safe_float(getattr(row,"weather_max_30d_mm",0)))
+    soil=min(max(safe_float(getattr(row,"ai_soil_fragility",0)),0),1)
+    pred=min(max(safe_float(getattr(row,"ai_pred_probability",0)),0),1)
+    signal=min(max(safe_float(getattr(row,"score",0)),0),4)/4
+    rain=.55*min(p24/60,1)+.30*min(p7/120,1)+.15*min(p30/250,1)
+    index=round(100*(.26*soil+.14*signal+.33*pred+.27*rain),1)
+    factors=[]
+    if p24>=30: factors.append("pluie 24 h forte")
+    if p7>=70: factors.append("cumul 7 j élevé")
+    if p30>=150: factors.append("sols humides sur 30 j")
+    if soil>=.65: factors.append("sol fragile")
+    if signal>=.65: factors.append("signal géotechnique")
+    if pred>=.65: factors.append("indice prédictif élevé")
+    if index>=85: level,action="CRITIQUE","Procédure interne et inspection immédiate"
+    elif index>=65: level,action="ELEVE","Inspection sous 24 h et contrôle du drainage"
+    elif index>=40: level,action="MODERE","Surveillance renforcée et revue sous 48 h"
+    else: level,action="FAIBLE","Surveillance courante"
+    fields=("weather_max_24h_mm","weather_max_7d_mm","ai_soil_fragility","ai_pred_probability","score")
+    completeness=round(100*sum(hasattr(row,c) for c in fields)/len(fields))
+    return {"expert_index":index,"expert_level":level,"expert_action":action,
+            "expert_factors":factors or ["aucun facteur dominant"],"data_completeness":completeness}
+
 def risk_badge(level: str) -> str:
     color = RISK_COLOR.get(level, "#6b7280")
     emoji = RISK_EMOJI.get(level, "⚪")
@@ -281,6 +353,9 @@ for col in ["weather_max_24h_mm", "weather_max_7d_mm", "weather_max_30d_mm",
     if col in sectors_df.columns:
         sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
 
+expert_df = pd.DataFrame([sector_expert_assessment(r) for r in sectors_df.itertuples(index=False)], index=sectors_df.index)
+for expert_col in expert_df.columns:
+    sectors_df[expert_col] = expert_df[expert_col]
 sector_lookup: dict = {}
 if {"sector_id", "pk_km", "commune_name"}.issubset(sectors_df.columns):
     sector_lookup = sectors_df.set_index("sector_id")[["pk_km", "commune_name"]].to_dict("index")
@@ -295,6 +370,11 @@ k3.metric("Critiques / Élevés (IA)",
           int(sector_summary.get("ai_critical", 0)) + int(sector_summary.get("ai_high", 0)))
 k4.metric("Probabilité IA moyenne", f"{safe_float(sector_summary.get('ai_mean_probability')) * 100:.0f} %")
 k5.metric("Secteurs sol fragile", int(sector_summary.get("fragile_soil_sectors", 0)))
+e1,e2,e3=st.columns(3)
+e1.metric("Priorités génie civil", int(sectors_df["expert_level"].isin(["ELEVE","CRITIQUE"]).sum()))
+e2.metric("Critiques multicritères", int((sectors_df["expert_level"]=="CRITIQUE").sum()))
+e3.metric("Données incomplètes", int((sectors_df["data_completeness"]<75).sum()))
+st.caption("Indice explicable de priorisation, pas une probabilité statistique validée. Les seuils opérationnels doivent être validés par l'exploitant.")
 
 st.subheader("🚨 Alertes secteurs")
 if not sector_alerts:
@@ -344,8 +424,8 @@ if risque_min != "Tout" and "risk_level" in df.columns:
 
 map_df = df.dropna(subset=["latitude", "longitude"]) if {"latitude", "longitude"}.issubset(df.columns) else pd.DataFrame()
 
-tab_carte, tab_analyses, tab_hist, tab_secteurs, tab_communes = st.tabs(
-    ["🗺 Carte", "📊 Analyses", "📅 Historique", "📋 Secteurs", "🏘 Communes"]
+tab_carte, tab_expert, tab_analyses, tab_hist, tab_secteurs, tab_communes = st.tabs(
+    ["🗺 Carte", "🛠 Surveillance GC", "📊 Analyses", "📅 Historique", "📋 Secteurs", "🏘 Communes"]
 )
 
 # ── Carte ────────────────────────────────────────────────────────────────
@@ -358,7 +438,13 @@ with tab_carte:
             lon_c = float(map_df["longitude"].mean())
             m = folium.Map(location=[lat_c, lon_c],
                             zoom_start=8 if selected == "— Toutes —" else 12,
-                            tiles="CartoDB positron", control_scale=True)
+                            tiles=None, control_scale=True)
+            folium.TileLayer(
+                tiles=("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                       "World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+                attr="Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+                name="Satellite", overlay=False, control=False, max_zoom=19,
+            ).add_to(m)
             for seg in (snapshot.get("lgv_lines") or []):
                 if isinstance(seg, list):
                     pts = [[p[0], p[1]] for p in seg if isinstance(p, (list, tuple)) and len(p) >= 2]
@@ -387,6 +473,58 @@ with tab_carte:
             st_folium(m, width=1400, height=520, returned_objects=[])
         except Exception as e:
             st.warning(f"Carte indisponible pour le moment ({e}).")
+
+# ── Surveillance génie civil ─────────────────────────────────────────────
+with tab_expert:
+    st.markdown("**Priorisation multicritère des secteurs**")
+    priority=df[df["expert_level"].isin(["ELEVE","CRITIQUE"])].sort_values("expert_index",ascending=False)
+    if priority.empty:
+        st.success("Aucun secteur élevé ou critique selon l'indice actuel.")
+    else:
+        st.warning(f"{len(priority)} secteur(s) à examiner en priorité.")
+        for row in priority.head(20).itertuples(index=False):
+            level=getattr(row,"expert_level","INDETERMINE"); color=RISK_COLOR.get(level,"#6b7280")
+            factors=", ".join(getattr(row,"expert_factors",[]) or [])
+            st.markdown(f'<div class="alert-card" style="border-left-color:{color};background:{color}12"><b>{RISK_EMOJI.get(level,"⚪")} {getattr(row,"sector_id","Secteur")} · PK {getattr(row,"pk_km","—")} · {getattr(row,"commune_name","—")}</b><br>Indice : {getattr(row,"expert_index",0):.0f}/100 · {level}<br>Facteurs : {factors}<br><b>Action :</b> {getattr(row,"expert_action","Surveillance")}</div>',unsafe_allow_html=True)
+    st.markdown("**Piézométrie publique Hub'Eau à proximité**")
+    st.caption("Contexte hydrogéologique uniquement. Une station publique distante n'est pas un capteur implanté dans l'ouvrage LGV.")
+    if map_df.empty:
+        st.info("Aucune emprise disponible.")
+    else:
+        bbox=(float(map_df.longitude.min())-.25,float(map_df.latitude.min())-.18,float(map_df.longitude.max())+.25,float(map_df.latitude.max())+.18)
+        stations,piezo_error=load_piezo_stations(bbox)
+        if piezo_error:
+            st.warning(f"Piézométrie non vérifiée : {piezo_error}")
+        elif stations.empty:
+            st.info("Aucun piézomètre public trouvé dans l'emprise.")
+        else:
+            clat,clon=float(map_df.latitude.mean()),float(map_df.longitude.mean())
+            stations=stations.copy()
+            stations["distance_km"]=stations.apply(lambda x:haversine_km(clat,clon,float(x.latitude),float(x.longitude)),axis=1)
+            near=stations.sort_values("distance_km").head(8)
+            station_index=st.selectbox("Station publique",near.index.tolist(),format_func=lambda i:f"{near.loc[i].get('code_bss',near.loc[i].get('bss_id','Station'))} · {near.loc[i].get('commune_piezo',near.loc[i].get('nom_station',''))} · {near.loc[i].distance_km:.1f} km")
+            code=str(near.loc[station_index].get("code_bss","") or near.loc[station_index].get("bss_id",""))
+            series,series_error=load_piezo_realtime(code)
+            if series_error:
+                st.warning(f"Chronique non vérifiée : {series_error}")
+            elif series.empty or "niveau_ngf_m" not in series.columns:
+                st.info("Pas de mesure télétransmise récente : statut non mesuré.")
+            else:
+                valid=series.dropna(subset=["niveau_ngf_m"])
+                if valid.empty:
+                    st.info("Niveau piézométrique non disponible.")
+                else:
+                    last=valid.iloc[-1]
+                    age=(pd.Timestamp.now(tz="UTC")-last.date_mesure_dt).total_seconds()/3600
+                    c1,c2,c3=st.columns(3)
+                    c1.metric("Dernier niveau",f"{last.niveau_ngf_m:.2f} m NGF")
+                    c2.metric("Fraîcheur",f"{age:.0f} h")
+                    c3.metric("État","À JOUR" if age<=PIEZO_MAX_AGE_HOURS else "DONNÉE ANCIENNE")
+                    figp=go.Figure()
+                    figp.add_scatter(x=valid.date_mesure_dt,y=valid.niveau_ngf_m,mode="lines+markers",name="Niveau nappe")
+                    figp.update_layout(height=320,xaxis_title="Date",yaxis_title="m NGF",**CHART_LAYOUT)
+                    st.plotly_chart(figp,width="stretch")
+    st.info("Pour une alerte complète, raccorder les piézomètres internes, inclinomètres, tassements, géométrie des talus, drainage, ouvrages hydrauliques, incidents et inspections. Aucune valeur absente n'est simulée.")
 
 # ── Analyses (profil PK, répartition, facteurs) ───────────────────────────
 with tab_analyses:
@@ -564,7 +702,7 @@ with tab_secteurs:
     if df.empty:
         st.info("Aucun secteur pour ces filtres.")
     else:
-        base_cols = ["commune_name", "pk_km", "risk_level", "ai_pred_risk_level"]
+        base_cols = ["commune_name", "pk_km", "risk_level", "ai_pred_risk_level", "expert_level", "expert_index", "data_completeness", "expert_action"]
         ai_cols = ["ai_pred_probability", "ai_confidence", "ai_soil_fragility", "ai_dominant_pedology"]
         show_cols = [c for c in base_cols + (ai_cols if show_ai_detail else []) if c in df.columns]
         rename = {
@@ -572,6 +710,8 @@ with tab_secteurs:
             "risk_level": "Risque", "ai_pred_risk_level": "Risque IA",
             "ai_pred_probability": "Proba IA", "ai_confidence": "Confiance IA",
             "ai_soil_fragility": "Fragilité sol", "ai_dominant_pedology": "Sol dominant",
+            "expert_level": "Priorité GC", "expert_index": "Indice GC /100",
+            "data_completeness": "Complétude (%)", "expert_action": "Action proposée",
         }
         disp = df[show_cols].copy().rename(columns=rename)
         # Insérer colonne pluie Open-Meteo (commune sélectionnée uniquement)
