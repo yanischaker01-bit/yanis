@@ -23,7 +23,7 @@ SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snap
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 VIGICRUES_GEOJSON_URL = "https://www.vigicrues.gouv.fr/services/1/InfoVigiCru.geojson"
-VIGICRUES_CORRIDOR_KM = 1.0  # troncon retenu s'il croise la LGV ou passe a moins de 1 km
+VIGICRUES_CORRIDOR_KM = 1.0
 
 # NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
 FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}/{date}"
@@ -243,39 +243,18 @@ def load_weather_alerts_all() -> tuple[list, int, int]:
     return alerts, ok_count, len(DEPS)
 
 
-def _normalize(s: str) -> str:
-    """Lowercase + strip accents for robust name matching."""
-    return "".join(
-        c for c in unicodedata.normalize("NFD", s.lower())
-        if unicodedata.category(c) != "Mn"
-    )
-
-# Cours d'eau traversés ou longés par la LGV SEA Tours→Bordeaux
-_RIVERS_RAW = [
-    "vienne", "clain", "charente", "boutonne", "seugne", "touvre",
-    "dronne", "isle", "dordogne", "garonne", "thouet", "sevre",
-    "indre", "cher", "creuse", "ciron", "jalles", "estey",
-    "leyre", "midouze", "brion", "anglin",
-]
-RIVERS_LGV = [_normalize(r) for r in _RIVERS_RAW]
-
-# Departments along LGV SEA (filter unrelated rivers with same name elsewhere)
-_DEP_OK = {"37","86","79","16","17","33","24","47","40","49","85","36"}
-
-
 def _extract_lgv_segments(lgv_lines) -> list[list[tuple[float, float]]]:
-    """Normalise le fichier geographique LGV en segments [(lon, lat), ...]."""
-    segments: list[list[tuple[float, float]]] = []
+    """Retourne tous les segments LGV au format [(lon, lat), ...]."""
+    segments = []
     for raw_segment in lgv_lines or []:
         if not isinstance(raw_segment, list):
             continue
-        points: list[tuple[float, float]] = []
+        points = []
         for point in raw_segment:
             try:
                 if isinstance(point, dict):
                     lat, lon = float(point["lat"]), float(point["lon"])
                 elif isinstance(point, (list, tuple)) and len(point) >= 2:
-                    # Le snapshot historique stocke les tableaux dans l'ordre [lat, lon].
                     lat, lon = float(point[0]), float(point[1])
                 else:
                     continue
@@ -292,9 +271,7 @@ def _lgv_geometry_wgs84(lgv_lines):
     segments = _extract_lgv_segments(lgv_lines)
     if not segments:
         return None
-    if len(segments) == 1:
-        return LineString(segments[0])
-    return MultiLineString(segments)
+    return LineString(segments[0]) if len(segments) == 1 else MultiLineString(segments)
 
 
 _WGS84_TO_L93 = Transformer.from_crs("EPSG:4326", "EPSG:2154", always_xy=True)
@@ -302,95 +279,70 @@ _L93_TO_WGS84 = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
 
 
 def _to_lambert93(geometry):
-    """Convertit une geometrie WGS84 en Lambert-93 pour une distance en metres."""
     return shapely_transform(_WGS84_TO_L93.transform, geometry)
 
 
 def _vigicrues_geometry_to_wgs84(geometry):
-    """Le flux a existe en Lambert-93 et en lon/lat : detecte les deux formats."""
     minx, miny, maxx, maxy = geometry.bounds
-    looks_geographic = (-180 <= minx <= 180 and -180 <= maxx <= 180
-                        and -90 <= miny <= 90 and -90 <= maxy <= 90)
-    return geometry if looks_geographic else shapely_transform(_L93_TO_WGS84.transform, geometry)
+    is_wgs84 = (-180 <= minx <= 180 and -180 <= maxx <= 180
+                and -90 <= miny <= 90 and -90 <= maxy <= 90)
+    return geometry if is_wgs84 else shapely_transform(_L93_TO_WGS84.transform, geometry)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_vigicrue_rivers(lgv_lines, corridor_km: float = VIGICRUES_CORRIDOR_KM) -> tuple[list, bool]:
-    """Vigilance des seuls troncons qui croisent ou approchent la LGV SEA.
-
-    La selection est geometrique : distance minimale entre le trace officiel LGV
-    du snapshot et la geometrie du troncon Vigicrues, calculee en Lambert-93.
-    Un filtre par nom de riviere ou par departement n'est donc plus necessaire.
-    """
+    """Garde seulement les tronçons Vigicrues croisant ou longeant la LGV SEA."""
     lgv_wgs84 = _lgv_geometry_wgs84(lgv_lines)
     if lgv_wgs84 is None or lgv_wgs84.is_empty:
         return [], False
     lgv_l93 = _to_lambert93(lgv_wgs84)
     max_distance_m = max(0.0, float(corridor_km)) * 1000.0
-
     try:
         response = requests.get(
             VIGICRUES_GEOJSON_URL,
-            headers={
-                "Accept": "application/geo+json,application/json",
-                "User-Agent": "LGV-PluvioStations/2.0 (+https://lgvpluviostations.streamlit.app/)",
-            },
+            headers={"Accept": "application/geo+json,application/json",
+                     "User-Agent": "LGV-PluvioStations/2.0"},
             timeout=(5, 30),
         )
         response.raise_for_status()
         payload = response.json()
     except (requests.RequestException, ValueError):
         return [], False
-
-    if payload.get("type") != "FeatureCollection" or not isinstance(payload.get("features"), list):
+    if payload.get("type") != "FeatureCollection":
         return [], False
 
     levels = {1: "VERT", 2: "JAUNE", 3: "ORANGE", 4: "ROUGE"}
-    colors = {"VERT": "#16a34a", "JAUNE": "#eab308", "ORANGE": "#ea580c", "ROUGE": "#dc2626"}
-    selected: list = []
-
-    for feature in payload["features"]:
+    results = {}
+    for feature in payload.get("features", []):
         if not isinstance(feature, dict) or not feature.get("geometry"):
             continue
         try:
-            raw_geometry = shape(feature["geometry"])
-            geometry_wgs84 = _vigicrues_geometry_to_wgs84(raw_geometry)
-            geometry_l93 = _to_lambert93(geometry_wgs84)
-            distance_m = float(geometry_l93.distance(lgv_l93))
+            geometry_wgs84 = _vigicrues_geometry_to_wgs84(shape(feature["geometry"]))
+            distance_m = float(_to_lambert93(geometry_wgs84).distance(lgv_l93))
         except Exception:
             continue
         if distance_m > max_distance_m:
             continue
-
         props = feature.get("properties") or {}
-        raw_level = props.get("NivSituVigiCruEnt", props.get("NivVigiCru", 1))
         try:
-            level = levels.get(int(float(raw_level)), "VERT")
+            level = levels.get(int(float(props.get("NivSituVigiCruEnt", 1))), "VERT")
         except (TypeError, ValueError):
             level = "VERT"
-        name = str(props.get("NomEntVigiCru") or props.get("name")
-                   or props.get("LbEntVigiCru") or "Troncon Vigicrues").strip()
+        name = str(props.get("NomEntVigiCru") or props.get("name") or "Tronçon Vigicrues")
         code = str(props.get("CdEntVigiCru") or props.get("gid") or name)
-        distance_label = "croise la LGV" if distance_m < 5 else f"a {distance_m:.0f} m de la LGV"
-        selected.append({
-            "id": code,
-            "riviere": name,
-            "distance_m": round(distance_m),
-            "level": level,
-            "color": colors[level],
-            "type": "VIGICRUE",
-            "geometry": mapping(geometry_wgs84),
-            "msg": f"{name} — vigilance {level.lower()} · {distance_label}",
-        })
-
-    # Une alerte par troncon, en priorisant le niveau le plus eleve puis la proximite.
-    dedup: dict[str, dict] = {}
-    for item in selected:
-        previous = dedup.get(item["id"])
-        if previous is None or (LEVEL_RANK[item["level"]], -item["distance_m"]) > (LEVEL_RANK[previous["level"]], -previous["distance_m"]):
-            dedup[item["id"]] = item
-    results = sorted(dedup.values(), key=lambda x: (-LEVEL_RANK[x["level"]], x["distance_m"], x["riviere"]))
-    return results, True
+        crossing = distance_m < 5
+        item = {
+            "id": code, "riviere": name, "level": level, "type": "VIGICRUE",
+            "distance_m": round(distance_m), "geometry": mapping(geometry_wgs84),
+            "color": LEVEL_COLOR[level],
+            "msg": f"{name} — vigilance {level.lower()} · "
+                   + ("croise la LGV" if crossing else f"à {distance_m:.0f} m de la LGV"),
+        }
+        previous = results.get(code)
+        if previous is None or LEVEL_RANK[level] > LEVEL_RANK[previous["level"]]:
+            results[code] = item
+    ordered = sorted(results.values(), key=lambda x: (-LEVEL_RANK[x["level"]], x["distance_m"], x["riviere"]))
+    return ordered, True
 
 
 def get_firms_map_key() -> str | None:
@@ -416,16 +368,11 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 @st.cache_data(ttl=3600)
 def build_lgv_pk_polyline(_lgv_lines) -> list[list[tuple[float, float, float]]]:
-    """Construit tous les segments LGV sans creer de liaison artificielle entre eux.
-
-    Chaque point contient (lat, lon, pk_km cumule). Le cumul continue entre les
-    segments, mais aucune distance n'est calculee dans les vides geographiques.
-    """
-    raw_segments = _extract_lgv_segments(_lgv_lines)
-    output: list[list[tuple[float, float, float]]] = []
+    """Construit tous les segments LGV sans liaison artificielle entre eux."""
+    output = []
     cumulative = 0.0
-    for raw_segment in raw_segments:
-        segment: list[tuple[float, float, float]] = []
+    for raw_segment in _extract_lgv_segments(_lgv_lines):
+        segment = []
         previous = None
         for lon, lat in raw_segment:
             if previous is not None:
@@ -438,40 +385,23 @@ def build_lgv_pk_polyline(_lgv_lines) -> list[list[tuple[float, float, float]]]:
 
 
 def pk_and_distance(lat: float, lon: float, polyline) -> tuple[float | None, float | None]:
-    """Projette un point sur le segment LGV reel le plus proche.
-
-    Accepte le nouveau format multi-segments et, par securite, l'ancien format
-    plat. Les separations entre geometries ne sont jamais traitees comme une voie.
-    """
+    """Projette un point sur le segment LGV réel le plus proche."""
     if not polyline:
         return None, None
-    segments = polyline
-    if polyline and isinstance(polyline[0], tuple):
-        segments = [polyline]
-
-    best_dist2 = None
-    best_pk = None
+    segments = [polyline] if isinstance(polyline[0], tuple) else polyline
+    best_dist2 = best_pk = None
     for segment in segments:
-        if len(segment) < 2:
-            continue
         for (lat1, lon1, pk1), (lat2, lon2, pk2) in zip(segment, segment[1:]):
             lat_mid = (lat1 + lat2) / 2.0
-            kx = 111.320 * math.cos(math.radians(lat_mid))
-            ky = 111.320
-            x1, y1 = lon1 * kx, lat1 * ky
-            x2, y2 = lon2 * kx, lat2 * ky
-            xp, yp = lon * kx, lat * ky
-            dx, dy = x2 - x1, y2 - y1
-            segment_length2 = dx * dx + dy * dy
-            t = 0.0 if segment_length2 == 0 else max(
-                0.0, min(1.0, ((xp - x1) * dx + (yp - y1) * dy) / segment_length2)
-            )
-            cx, cy = x1 + t * dx, y1 + t * dy
-            distance2 = (xp - cx) ** 2 + (yp - cy) ** 2
-            if best_dist2 is None or distance2 < best_dist2:
-                best_dist2 = distance2
-                best_pk = pk1 + t * (pk2 - pk1)
-
+            kx, ky = 111.320 * math.cos(math.radians(lat_mid)), 111.320
+            x1, y1, x2, y2, xp, yp = lon1*kx, lat1*ky, lon2*kx, lat2*ky, lon*kx, lat*ky
+            dx, dy = x2-x1, y2-y1
+            length2 = dx*dx + dy*dy
+            t = 0.0 if length2 == 0 else max(0.0, min(1.0, ((xp-x1)*dx + (yp-y1)*dy)/length2))
+            cx, cy = x1+t*dx, y1+t*dy
+            dist2 = (xp-cx)**2 + (yp-cy)**2
+            if best_dist2 is None or dist2 < best_dist2:
+                best_dist2, best_pk = dist2, pk1+t*(pk2-pk1)
     return best_pk, math.sqrt(best_dist2) if best_dist2 is not None else None
 
 
@@ -756,6 +686,24 @@ def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
 
 
 
+# Thème commun : mêmes axes, couleurs, infobulles et marges partout.
+CHART_GRID = "#e8eef5"
+CHART_TEXT = "#475569"
+CHART_TEAL = "#0f766e"
+
+def style_figure(fig: go.Figure, *, height: int = 340, hovermode: str = "x unified") -> go.Figure:
+    fig.update_layout(
+        height=height, hovermode=hovermode,
+        font=dict(family="Arial, sans-serif", size=12, color=CHART_TEXT),
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(t=40, b=45, l=50, r=35),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        hoverlabel=dict(bgcolor="white", font_size=12, font_color="#0f172a"),
+    )
+    fig.update_xaxes(showgrid=False, showline=True, linecolor="#cbd5e1", automargin=True)
+    fig.update_yaxes(showgrid=True, gridcolor=CHART_GRID, zerolinecolor="#cbd5e1", automargin=True)
+    return fig
+
 def safe_df(records) -> pd.DataFrame:
     if isinstance(records, list) and records:
         try:
@@ -1032,7 +980,7 @@ elif firms_alerts:
     st.dataframe(
         df_firms[["PK (km)", "Distance LGV (m)", "Date", "Heure (UTC)",
                   "Confiance", "FRP (MW)", "Satellite"]],
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
 else:
     st.success(f"Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
@@ -1142,7 +1090,10 @@ else:
             plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
             margin=dict(t=10, b=30, l=10, r=90),
         )
-        st.plotly_chart(fig_top, use_container_width=True)
+        style_figure(fig_top, height=max(360, len(bar_df) * 30 + 80), hovermode="closest")
+        fig_top.update_xaxes(title="Cumul de précipitations (mm)", rangemode="tozero")
+        fig_top.update_yaxes(title=None, showgrid=False)
+        st.plotly_chart(fig_top, width="stretch", config={"displayModeBar": False})
 
         # Courbes journalières : top 3 en couleur (identité), le reste du TOP 20 en gris (contexte)
         HIGHLIGHT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a"]
@@ -1165,14 +1116,17 @@ else:
             legend=dict(orientation="h", y=1.15),
             margin=dict(t=35, b=20, l=20, r=20),
         )
-        st.plotly_chart(fig_curve, use_container_width=True)
+        style_figure(fig_curve, height=370)
+        fig_curve.update_xaxes(title=None, tickformat="%d/%m")
+        fig_curve.update_yaxes(title="Précipitations journalières (mm)", rangemode="tozero")
+        st.plotly_chart(fig_curve, width="stretch", config={"displayModeBar": False})
         st.caption("Courbes : les 3 communes les plus arrosées de ce TOP 20 sont mises en évidence "
                    "(couleur + légende) · les 17 autres apparaissent en gris clair pour le contexte.")
 
         with st.expander("📋 Table du TOP 20"):
             st.dataframe(
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
-                use_container_width=True, hide_index=True,
+                width="stretch", hide_index=True,
             )
     st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
                "une requête par commune, mise en cache 1h.")
@@ -1247,7 +1201,10 @@ if selected_multi and not sectors_df.empty:
                 plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                 margin=dict(t=10, b=30, l=10, r=90),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            style_figure(fig, height=height, hovermode="closest")
+            fig.update_xaxes(title="Cumul de précipitations (mm)", rangemode="tozero")
+            fig.update_yaxes(title=None, showgrid=False)
+            st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
             _src = "AROME Météo-France 1,3 km" if periode == "24h" else "ERA5 near real-time"
             st.caption(f"Source : Open-Meteo {_src} · {date_str}")
 
@@ -1297,7 +1254,9 @@ if not fc_df.empty:
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         margin=dict(t=30, b=20, l=20, r=80), xaxis=dict(tickangle=-20),
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    style_figure(fig2, height=360)
+    fig2.update_xaxes(title=None, tickangle=0)
+    st.plotly_chart(fig2, width="stretch", config={"displayModeBar": False})
 else:
     st.info("Prévisions indisponibles.")
 
@@ -1314,7 +1273,12 @@ if not monthly_df.empty:
     fig3.update_layout(coloraxis_showscale=False, height=260,
                        plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
                        margin=dict(t=20,b=20,l=20,r=20), xaxis=dict(tickangle=-30))
-    st.plotly_chart(fig3, use_container_width=True)
+    monthly_mean = float(monthly_df["pluie_mm"].mean())
+    fig3.add_hline(y=monthly_mean, line_dash="dash", line_color=CHART_TEAL, annotation_text=f"Moyenne : {monthly_mean:.0f} mm")
+    style_figure(fig3, height=340, hovermode="closest")
+    fig3.update_xaxes(title=None, tickangle=0)
+    fig3.update_yaxes(title="Cumul mensuel (mm)", rangemode="tozero")
+    st.plotly_chart(fig3, width="stretch", config={"displayModeBar": False})
 else:
     st.info("Historique indisponible.")
 
@@ -1375,20 +1339,15 @@ if not map_df.empty:
             if pts:
                 folium.PolyLine(pts, color="#cc0000", weight=2.5, opacity=0.7).add_to(m)
 
-    # Troncons Vigicrues selectionnes par intersection/proximite geometrique avec la LGV.
     for alert in vc_alerts:
-        geometry = alert.get("geometry")
-        if not geometry:
+        if not alert.get("geometry"):
             continue
         folium.GeoJson(
-            {"type": "Feature", "geometry": geometry, "properties": {}},
-            name=f"Vigicrues - {alert['riviere']}",
-            style_function=lambda _feature, color=alert["color"]: {
-                "color": color, "weight": 5, "opacity": 0.9,
-            },
+            {"type": "Feature", "geometry": alert["geometry"], "properties": {}},
+            name=f"Vigicrues — {alert['riviere']}",
+            style_function=lambda _feature, color=alert["color"]: {"color": color, "weight": 5, "opacity": 0.9},
             tooltip=folium.Tooltip(
-                f"{alert['riviere']} - {alert['level']} - "
-                f"{alert['distance_m']} m de la LGV"
+                f"{alert['riviere']} — {alert['level']} — {alert['distance_m']} m de la LGV"
             ),
         ).add_to(m)
 
@@ -1431,4 +1390,4 @@ elif not disp.empty:
 
 if not disp.empty:
     st.dataframe(disp.sort_values("PK (km)") if "PK (km)" in disp.columns else disp,
-                 use_container_width=True, hide_index=True, height=300)
+                 width="stretch", hide_index=True, height=300)
