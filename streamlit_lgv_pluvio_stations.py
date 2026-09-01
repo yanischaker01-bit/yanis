@@ -1,8 +1,10 @@
+```python
 from __future__ import annotations
 
 import io
 import math
 import os
+import time
 import unicodedata
 import xml.etree.ElementTree as ET
 from collections import defaultdict
@@ -390,15 +392,33 @@ def load_vigicrue_rivers() -> tuple[list, bool]:
 
 
 def get_firms_map_key() -> str | None:
-    """Clé API FIRMS : st.secrets['FIRMS_MAP_KEY'] ou variable d'env FIRMS_MAP_KEY.
-    Clé gratuite : https://firms.modaps.eosdis.nasa.gov/api/map_key/"""
+    """Récupère la clé FIRMS depuis les secrets Streamlit ou les variables d'environnement.
+    Essaie plusieurs emplacements possibles."""
+    # 1. Secrets Streamlit (racine)
     try:
         key = st.secrets.get("FIRMS_MAP_KEY")
         if key:
             return key
     except Exception:
         pass
-    return os.environ.get("FIRMS_MAP_KEY")
+
+    # 2. Secrets Streamlit (section 'firms')
+    try:
+        key = st.secrets.get("firms", {}).get("FIRMS_MAP_KEY")
+        if key:
+            return key
+    except Exception:
+        pass
+
+    # 3. Variables d'environnement
+    key = os.environ.get("FIRMS_MAP_KEY") or os.environ.get("FIRMS_KEY")
+    if key:
+        return key
+
+    # 4. (optionnel) Si vous utilisez un fichier .env non standard
+    #    Vous pouvez ajouter une lecture depuis un fichier de config.
+
+    return None
 
 
 def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -457,18 +477,26 @@ def pk_and_distance(lat: float, lon: float, polyline: list) -> tuple[float | Non
 def _fetch_firms_source_raw(key: str, source: str, day_range: int, date_str: str) -> pd.DataFrame:
     url = FIRMS_AREA_URL.format(key=key, source=source, area=FIRMS_BBOX,
                                  day_range=day_range, date=date_str)
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    txt = r.text.strip()
-    if "invalid" in txt.lower()[:200]:
-        raise ValueError("invalid_key")
-    if not txt or "<html" in txt.lower()[:200]:
-        raise RuntimeError("unexpected_response")
-    df = pd.read_csv(io.StringIO(txt))
-    if "latitude" not in df.columns:
-        raise RuntimeError("unexpected_response")
-    df["source"] = source
-    return df
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=20)
+            r.raise_for_status()
+            txt = r.text.strip()
+            if "invalid" in txt.lower()[:200]:
+                raise ValueError("invalid_key")
+            if not txt or "<html" in txt.lower()[:200]:
+                raise RuntimeError("unexpected_response")
+            df = pd.read_csv(io.StringIO(txt))
+            if "latitude" not in df.columns:
+                raise RuntimeError("unexpected_response")
+            df["source"] = source
+            return df
+        except (requests.RequestException, ValueError, RuntimeError) as e:
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)  # 1s, 2s, 4s
+    # fallback (ne devrait pas arriver)
+    raise RuntimeError("Failed after retries")
 
 
 def load_firms_hotspots(day_range: int = 1, end_date=None) -> tuple[pd.DataFrame, str | None]:
@@ -730,8 +758,6 @@ def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
                               for m, v in sorted(monthly.items())])
     except Exception:
         return pd.DataFrame()
-
-
 
 
 # Charte graphique commune aux graphiques météo/pluviométrie.
@@ -1061,14 +1087,15 @@ firms_alerts, firms_err = load_firms_alerts(lgv_polyline, day_range=firms_day_ra
                                              end_date=firms_end_date)
 
 if firms_err == "missing_key":
-    st.warning(
-        "Clé FIRMS manquante. Crée une clé gratuite sur "
-        "[firms.modaps.eosdis.nasa.gov/api/map_key](https://firms.modaps.eosdis.nasa.gov/api/map_key/), "
-        "puis renseigne-la dans `.streamlit/secrets.toml` (`FIRMS_MAP_KEY = \"...\"`) "
-        "ou la variable d'environnement `FIRMS_MAP_KEY`."
+    st.error(
+        "🚫 **Clé FIRMS introuvable.**\n\n"
+        "Vérifie que **`FIRMS_MAP_KEY`** est bien définie dans `.streamlit/secrets.toml`\n"
+        "ou dans la variable d'environnement `FIRMS_MAP_KEY`.\n\n"
+        "**Rappel** : Crée ta clé gratuite sur "
+        "[firms.modaps.eosdis.nasa.gov/api/map_key](https://firms.modaps.eosdis.nasa.gov/api/map_key/)."
     )
 elif firms_err == "invalid_key":
-    st.error("Clé FIRMS invalide — vérifie `FIRMS_MAP_KEY`.")
+    st.error("**Clé FIRMS invalide** — vérifie la valeur de `FIRMS_MAP_KEY`.")
 elif firms_err == "fetch_failed":
     st.warning("FIRMS injoignable actuellement (réseau/API) — statut incendie **non vérifié** "
                "(ce n'est pas un « aucun feu détecté », réessaie dans quelques minutes).")
