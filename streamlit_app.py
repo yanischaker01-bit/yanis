@@ -39,7 +39,50 @@ LEVEL_ACTION = {
     "ROUGE": "Contrôle prioritaire et application des consignes métier",
 }
 
-st.set_page_config(page_title="LGV SEA - Surveillance optimisée", page_icon="⚠️", layout="wide")
+PHENOMENON_LABELS = {
+    "PLUIE_INONDATION": "Pluie et ruissellement",
+    "ORAGE": "Orage",
+    "VENT": "Vent fort",
+    "CANICULE": "Canicule / chaleur",
+    "FROID": "Grand froid",
+    "NEIGE_VERGLAS": "Neige / verglas",
+    "CRUE": "Crue / inondation",
+}
+
+PHENOMENON_ACTIONS = {
+    "PLUIE_INONDATION": [
+        "Contrôler les fossés, exutoires, buses et ouvrages hydrauliques.",
+        "Rechercher ravinement, érosion, résurgences et matériaux entraînés.",
+        "Programmer une inspection post-épisode des talus sensibles.",
+    ],
+    "ORAGE": [
+        "Cibler les points bas et ouvrages hydrauliques avant le pic prévu.",
+        "Suspendre ou adapter les inspections extérieures si l'orage est proche.",
+        "Contrôler après passage les chutes de branches et dégâts localisés.",
+    ],
+    "VENT": [
+        "Surveiller arbres, écrans, clôtures et objets susceptibles d'être projetés.",
+        "Adapter les interventions exposées aux fortes rafales.",
+    ],
+    "CANICULE": [
+        "Appliquer les consignes chaleur pour les agents et équipements sensibles.",
+        "Surveiller les sols argileux fissurés et la réhumidification après sécheresse.",
+    ],
+    "FROID": [
+        "Contrôler les zones soumises au gel-dégel et les écoulements bloqués.",
+        "Adapter les conditions d'accès et d'intervention.",
+    ],
+    "NEIGE_VERGLAS": [
+        "Sécuriser les accès et contrôler les dispositifs de drainage gelés.",
+        "Adapter les inspections et interventions aux conditions d'adhérence.",
+    ],
+    "CRUE": [
+        "Contrôler les franchissements, pieds de remblai et zones basses proches.",
+        "Vérifier affouillement, érosion et obstruction des ouvrages.",
+    ],
+}
+
+st.set_page_config(page_title="LGV SEA - Surveillance multirisques", page_icon="⚠️", layout="wide")
 
 # =============================================================================
 # OUTILS
@@ -166,26 +209,191 @@ def make_sectors(points, width=10):
 # =============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_forecast(lat, lon):
+    """Prévisions multirisques à un point représentatif du secteur."""
     return get_json(FORECAST_URL, params={
-        "latitude": round(lat, 4), "longitude": round(lon, 4),
-        "hourly": "precipitation,soil_moisture_0_to_7cm,wind_gusts_10m",
-        "daily": "precipitation_sum,precipitation_probability_max,wind_gusts_10m_max,weather_code",
-        "forecast_days": 7, "timezone": "Europe/Paris",
+        "latitude": round(lat, 4),
+        "longitude": round(lon, 4),
+        "hourly": ",".join([
+            "temperature_2m", "apparent_temperature", "relative_humidity_2m",
+            "precipitation", "precipitation_probability", "rain", "showers",
+            "weather_code", "soil_moisture_0_to_7cm", "soil_moisture_7_to_28cm",
+            "wind_speed_10m", "wind_gusts_10m",
+        ]),
+        "daily": ",".join([
+            "weather_code", "temperature_2m_max", "temperature_2m_min",
+            "apparent_temperature_max", "apparent_temperature_min",
+            "precipitation_sum", "precipitation_probability_max",
+            "wind_speed_10m_max", "wind_gusts_10m_max",
+        ]),
+        "forecast_days": 7,
+        "timezone": "Europe/Paris",
     })
 
 
+def _series(container, key, fill=None):
+    s = pd.to_numeric(pd.Series(container.get(key, [])), errors="coerce")
+    return s.fillna(fill) if fill is not None else s
+
+
+def _rolling_max(series, window):
+    if series.empty:
+        return np.nan
+    return float(series.rolling(window, min_periods=1).sum().max())
+
+
 def forecast_summary(payload):
-    hourly = payload.get("hourly", {})
-    daily = payload.get("daily", {})
-    rain_h = pd.to_numeric(pd.Series(hourly.get("precipitation", [])), errors="coerce").fillna(0)
-    soil = pd.to_numeric(pd.Series(hourly.get("soil_moisture_0_to_7cm", [])), errors="coerce").dropna()
-    rain_d = pd.to_numeric(pd.Series(daily.get("precipitation_sum", [])), errors="coerce").fillna(0)
+    hourly = payload.get("hourly", {}) or {}
+    daily = payload.get("daily", {}) or {}
+    rain = _series(hourly, "precipitation", 0)
+    showers = _series(hourly, "showers", 0)
+    temp = _series(hourly, "temperature_2m")
+    apparent = _series(hourly, "apparent_temperature")
+    gust = _series(hourly, "wind_gusts_10m")
+    wind = _series(hourly, "wind_speed_10m")
+    code = _series(hourly, "weather_code")
+    probability = _series(hourly, "precipitation_probability", 0)
+    soil_surface = _series(hourly, "soil_moisture_0_to_7cm")
+    soil_deep = _series(hourly, "soil_moisture_7_to_28cm")
+    daily_rain = _series(daily, "precipitation_sum", 0)
+
+    first72 = slice(0, min(72, len(rain)))
+    thunder_hours = int(code.iloc[first72].isin([95, 96, 99]).sum()) if not code.empty else 0
+    freezing_hours = int(((temp.iloc[first72] <= 0) & (rain.iloc[first72] > 0)).sum()) if not temp.empty else 0
+
     return {
-        "rain_6h": float(rain_h.iloc[:6].sum()), "rain_24h": float(rain_h.iloc[:24].sum()),
-        "rain_72h": float(rain_h.iloc[:72].sum()), "rain_7d": float(rain_d.sum()),
-        "soil": float(soil.iloc[0]) if not soil.empty else np.nan, "daily": daily,
+        "rain_1h_max": float(rain.iloc[first72].max()) if not rain.empty else np.nan,
+        "rain_3h_max": _rolling_max(rain.iloc[first72], 3),
+        "rain_6h": float(rain.iloc[:6].sum()),
+        "rain_24h": float(rain.iloc[:24].sum()),
+        "rain_72h": float(rain.iloc[first72].sum()),
+        "rain_7d": float(daily_rain.sum()),
+        "showers_72h": float(showers.iloc[first72].sum()) if not showers.empty else np.nan,
+        "precip_probability_max": float(probability.iloc[first72].max()) if not probability.empty else np.nan,
+        "soil": float(soil_surface.iloc[0]) if not soil_surface.dropna().empty else np.nan,
+        "soil_deep": float(soil_deep.iloc[0]) if not soil_deep.dropna().empty else np.nan,
+        "gust_max": float(gust.iloc[first72].max()) if not gust.dropna().empty else np.nan,
+        "wind_max": float(wind.iloc[first72].max()) if not wind.dropna().empty else np.nan,
+        "temp_max": float(temp.iloc[first72].max()) if not temp.dropna().empty else np.nan,
+        "temp_min": float(temp.iloc[first72].min()) if not temp.dropna().empty else np.nan,
+        "apparent_max": float(apparent.iloc[first72].max()) if not apparent.dropna().empty else np.nan,
+        "apparent_min": float(apparent.iloc[first72].min()) if not apparent.dropna().empty else np.nan,
+        "hot_hours": int((temp.iloc[first72] >= 35).sum()) if not temp.empty else 0,
+        "frost_hours": int((temp.iloc[first72] <= 0).sum()) if not temp.empty else 0,
+        "freezing_precip_hours": freezing_hours,
+        "thunder_hours": thunder_hours,
+        "daily": daily,
+        "hourly": hourly,
     }
 
+
+def normalize_phenomenon(value):
+    v = norm(value).replace("_", " ").replace("-", " ")
+    if "orage" in v:
+        return "ORAGE"
+    if "canicul" in v or "chaleur" in v:
+        return "CANICULE"
+    if "neige" in v or "verglas" in v:
+        return "NEIGE_VERGLAS"
+    if "grand froid" in v or v.strip() == "froid":
+        return "FROID"
+    if "vent" in v:
+        return "VENT"
+    if "crue" in v or ("inond" in v and "pluie" not in v):
+        return "CRUE"
+    if "pluie" in v or "inond" in v:
+        return "PLUIE_INONDATION"
+    return None
+
+
+def level_from_score(score):
+    return risk_level(score)
+
+
+def hazard_scores(fc, official_alerts=None, vigicrues_level="VERT"):
+    """Sous-indices indépendants, pour ne pas confondre glissement et météo d'exploitation."""
+    official_alerts = official_alerts or []
+    official = {k: "VERT" for k in PHENOMENON_LABELS}
+    for alert in official_alerts:
+        key = normalize_phenomenon(alert.get("phenomenon"))
+        level = alert.get("level", "VERT")
+        if key and LEVEL_RANK.get(level, 0) > LEVEL_RANK.get(official[key], 0):
+            official[key] = level
+    if LEVEL_RANK.get(vigicrues_level, 0) > LEVEL_RANK.get(official["CRUE"], 0):
+        official["CRUE"] = vigicrues_level
+
+    raw = {
+        "PLUIE_INONDATION": 100 * (
+            .30 * scale(fc.get("rain_1h_max"), 5, 30)
+            + .20 * scale(fc.get("rain_3h_max"), 10, 60)
+            + .25 * scale(fc.get("rain_24h"), 20, 80)
+            + .15 * scale(fc.get("rain_72h"), 40, 150)
+            + .10 * scale(fc.get("soil_deep"), .22, .45)
+        ),
+        "ORAGE": 100 * max(
+            scale(fc.get("thunder_hours"), 0, 4),
+            .55 * scale(fc.get("rain_1h_max"), 5, 30)
+            + .25 * scale(fc.get("showers_72h"), 5, 40)
+            + .20 * scale(fc.get("gust_max"), 50, 110),
+        ),
+        "VENT": 100 * (
+            .75 * scale(fc.get("gust_max"), 60, 130)
+            + .25 * scale(fc.get("wind_max"), 35, 80)
+        ),
+        "CANICULE": 100 * (
+            .55 * scale(fc.get("temp_max"), 30, 40)
+            + .25 * scale(fc.get("apparent_max"), 32, 44)
+            + .20 * scale(fc.get("hot_hours"), 3, 24)
+        ),
+        "FROID": 100 * (
+            .65 * scale(-safe_float(fc.get("temp_min")), 0, 10)
+            + .35 * scale(fc.get("frost_hours"), 3, 36)
+        ),
+        "NEIGE_VERGLAS": 100 * max(
+            scale(fc.get("freezing_precip_hours"), 0, 4),
+            .7 * scale(fc.get("frost_hours"), 3, 24)
+            + .3 * scale(fc.get("rain_24h"), 1, 15),
+        ),
+        "CRUE": 100 * (
+            .55 * scale(fc.get("rain_72h"), 40, 180)
+            + .25 * scale(fc.get("rain_7d"), 60, 250)
+            + .20 * scale(fc.get("soil_deep"), .25, .48)
+        ),
+    }
+
+    rows = []
+    for key, score in raw.items():
+        official_score = max(0, LEVEL_RANK.get(official[key], 0)) * 25
+        final_score = max(float(score), float(official_score))
+        rows.append({
+            "code": key,
+            "Phénomène": PHENOMENON_LABELS[key],
+            "Indice": round(final_score, 1),
+            "Niveau": level_from_score(final_score),
+            "Vigilance officielle": official[key],
+        })
+    return pd.DataFrame(rows).sort_values("Indice", ascending=False)
+
+
+def civil_engineering_assessment(hazards, sector):
+    top = hazards.iloc[0]
+    geo_candidates = hazards[hazards["code"].isin(["PLUIE_INONDATION", "CRUE", "ORAGE"])]
+    geo_weather = float(geo_candidates["Indice"].max()) if not geo_candidates.empty else 0.0
+    susceptibility = 100 * safe_float(sector.get("susceptibility"), .4)
+    soil = 100 * safe_float(sector.get("soil_fragility"), .4)
+    geotech_score = min(100.0, .55 * geo_weather + .25 * susceptibility + .20 * soil)
+    operational = float(hazards["Indice"].max())
+    return {
+        "geotech_score": round(geotech_score, 1),
+        "geotech_level": risk_level(geotech_score),
+        "operational_score": round(operational, 1),
+        "operational_level": risk_level(operational),
+        "global_level": max(
+            [risk_level(geotech_score), risk_level(operational)],
+            key=lambda x: LEVEL_RANK.get(x, -1),
+        ),
+        "dominant_code": top["code"],
+        "dominant_label": top["Phénomène"],
+    }
 
 @st.cache_data(ttl=21600, show_spinner=False)
 def load_daily_rain(lat, lon, start_date, end_date):
@@ -376,10 +584,54 @@ def calculate_risk(rain, sector, piezo=None, forecast=None, mf="VERT", vc="VERT"
     factors = [k for k,v in sorted(valid.items(), key=lambda x:x[1], reverse=True)[:4] if v >= .5]
     return {"score":round(score,1),"level":risk_level(score),"confidence":round(100*valid_weight),"factors":factors}
 
+def make_fine_sections(points, parent_sector, width=1.0):
+    """Découpe uniquement le secteur choisi. 1 km est le compromis par défaut."""
+    work = points[
+        (points["pk_km"] >= parent_sector["pk_start"])
+        & (points["pk_km"] <= parent_sector["pk_end"])
+    ].copy()
+    if work.empty:
+        return pd.DataFrame()
+    origin = float(parent_sector["pk_start"])
+    work["fine_start"] = origin + np.floor((work["pk_km"] - origin) / width) * width
+    rows = []
+    for pk_start, group in work.groupby("fine_start"):
+        ai = pd.to_numeric(group.get("ai_pred_probability"), errors="coerce").dropna()
+        soil = pd.to_numeric(group.get("ai_soil_fragility"), errors="coerce").dropna()
+        measured = pd.to_numeric(group.get("score"), errors="coerce").dropna()
+        susceptibility = float(ai.max()) if not ai.empty else safe_float(parent_sector.get("susceptibility"), .4)
+        fragility = float(soil.mean()) if not soil.empty else safe_float(parent_sector.get("soil_fragility"), .4)
+        signal = min(1.0, float(measured.max()) / 4) if not measured.empty else safe_float(parent_sector.get("signal"), .2)
+        local_score = 100 * (.55 * susceptibility + .30 * fragility + .15 * signal)
+        rows.append({
+            "PK début": round(float(pk_start), 3),
+            "PK fin": round(min(float(pk_start + width), float(parent_sector["pk_end"])), 3),
+            "Latitude": float(group["latitude"].mean()),
+            "Longitude": float(group["longitude"].mean()),
+            "Communes": ", ".join(sorted(group["commune_name"].astype(str).unique())),
+            "Sensibilité": round(susceptibility, 3),
+            "Fragilité sol": round(fragility, 3),
+            "Signal": round(signal, 3),
+            "Indice local": round(local_score, 1),
+            "Niveau local": risk_level(local_score),
+        })
+    return pd.DataFrame(rows).sort_values("PK début")
+
+
+def interpolate_line_at_pk(line, target_pk):
+    if not line:
+        return None
+    for a, b in zip(line, line[1:]):
+        if a[2] <= target_pk <= b[2]:
+            ratio = 0 if b[2] == a[2] else (target_pk - a[2]) / (b[2] - a[2])
+            return (a[0] + ratio * (b[0] - a[0]), a[1] + ratio * (b[1] - a[1]))
+    return (line[-1][0], line[-1][1])
+
+
 # =============================================================================
 # APPLICATION LAZY LOAD
 # =============================================================================
-st.title("⚠️ LGV SEA - Surveillance optimisée des risques de glissement")
+st.title("⚠️ LGV SEA - Surveillance multirisques et géotechnique")
 st.caption("Chargement rapide : tous les secteurs sont affichés immédiatement. Les API lourdes sont appelées uniquement dans le module choisi.")
 
 try:
@@ -393,7 +645,7 @@ sectors = make_sectors(points)
 with st.sidebar:
     st.header("Pilotage")
     sector_name = st.selectbox("Secteur surveillé", ["Tous les secteurs"]+sectors["name"].tolist(), index=0)
-    module = st.radio("Module", ["Vue rapide", "Alertes et prévisions", "Pluie historique", "Piézomètres actifs", "Risque historique", "Carte satellite"], index=0)
+    module = st.radio("Module", ["Vue rapide", "Alertes et prévisions", "Localisation fine", "Pluie historique", "Piézomètres actifs", "Risque historique", "Carte satellite"], index=0)
     radius = st.slider("Rayon piézomètres", 1, 20, 8, format="%d km")
     station_limit = st.slider("Stations à tester", 10, 60, 30, 10)
     if st.button("🔄 Actualiser"):
@@ -419,31 +671,117 @@ if module == "Vue rapide":
     st.info("Vue instantanée depuis le snapshot. Sélectionne un secteur et un module pour charger les données détaillées.")
 
 elif module == "Alertes et prévisions":
-    st.subheader(f"Alertes et prévisions - {sector_name}")
-    with st.spinner("Chargement parallèle des sources..."):
+    st.subheader(f"Alertes multirisques et prévisions - {sector_name}")
+    st.caption("Lecture séparée du risque géotechnique et des contraintes d'exploitation. Les seuils sont des indicateurs d'aide à la décision à valider selon les procédures métier.")
+
+    representative = selected_sectors.iloc[0] if not selected_sectors.empty else sectors.iloc[0]
+    with st.spinner("Chargement parallèle des vigilances et prévisions..."):
         with ThreadPoolExecutor(max_workers=3) as pool:
-            f_mf=pool.submit(load_mf_alerts); f_vc=pool.submit(load_vigicrues); f_fc=pool.submit(load_forecast,lat_c,lon_c)
-            mf_alerts,mf_ok=f_mf.result(); vc_alerts,vc_ok=f_vc.result()
-            try: forecast=forecast_summary(f_fc.result()); fc_ok=True
-            except Exception: forecast={}; fc_ok=False
-    a,b,c=st.columns(3)
-    with a:
-        st.markdown("**Vigilance Météo-France**")
-        if not mf_ok: st.warning("Non vérifiée")
-        elif not mf_alerts: st.success("Aucune vigilance non verte")
-        else:
-            for x in mf_alerts: st.write(f"{x['level']} | Dép. {x['dep']} | {x['phenomenon']} | {x['day']}")
-    with b:
-        st.markdown("**Prévisions**")
-        if not fc_ok: st.warning("Non vérifiées")
-        else:
-            st.metric("6 h",f"{forecast['rain_6h']:.1f} mm"); st.metric("24 h",f"{forecast['rain_24h']:.1f} mm"); st.metric("72 h",f"{forecast['rain_72h']:.1f} mm"); st.metric("7 j",f"{forecast['rain_7d']:.1f} mm")
-    with c:
-        st.markdown("**Vigicrues**")
-        if not vc_ok: st.warning("Non vérifié")
-        elif not [x for x in vc_alerts if x["level"]!="VERT"]: st.success("Aucune vigilance non verte")
-        else:
-            for x in sorted(vc_alerts,key=lambda z:-LEVEL_RANK[z["level"]])[:15]: st.write(f"{x['level']} | {x['name']}")
+            f_mf = pool.submit(load_mf_alerts)
+            f_vc = pool.submit(load_vigicrues)
+            f_fc = pool.submit(load_forecast, lat_c, lon_c)
+        mf_alerts, mf_ok = f_mf.result()
+        vc_alerts, vc_ok = f_vc.result()
+        try:
+            forecast = forecast_summary(f_fc.result())
+            fc_ok = True
+        except Exception as exc:
+            forecast, fc_ok = {}, False
+            st.warning(f"Prévisions indisponibles : {exc}")
+
+    if fc_ok:
+        vc_level = max(
+            [x.get("level", "VERT") for x in vc_alerts] or ["VERT"],
+            key=lambda x: LEVEL_RANK.get(x, 0),
+        )
+        hazards = hazard_scores(forecast, mf_alerts if mf_ok else [], vc_level if vc_ok else "VERT")
+        assessment = civil_engineering_assessment(hazards, representative)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Niveau global", assessment["global_level"])
+        c2.metric("Géotechnique", assessment["geotech_level"], f"{assessment['geotech_score']:.1f}/100")
+        c3.metric("Exploitation", assessment["operational_level"], f"{assessment['operational_score']:.1f}/100")
+        c4.metric("Phénomène dominant", assessment["dominant_label"])
+
+        st.markdown("### Prévisions utiles au génie civil")
+        a, b, c, d, e, f = st.columns(6)
+        a.metric("Pluie max 1 h", f"{forecast['rain_1h_max']:.1f} mm")
+        b.metric("Pluie max 3 h", f"{forecast['rain_3h_max']:.1f} mm")
+        c.metric("Pluie 24 h", f"{forecast['rain_24h']:.1f} mm")
+        d.metric("Pluie 72 h", f"{forecast['rain_72h']:.1f} mm")
+        e.metric("Rafale max", f"{forecast['gust_max']:.0f} km/h")
+        f.metric("Température", f"{forecast['temp_min']:.1f} à {forecast['temp_max']:.1f} °C")
+
+        display_hazards = hazards.drop(columns=["code"])
+        st.dataframe(
+            display_hazards,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Indice": st.column_config.ProgressColumn("Indice", min_value=0, max_value=100, format="%.1f"),
+            },
+        )
+
+        dominant = assessment["dominant_code"]
+        st.markdown("### Lecture métier et actions suggérées")
+        st.warning(
+            f"Phénomène dominant : {PHENOMENON_LABELS[dominant]}. "
+            f"Le niveau géotechnique combine la sollicitation météo, la sensibilité du secteur "
+            f"et la fragilité du sol. Il ne constitue pas une preuve qu'un désordre va se produire."
+        )
+        for action in PHENOMENON_ACTIONS.get(dominant, []):
+            st.write(f"• {action}")
+
+        with st.expander("Détail des vigilances officielles"):
+            if not mf_ok:
+                st.warning("Vigilance Météo-France non vérifiée.")
+            elif not mf_alerts:
+                st.success("Aucune vigilance départementale non verte détectée.")
+            else:
+                for x in sorted(mf_alerts, key=lambda z: -LEVEL_RANK.get(z["level"], 0)):
+                    st.write(f"{x['level']} | Département {x['dep']} | {x['phenomenon']} | {x['day']}")
+            if not vc_ok:
+                st.warning("Vigicrues non vérifié.")
+            elif not vc_alerts:
+                st.success("Aucune vigilance crue significative détectée sur les cours d'eau suivis.")
+            else:
+                for x in sorted(vc_alerts, key=lambda z: -LEVEL_RANK.get(z["level"], 0))[:20]:
+                    st.write(f"{x['level']} | {x['name']}")
+
+        st.caption(f"Prévision évaluée au point représentatif du secteur : {lat_c:.4f}, {lon_c:.4f}. Cache 30 minutes.")
+
+elif module == "Localisation fine":
+    if all_selected:
+        st.warning("Sélectionne d'abord un secteur de 10 km pour lancer l'analyse fine.")
+        st.stop()
+    st.subheader(f"Localisation fine - {sector_name}")
+    st.info("Le secteur de 10 km reste l'unité de pilotage. Cette vue le découpe à la demande pour localiser les zones intrinsèquement les plus sensibles, sans prétendre que la météo est précise au mètre.")
+    fine_width = st.select_slider(
+        "Pas d'analyse",
+        options=[0.5, 1.0, 2.0],
+        value=1.0,
+        format_func=lambda x: f"{x:g} km",
+        help="1 km est recommandé. 500 m seulement si les points SIG sources sont suffisamment denses.",
+    )
+    parent = selected_sectors.iloc[0]
+    fine = make_fine_sections(points, parent, fine_width)
+    if fine.empty:
+        st.warning("Pas assez de points SIG pour créer des sous-portions dans ce secteur.")
+    else:
+        worst = fine.sort_values("Indice local", ascending=False).iloc[0]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sous-portions", len(fine))
+        c2.metric("Maximum intrinsèque", f"{worst['Indice local']:.1f}/100", worst["Niveau local"])
+        c3.metric("Portion prioritaire", f"PK {worst['PK début']:.1f} à {worst['PK fin']:.1f}")
+        st.dataframe(
+            fine[["PK début", "PK fin", "Communes", "Sensibilité", "Fragilité sol", "Signal", "Indice local", "Niveau local"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Indice local": st.column_config.ProgressColumn("Indice local", min_value=0, max_value=100, format="%.1f"),
+            },
+        )
+        st.caption("L'indice local repose sur les données SIG du snapshot. La météo reste évaluée à une résolution plus large et doit être croisée avec les ouvrages, talus, incidents et inspections terrain.")
 
 elif module == "Pluie historique":
     st.subheader(f"Pluviométrie journalière - {sector_name}")
