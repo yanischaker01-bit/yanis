@@ -24,6 +24,17 @@ PIEZO_STATIONS_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/stations
 PIEZO_TR_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/chroniques_tr"
 PIEZO_HISTORY_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/chroniques"
 VIGICRUES_URL = "https://www.vigicrues.gouv.fr/services/v1.1/TerEntVigiCru.json"
+VIGICRUES_GEOJSON_URL = "https://www.vigicrues.gouv.fr/services/vigicrues.geojson/"
+HYDRO_STATIONS_URL = "https://hubeau.eaufrance.fr/api/v2/hydrometrie/referentiel/stations"
+# Points centraux indicatifs, utilises uniquement pour une prevision synthetique par departement.
+DEPARTMENT_INFO = {
+    "33": {"name": "Gironde", "lat": 44.8378, "lon": -0.5792},
+    "16": {"name": "Charente", "lat": 45.6484, "lon": 0.1560},
+    "17": {"name": "Charente-Maritime", "lat": 45.7467, "lon": -0.6333},
+    "86": {"name": "Vienne", "lat": 46.5802, "lon": 0.3404},
+    "79": {"name": "Deux-Sevres", "lat": 46.3237, "lon": -0.4588},
+    "37": {"name": "Indre-et-Loire", "lat": 47.3941, "lon": 0.6848},
+}
 MF_URL = "https://public.opendatasoft.com/api/records/1.0/search/"
 MF_DATASET = "weatherref-france-vigilance-meteo-departement"
 DEPARTMENTS = ["37", "86", "79", "16", "17", "33"]
@@ -299,46 +310,138 @@ def active_piezometers(line, radius, limit, pk_min=None, pk_max=None):
 # =============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_mf_alerts():
+    """Charge les vigilances departementales depuis le miroir OpenDataSoft.
+
+    Le flux officiel Météo-France nécessite une clé API. Ce flux public sert de
+    secours sans secret. L'interface signale clairement si la source ne répond pas.
+    """
     try:
         query = " OR ".join(f"domain_id:{d}" for d in DEPARTMENTS)
-        records = get_json(MF_URL, params={"dataset": MF_DATASET, "q": query, "rows": 100}).get("records", [])
+        records = get_json(MF_URL, params={
+            "dataset": MF_DATASET, "q": query, "rows": 500
+        }).get("records", [])
         alerts = []
         for rec in records:
             f = rec.get("fields", {})
-            level = {"vert":"VERT", "jaune":"JAUNE", "orange":"ORANGE", "rouge":"ROUGE"}.get(norm(f.get("color")))
-            if level and level != "VERT":
-                alerts.append({"level":level, "dep":f.get("domain_id", ""), "phenomenon":f.get("phenomenon", ""), "day":f.get("echeance", "")})
+            dep = str(f.get("domain_id", f.get("department", ""))).zfill(2)
+            if dep not in DEPARTMENTS:
+                continue
+            raw_color = f.get("color", f.get("couleur", f.get("level", "")))
+            level = {"vert":"VERT", "jaune":"JAUNE", "orange":"ORANGE", "rouge":"ROUGE"}.get(norm(raw_color))
+            if level:
+                alerts.append({
+                    "level": level,
+                    "dep": dep,
+                    "phenomenon": f.get("phenomenon", f.get("phenomene", "Tous phenomenes")),
+                    "day": f.get("echeance", f.get("validity", "En cours")),
+                })
         return alerts, True
     except Exception:
         return [], False
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def load_vigicrues():
-    headers = {"Accept":"application/json", "User-Agent":"LGV-SEA-Monitoring/3.0"}
+def _iter_geo_points(obj):
+    """Extrait recursivement les paires XY d'une geometrie GeoJSON."""
+    if isinstance(obj, (list, tuple)):
+        if len(obj) >= 2 and all(isinstance(v, (int, float)) for v in obj[:2]):
+            yield float(obj[0]), float(obj[1])
+        else:
+            for part in obj:
+                yield from _iter_geo_points(part)
+
+
+def _geojson_points_wgs84(geometry):
+    points = list(_iter_geo_points((geometry or {}).get("coordinates", [])))
+    if not points:
+        return []
+    # Le flux historique Vigicrues est annonce en Lambert-93. Certains miroirs
+    # livrent deja du WGS84. On detecte le cas a partir de l'ordre de grandeur.
+    projected = abs(points[0][0]) > 180 or abs(points[0][1]) > 90
+    if not projected:
+        return [(y, x) for x, y in points]
     try:
-        root = get_json(VIGICRUES_URL, headers=headers)
+        from pyproj import Transformer
+        transformer = Transformer.from_crs("EPSG:2154", "EPSG:4326", always_xy=True)
+        converted = []
+        for x, y in points:
+            lon, lat = transformer.transform(x, y)
+            converted.append((lat, lon))
+        return converted
+    except Exception:
+        return []
+
+
+def _nearest_line_location(points, line):
+    """Retourne PK et distance minimale entre des points de troncon et la LGV."""
+    best_pk, best_dist = None, None
+    if not points:
+        return best_pk, best_dist
+    # Echantillonnage borne pour conserver un chargement rapide.
+    step = max(1, len(points) // 250)
+    sample = points[::step]
+    if points[-1] not in sample:
+        sample.append(points[-1])
+    for lat, lon in sample:
+        pk, dist = pk_distance(lat, lon, line)
+        if dist is not None and (best_dist is None or dist < best_dist):
+            best_pk, best_dist = pk, dist
+    return best_pk, best_dist
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_vigicrues_near_lgv(line_signature, radius_km=5.0):
+    """Tous les troncons Vigicrues croisant ou proches de la LGV.
+
+    Important : Vigicrues ne couvre pas chaque petit cours d'eau. Cette fonction
+    selectionne automatiquement tous les troncons du reseau réglementaire
+    Vigicrues dont la geometrie est a moins de radius_km du trace LGV.
+    """
+    line = [tuple(x) for x in line_signature]
+    headers = {"Accept": "application/geo+json,application/json", "User-Agent": "LGV-SEA-Monitoring/4.0"}
+    try:
+        payload = get_json(VIGICRUES_GEOJSON_URL, headers=headers, timeout=(8, 45))
+        features = payload.get("features", [])
     except Exception:
         return [], False
-    results = []
-    for territory in root.get("ListEntVigiCru", []) if isinstance(root.get("ListEntVigiCru", []), list) else []:
-        code = territory.get("CdEntVigiCru")
-        if not code: continue
-        try:
-            payload = get_json(VIGICRUES_URL, params={"CdEntVigiCru":code,"TypEntVigiCru":territory.get("TypEntVigiCru", "5")}, headers=headers)
-        except Exception:
+    rows = []
+    for feature in features:
+        props = feature.get("properties", {}) or {}
+        points = _geojson_points_wgs84(feature.get("geometry", {}))
+        pk, distance = _nearest_line_location(points, line)
+        if distance is None or distance > float(radius_km):
             continue
-        stack = [payload]
-        while stack:
-            item = stack.pop()
-            if isinstance(item, dict):
-                name = next((item.get(k) for k in ["LbEntVigiCru","LibEntVigiCru","LibTroncon","NomTroncon","NomCoursDeau","Nom"] if item.get(k)), None)
-                raw = next((item.get(k) for k in ["NivVigiCru","NiveauVigilance","CdCouleur","Couleur"] if item.get(k) is not None), None)
-                level = {"1":"VERT","2":"JAUNE","3":"ORANGE","4":"ROUGE","vert":"VERT","jaune":"JAUNE","orange":"ORANGE","rouge":"ROUGE"}.get(norm(raw))
-                if name and level and any(r in norm(name) for r in RIVERS): results.append({"name":str(name),"level":level})
-                stack.extend(item.values())
-            elif isinstance(item, list): stack.extend(item)
-    return list({(x["name"],x["level"]):x for x in results}.values()), True
+        raw = props.get("NivSituVigiCruEnt", props.get("NivVigiCru", props.get("niveau", 0)))
+        level = {"1":"VERT", "2":"JAUNE", "3":"ORANGE", "4":"ROUGE",
+                 "vert":"VERT", "jaune":"JAUNE", "orange":"ORANGE", "rouge":"ROUGE"}.get(norm(raw), "INDETERMINE")
+        rows.append({
+            "code": str(props.get("CdEntVigiCru", props.get("code", ""))),
+            "name": str(props.get("NomEntVigiCru", props.get("name", "Cours d'eau surveille"))),
+            "level": level,
+            "pk_km": pk,
+            "distance_km": distance,
+        })
+    unique = {(r["code"], r["name"]): r for r in rows}
+    return sorted(unique.values(), key=lambda r: (r["distance_km"], r["pk_km"] or 9999)), True
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_department_forecasts():
+    """Previsions 7 jours pour les six departements, chargees en parallele."""
+    rows = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        jobs = {
+            pool.submit(load_forecast, info["lat"], info["lon"]): (dep, info)
+            for dep, info in DEPARTMENT_INFO.items()
+        }
+        for future in as_completed(jobs):
+            dep, info = jobs[future]
+            try:
+                summary = forecast_summary(future.result())
+                rows.append({"dep": dep, "department": info["name"], **summary, "ok": True})
+            except Exception:
+                rows.append({"dep": dep, "department": info["name"], "ok": False})
+    return sorted(rows, key=lambda r: DEPARTMENTS.index(r["dep"]))
+
 
 # =============================================================================
 # RISQUE
@@ -395,6 +498,7 @@ with st.sidebar:
     sector_name = st.selectbox("Secteur surveillé", ["Tous les secteurs"]+sectors["name"].tolist(), index=0)
     module = st.radio("Module", ["Vue rapide", "Alertes et prévisions", "Pluie historique", "Piézomètres actifs", "Risque historique", "Carte satellite"], index=0)
     radius = st.slider("Rayon piézomètres", 1, 20, 8, format="%d km")
+    river_radius = st.slider("Proximité cours d'eau / LGV", 0.5, 15.0, 5.0, 0.5, format="%.1f km")
     station_limit = st.slider("Stations à tester", 10, 60, 30, 10)
     if st.button("🔄 Actualiser"):
         st.cache_data.clear(); st.rerun()
@@ -419,31 +523,63 @@ if module == "Vue rapide":
     st.info("Vue instantanée depuis le snapshot. Sélectionne un secteur et un module pour charger les données détaillées.")
 
 elif module == "Alertes et prévisions":
-    st.subheader(f"Alertes et prévisions - {sector_name}")
-    with st.spinner("Chargement parallèle des sources..."):
+    st.subheader("Alertes météo par département et Vigicrues spatial LGV")
+    st.caption("Départements suivis : 33, 16, 17, 86, 79 et 37. Les prévisions sont calculées au point central indicatif de chaque département.")
+    line_signature = tuple((round(a, 6), round(b, 6), round(pk, 3)) for a, b, pk in line)
+    with st.spinner("Chargement parallèle : vigilance météo, prévisions et tronçons Vigicrues proches de la LGV..."):
         with ThreadPoolExecutor(max_workers=3) as pool:
-            f_mf=pool.submit(load_mf_alerts); f_vc=pool.submit(load_vigicrues); f_fc=pool.submit(load_forecast,lat_c,lon_c)
-            mf_alerts,mf_ok=f_mf.result(); vc_alerts,vc_ok=f_vc.result()
-            try: forecast=forecast_summary(f_fc.result()); fc_ok=True
-            except Exception: forecast={}; fc_ok=False
-    a,b,c=st.columns(3)
-    with a:
-        st.markdown("**Vigilance Météo-France**")
-        if not mf_ok: st.warning("Non vérifiée")
-        elif not mf_alerts: st.success("Aucune vigilance non verte")
-        else:
-            for x in mf_alerts: st.write(f"{x['level']} | Dép. {x['dep']} | {x['phenomenon']} | {x['day']}")
-    with b:
-        st.markdown("**Prévisions**")
-        if not fc_ok: st.warning("Non vérifiées")
-        else:
-            st.metric("6 h",f"{forecast['rain_6h']:.1f} mm"); st.metric("24 h",f"{forecast['rain_24h']:.1f} mm"); st.metric("72 h",f"{forecast['rain_72h']:.1f} mm"); st.metric("7 j",f"{forecast['rain_7d']:.1f} mm")
-    with c:
-        st.markdown("**Vigicrues**")
-        if not vc_ok: st.warning("Non vérifié")
-        elif not [x for x in vc_alerts if x["level"]!="VERT"]: st.success("Aucune vigilance non verte")
-        else:
-            for x in sorted(vc_alerts,key=lambda z:-LEVEL_RANK[z["level"]])[:15]: st.write(f"{x['level']} | {x['name']}")
+            f_mf = pool.submit(load_mf_alerts)
+            f_fc = pool.submit(load_department_forecasts)
+            f_vc = pool.submit(load_vigicrues_near_lgv, line_signature, river_radius)
+            mf_alerts, mf_ok = f_mf.result()
+            dept_forecasts = f_fc.result()
+            vc_alerts, vc_ok = f_vc.result()
+
+    st.markdown("### 1. Vigilances et prévisions par département")
+    alert_by_dep = {}
+    for item in mf_alerts:
+        alert_by_dep.setdefault(item["dep"], []).append(item)
+    forecast_rows = []
+    for item in dept_forecasts:
+        dep = item["dep"]
+        dep_alerts = alert_by_dep.get(dep, [])
+        max_level = max((a["level"] for a in dep_alerts), key=lambda x: LEVEL_RANK.get(x, -1), default="VERT" if mf_ok else "INDETERMINE")
+        phenomena = ", ".join(sorted({str(a["phenomenon"]) for a in dep_alerts if a.get("phenomenon")})) or "Aucune vigilance non verte"
+        forecast_rows.append({
+            "Département": f"{dep} - {item['department']}",
+            "Vigilance": max_level,
+            "Phénomène": phenomena,
+            "Pluie 6 h (mm)": round(item.get("rain_6h", np.nan), 1),
+            "Pluie 24 h (mm)": round(item.get("rain_24h", np.nan), 1),
+            "Pluie 72 h (mm)": round(item.get("rain_72h", np.nan), 1),
+            "Pluie 7 j (mm)": round(item.get("rain_7d", np.nan), 1),
+            "Source prévision": "Disponible" if item.get("ok") else "Indisponible",
+        })
+    forecast_df = pd.DataFrame(forecast_rows)
+    st.dataframe(forecast_df, use_container_width=True, hide_index=True)
+    if not mf_ok:
+        st.warning("Le flux de vigilance départementale n'a pas répondu. Les prévisions restent affichées, mais la vigilance officielle est à vérifier sur Météo-France.")
+
+    st.markdown("### 2. Tronçons Vigicrues croisant la LGV ou à proximité")
+    st.caption(f"Sélection géographique automatique dans un rayon de {river_radius:.1f} km autour du tracé LGV. Le PK indiqué est le point du tracé le plus proche.")
+    if not vc_ok:
+        st.warning("Le flux géographique Vigicrues n'a pas répondu.")
+    elif not vc_alerts:
+        st.info("Aucun tronçon du réseau réglementaire Vigicrues trouvé dans ce rayon. Cela ne signifie pas qu'il n'existe aucun petit cours d'eau.")
+    else:
+        vc_df = pd.DataFrame(vc_alerts)
+        vc_df = vc_df.rename(columns={"code":"Code", "name":"Cours d'eau / tronçon", "level":"Vigilance", "pk_km":"PK LGV proche", "distance_km":"Distance LGV (km)"})
+        vc_df["PK LGV proche"] = vc_df["PK LGV proche"].round(1)
+        vc_df["Distance LGV (km)"] = vc_df["Distance LGV (km)"].round(2)
+        vc_df = vc_df.sort_values("Vigilance", key=lambda col: col.map(LEVEL_RANK), ascending=False)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Tronçons proches", len(vc_df))
+        c2.metric("Jaune", int((vc_df["Vigilance"] == "JAUNE").sum()))
+        c3.metric("Orange", int((vc_df["Vigilance"] == "ORANGE").sum()))
+        c4.metric("Rouge", int((vc_df["Vigilance"] == "ROUGE").sum()))
+        st.dataframe(vc_df, use_container_width=True, hide_index=True, height=430)
+        st.download_button("Télécharger les tronçons proches (CSV)", vc_df.to_csv(index=False).encode("utf-8-sig"), "vigicrues_proche_lgv.csv", "text/csv")
+    st.info("Limite métier : Vigicrues surveille les principaux tronçons réglementaires, pas tous les fossés ni tous les petits cours d'eau. Pour un inventaire exhaustif des franchissements, il faut croiser le tracé LGV avec le référentiel hydrographique national ou votre couche interne d'ouvrages hydrauliques.")
 
 elif module == "Pluie historique":
     st.subheader(f"Pluviométrie journalière - {sector_name}")
