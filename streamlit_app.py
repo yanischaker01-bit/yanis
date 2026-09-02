@@ -27,13 +27,10 @@ VIGICRUES_URL = "https://www.vigicrues.gouv.fr/services/v1.1/TerEntVigiCru.json"
 MF_URL = "https://public.opendatasoft.com/api/records/1.0/search/"
 MF_DATASET = "weatherref-france-vigilance-meteo-departement"
 DEPARTMENTS = ["37", "86", "79", "16", "17", "33"]
-RIVERS = ["vienne", "clain", "charente", "boutonne", "seugne", "touvre", "dronne",
-          "isle", "dordogne", "garonne", "thouet", "sevre", "indre", "cher",
-          "creuse", "ciron", "jalles"]
+RIVERS = ["vienne", "clain", "charente", "boutonne", "seugne", "touvre", "dronne", "isle", "dordogne", "garonne", "thouet", "sevre", "indre", "cher", "creuse", "ciron", "jalles"]
 
 LEVEL_RANK = {"INDETERMINE": -1, "VERT": 0, "JAUNE": 1, "ORANGE": 2, "ROUGE": 3}
-LEVEL_COLOR = {"INDETERMINE": "#64748b", "VERT": "#16a34a", "JAUNE": "#eab308",
-               "ORANGE": "#ea580c", "ROUGE": "#dc2626"}
+LEVEL_COLOR = {"INDETERMINE": "#64748b", "VERT": "#16a34a", "JAUNE": "#eab308", "ORANGE": "#ea580c", "ROUGE": "#dc2626"}
 LEVEL_ACTION = {
     "INDETERMINE": "Données insuffisantes, contrôle manuel nécessaire",
     "VERT": "Surveillance courante",
@@ -42,35 +39,15 @@ LEVEL_ACTION = {
     "ROUGE": "Contrôle prioritaire et application des consignes métier",
 }
 
-# Poids des facteurs pour le calcul du risque (défini une seule fois)
-WEIGHTS = {
-    "Pluie jour": 0.07,
-    "Pluie 3 j": 0.11,
-    "Pluie 7 j": 0.16,
-    "Pluie 30 j": 0.08,
-    "Sensibilité": 0.13,
-    "Sol": 0.08,
-    "Piézo niveau": 0.14,
-    "Piézo tendance": 0.10,
-    "Prévision 72 h": 0.07,
-    "Humidité sol": 0.03,
-    "Vigilance météo": 0.02,
-    "Vigicrues": 0.01,
-}
-
 st.set_page_config(page_title="LGV SEA - Surveillance optimisée", page_icon="⚠️", layout="wide")
 
 # =============================================================================
 # OUTILS
 # =============================================================================
-@st.cache_resource(show_spinner=False)
-def get_session():
-    """Session HTTP réutilisable pour améliorer les performances."""
-    return requests.Session()
-
 def norm(value: Any) -> str:
     value = unicodedata.normalize("NFD", str(value or "").lower())
     return "".join(c for c in value if unicodedata.category(c) != "Mn")
+
 
 def safe_float(value: Any, default=np.nan) -> float:
     try:
@@ -78,11 +55,12 @@ def safe_float(value: Any, default=np.nan) -> float:
     except (TypeError, ValueError):
         return default
 
+
 def get_json(url: str, params=None, timeout=(5, 30), headers=None) -> dict:
-    session = get_session()
-    response = session.get(url, params=params, timeout=timeout, headers=headers)
+    response = requests.get(url, params=params, timeout=timeout, headers=headers)
     response.raise_for_status()
     return response.json()
+
 
 def haversine_km(lat1, lon1, lat2, lon2) -> float:
     radius = 6371.0088
@@ -90,6 +68,7 @@ def haversine_km(lat1, lon1, lat2, lon2) -> float:
     dp, dl = math.radians(lat2-lat1), math.radians(lon2-lon1)
     a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
     return 2*radius*math.asin(min(1, math.sqrt(a)))
+
 
 def build_polyline(lines) -> list[tuple[float, float, float]]:
     candidates = []
@@ -111,6 +90,7 @@ def build_polyline(lines) -> list[tuple[float, float, float]]:
         output.append((b[0], b[1], distance))
     return output
 
+
 def pk_distance(lat: float, lon: float, line) -> tuple[float | None, float | None]:
     if len(line) < 2:
         return None, None
@@ -128,12 +108,14 @@ def pk_distance(lat: float, lon: float, line) -> tuple[float | None, float | Non
             best_d2, best_pk = d2, pk1+t*(pk2-pk1)
     return best_pk, math.sqrt(best_d2) if best_d2 is not None else None
 
+
 def risk_level(score: float) -> str:
     if pd.isna(score): return "INDETERMINE"
     if score >= 75: return "ROUGE"
     if score >= 50: return "ORANGE"
     if score >= 25: return "JAUNE"
     return "VERT"
+
 
 def scale(value, low, high):
     if pd.isna(value): return np.nan
@@ -146,6 +128,7 @@ def scale(value, low, high):
 def load_snapshot():
     return get_json(SNAPSHOT_URL)
 
+
 def load_points(snapshot):
     payload = snapshot.get("sectors", {})
     df = pd.DataFrame(payload.get("sectors", []) if isinstance(payload, dict) else [])
@@ -153,6 +136,7 @@ def load_points(snapshot):
         if col in df: df[col] = pd.to_numeric(df[col], errors="coerce")
     if "commune_name" not in df: df["commune_name"] = "Commune inconnue"
     return df.dropna(subset=["latitude", "longitude", "pk_km"])
+
 
 def make_sectors(points, width=10):
     work = points.copy()
@@ -189,6 +173,7 @@ def load_forecast(lat, lon):
         "forecast_days": 7, "timezone": "Europe/Paris",
     })
 
+
 def forecast_summary(payload):
     hourly = payload.get("hourly", {})
     daily = payload.get("daily", {})
@@ -201,7 +186,8 @@ def forecast_summary(payload):
         "soil": float(soil.iloc[0]) if not soil.empty else np.nan, "daily": daily,
     }
 
-@st.cache_data(ttl=86400, show_spinner=False)  # TTL étendu à 24h (données historiques stables)
+
+@st.cache_data(ttl=21600, show_spinner=False)
 def load_daily_rain(lat, lon, start_date, end_date):
     payload = get_json(ARCHIVE_URL, params={
         "latitude": round(lat, 4), "longitude": round(lon, 4),
@@ -214,6 +200,7 @@ def load_daily_rain(lat, lon, start_date, end_date):
     df["rain_mm"] = pd.to_numeric(df["rain_mm"], errors="coerce")
     return df.dropna().sort_values("date")
 
+
 def add_rain_features(df):
     df = df.sort_values("date").copy()
     for days in [3, 7, 15, 30]:
@@ -221,7 +208,7 @@ def add_rain_features(df):
     return df
 
 # =============================================================================
-# PIEZOMETRIE ACTIVE (optimisée avec appel groupé)
+# PIEZOMETRIE ACTIVE
 # =============================================================================
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_piezo_referential():
@@ -236,25 +223,20 @@ def load_piezo_referential():
     df = pd.concat(frames, ignore_index=True)
     return df.drop_duplicates("code_bss") if "code_bss" in df else df
 
+
 @st.cache_data(ttl=900, show_spinner=False)
-def load_piezo_tr_multi(codes_bss: list[str], days: int = 8) -> pd.DataFrame:
-    """Récupère les chroniques TR pour plusieurs stations en une seule requête."""
-    if not codes_bss:
-        return pd.DataFrame()
-    start = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    code_param = ",".join(codes_bss)
-    rows = get_json(PIEZO_TR_URL, params={
-        "code_bss": code_param,
-        "date_debut_mesure": start,
-        "size": 20000
-    }).get("data", [])
+def load_piezo_tr(code_bss, days=8):
+    start = (datetime.now(timezone.utc)-timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = get_json(PIEZO_TR_URL, params={"code_bss": code_bss, "date_debut_mesure": start, "size": 20000}).get("data", [])
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df["date"] = pd.to_datetime(df["date_mesure"], errors="coerce", utc=True)
-    df["level"] = pd.to_numeric(df["niveau_nappe_eau"], errors="coerce")
-    df = df.dropna(subset=["date", "level"])
-    return df.sort_values(["code_bss", "date"])
+    if df.empty: return df
+    date_col = next((c for c in ["date_mesure", "date_mesure_utc", "date"] if c in df), None)
+    level_col = next((c for c in ["niveau_nappe_eau", "niveau_eau_ngf", "niveau"] if c in df), None)
+    if not date_col: return pd.DataFrame()
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce", utc=True)
+    df["level"] = pd.to_numeric(df[level_col], errors="coerce") if level_col else np.nan
+    return df.dropna(subset=["date"]).sort_values("date")
+
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_piezo_history(code_bss, start_date, end_date):
@@ -268,6 +250,7 @@ def load_piezo_history(code_bss, start_date, end_date):
     df["level"] = pd.to_numeric(df.get("niveau_nappe_eau"), errors="coerce")
     return df.dropna(subset=["date", "level"]).sort_values("date").drop_duplicates("date")
 
+
 def piezo_status(df):
     if df.empty: return None
     last = df.iloc[-1]
@@ -280,6 +263,7 @@ def piezo_status(df):
         return current-float(before.iloc[-1]["level"]) if not before.empty else np.nan
     return {"status": status, "last_date": last["date"], "age_h": age, "level": current,
             "delta_24h": delta(24), "delta_7d": delta(168)}
+
 
 def active_piezometers(line, radius, limit, pk_min=None, pk_max=None):
     stations = load_piezo_referential()
@@ -298,160 +282,63 @@ def active_piezometers(line, radius, limit, pk_min=None, pk_max=None):
     if pk_max is not None: stations = stations[stations["pk_km"] <= pk_max+10]
     stations = stations.sort_values("distance_km").head(limit)
     if stations.empty: return pd.DataFrame()
-
-    # Appel groupé pour récupérer toutes les chroniques en une seule requête
-    codes = stations["code_bss"].astype(str).tolist()
-    tr_df = load_piezo_tr_multi(codes)
-    if tr_df.empty:
-        return pd.DataFrame()
-
     rows = []
-    for code, group in tr_df.groupby("code_bss"):
-        info = piezo_status(group)
-        if info and info["status"] in ["ACTIF", "RETARD"]:
-            station_row = stations[stations["code_bss"] == code].iloc[0].to_dict()
-            station_row.update(info)
-            rows.append(station_row)
+    with ThreadPoolExecutor(max_workers=min(10, len(stations))) as pool:
+        jobs = {pool.submit(load_piezo_tr, str(r.code_bss)): r for r in stations.itertuples(index=False)}
+        for future in as_completed(jobs):
+            try:
+                info = piezo_status(future.result())
+                if info and info["status"] in ["ACTIF", "RETARD"]:
+                    row = jobs[future]._asdict(); row.update(info); rows.append(row)
+            except Exception:
+                pass
     return pd.DataFrame(rows)
 
 # =============================================================================
-# VIGILANCES MÉTÉO (par département)
+# VIGILANCES
 # =============================================================================
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_mf_alerts() -> pd.DataFrame:
-    """
-    Retourne un DataFrame avec une ligne par département suivi.
-    Colonnes : dep, level, phenomenons (liste des phénomènes actifs non verts)
-    """
-    # Construire la requête pour tous les départements
-    query = " OR ".join(f"domain_id:{d}" for d in DEPARTMENTS)
+def load_mf_alerts():
     try:
-        records = get_json(MF_URL, params={
-            "dataset": MF_DATASET,
-            "q": query,
-            "rows": 200,          # suffisamment grand pour tous les phénomènes
-            "sort": "domain_id"
-        }).get("records", [])
+        query = " OR ".join(f"domain_id:{d}" for d in DEPARTMENTS)
+        records = get_json(MF_URL, params={"dataset": MF_DATASET, "q": query, "rows": 100}).get("records", [])
+        alerts = []
+        for rec in records:
+            f = rec.get("fields", {})
+            level = {"vert":"VERT", "jaune":"JAUNE", "orange":"ORANGE", "rouge":"ROUGE"}.get(norm(f.get("color")))
+            if level and level != "VERT":
+                alerts.append({"level":level, "dep":f.get("domain_id", ""), "phenomenon":f.get("phenomenon", ""), "day":f.get("echeance", "")})
+        return alerts, True
     except Exception:
-        return pd.DataFrame(columns=["dep", "level", "phenomenons"])
+        return [], False
 
-    # Structurer les données
-    data = []
-    for rec in records:
-        f = rec.get("fields", {})
-        dep = str(f.get("domain_id", ""))
-        if dep not in DEPARTMENTS:
-            continue
-        level = {"vert": "VERT", "jaune": "JAUNE", "orange": "ORANGE",
-                 "rouge": "ROUGE"}.get(norm(f.get("color")), "INDETERMINE")
-        phen = f.get("phenomenon", "")
-        if level != "VERT":   # on ne garde que les phénomènes non verts pour l'affichage
-            data.append({"dep": dep, "level": level, "phenomenon": phen})
 
-    # Agréger par département : prendre le niveau le plus élevé et la liste des phénomènes
-    if not data:
-        # Tous verts
-        return pd.DataFrame({
-            "dep": DEPARTMENTS,
-            "level": ["VERT"] * len(DEPARTMENTS),
-            "phenomenons": [""] * len(DEPARTMENTS)
-        })
-
-    df = pd.DataFrame(data)
-    # Convertir level en rang pour max
-    df["rank"] = df["level"].map(LEVEL_RANK)
-    agg = df.groupby("dep").agg(
-        level=("rank", "max"),
-        phenomenons=("phenomenon", lambda x: ", ".join(sorted(set(x))))
-    ).reset_index()
-    agg["level"] = agg["level"].map({v: k for k, v in LEVEL_RANK.items()})
-    # Ajouter les départements manquants (verts)
-    missing = [d for d in DEPARTMENTS if d not in agg["dep"].values]
-    if missing:
-        missing_df = pd.DataFrame({"dep": missing, "level": ["VERT"]*len(missing),
-                                   "phenomenons": [""]*len(missing)})
-        agg = pd.concat([agg, missing_df], ignore_index=True)
-    # Trier selon l'ordre des départements
-    agg["dep"] = pd.Categorical(agg["dep"], categories=DEPARTMENTS, ordered=True)
-    return agg.sort_values("dep").reset_index(drop=True)
-
-# =============================================================================
-# VIGICRUES (optimisée pour les cours d'eau de la LGV)
-# =============================================================================
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_vigicrues():
-    """
-    Retourne un DataFrame des tronçons de vigilance pertinents (ceux dont le nom
-    contient une des rivières de RIVERS) avec leur niveau.
-    """
-    headers = {"Accept": "application/json", "User-Agent": "LGV-SEA-Monitoring/3.0"}
+    headers = {"Accept":"application/json", "User-Agent":"LGV-SEA-Monitoring/3.0"}
     try:
         root = get_json(VIGICRUES_URL, headers=headers)
     except Exception:
-        return pd.DataFrame(columns=["name", "level"])
-
-    # Filtrer les entités qui pourraient être des tronçons de rivière
-    entites = root.get("ListEntVigiCru", [])
-    # Ne garder que celles dont le libellé contient une rivière de la liste
-    candidates = []
-    for ent in entites:
-        name = ent.get("LbEntVigiCru") or ent.get("LibEntVigiCru") or ""
-        if name and any(r in norm(name) for r in RIVERS):
-            candidates.append(ent)
-
-    if not candidates:
-        return pd.DataFrame(columns=["name", "level"])
-
-    # Paralléliser les appels pour récupérer le niveau de chaque tronçon
+        return [], False
     results = []
-    with ThreadPoolExecutor(max_workers=min(10, len(candidates))) as pool:
-        future_to_ent = {}
-        for ent in candidates:
-            code = ent.get("CdEntVigiCru")
-            typ = ent.get("TypEntVigiCru", "5")
-            future = pool.submit(get_json, VIGICRUES_URL,
-                                 params={"CdEntVigiCru": code, "TypEntVigiCru": typ},
-                                 headers=headers)
-            future_to_ent[future] = ent
-
-        for future in as_completed(future_to_ent):
-            ent = future_to_ent[future]
-            try:
-                payload = future.result()
-            except Exception:
-                continue
-            # Extraire le niveau directement sans récursion profonde
-            name = ent.get("LbEntVigiCru") or ent.get("LibEntVigiCru") or ""
-            # Chercher le niveau dans le payload (les clés varient selon le type)
-            raw = None
-            for key in ["NivVigiCru", "NiveauVigilance", "CdCouleur", "Couleur"]:
-                if key in payload:
-                    raw = payload[key]
-                    break
-            if raw is None:
-                # parfois le niveau est dans une sous-structure
-                for value in payload.values():
-                    if isinstance(value, dict):
-                        for k2 in ["NivVigiCru", "NiveauVigilance", "CdCouleur", "Couleur"]:
-                            if k2 in value:
-                                raw = value[k2]
-                                break
-                        if raw: break
-            level = {
-                "1": "VERT", "2": "JAUNE", "3": "ORANGE", "4": "ROUGE",
-                "vert": "VERT", "jaune": "JAUNE", "orange": "ORANGE", "rouge": "ROUGE"
-            }.get(norm(raw), "INDETERMINE")
-            # Filtrer à nouveau sur le nom final
-            if name and any(r in norm(name) for r in RIVERS):
-                results.append({"name": str(name), "level": level})
-
-    if not results:
-        return pd.DataFrame(columns=["name", "level"])
-
-    df = pd.DataFrame(results)
-    # Dédoublonnage éventuel
-    df = df.drop_duplicates(subset=["name", "level"])
-    return df.sort_values("name")
+    for territory in root.get("ListEntVigiCru", []) if isinstance(root.get("ListEntVigiCru", []), list) else []:
+        code = territory.get("CdEntVigiCru")
+        if not code: continue
+        try:
+            payload = get_json(VIGICRUES_URL, params={"CdEntVigiCru":code,"TypEntVigiCru":territory.get("TypEntVigiCru", "5")}, headers=headers)
+        except Exception:
+            continue
+        stack = [payload]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, dict):
+                name = next((item.get(k) for k in ["LbEntVigiCru","LibEntVigiCru","LibTroncon","NomTroncon","NomCoursDeau","Nom"] if item.get(k)), None)
+                raw = next((item.get(k) for k in ["NivVigiCru","NiveauVigilance","CdCouleur","Couleur"] if item.get(k) is not None), None)
+                level = {"1":"VERT","2":"JAUNE","3":"ORANGE","4":"ROUGE","vert":"VERT","jaune":"JAUNE","orange":"ORANGE","rouge":"ROUGE"}.get(norm(raw))
+                if name and level and any(r in norm(name) for r in RIVERS): results.append({"name":str(name),"level":level})
+                stack.extend(item.values())
+            elif isinstance(item, list): stack.extend(item)
+    return list({(x["name"],x["level"]):x for x in results}.values()), True
 
 # =============================================================================
 # RISQUE
@@ -466,59 +353,51 @@ def historical_piezo_context(history, target):
     percentile = float((ref <= current).mean()) if len(ref) else np.nan
     before = past[past["date"] <= target-pd.Timedelta(days=1)]
     delta = current-float(before.iloc[-1]["level"]) if not before.empty else np.nan
-    return {"percentile": percentile, "delta_24h": delta}
+    return {"percentile":percentile, "delta_24h":delta}
+
 
 def calculate_risk(rain, sector, piezo=None, forecast=None, mf="VERT", vc="VERT", historical=False):
     c = {
-        "Pluie jour": scale(rain.get("rain_mm"), 5, 60),
-        "Pluie 3 j": scale(rain.get("rain_3d"), 15, 100),
-        "Pluie 7 j": scale(rain.get("rain_7d"), 25, 150),
-        "Pluie 30 j": scale(rain.get("rain_30d"), 60, 300),
-        "Sensibilité": safe_float(sector.get("susceptibility"), .4),
-        "Sol": safe_float(sector.get("soil_fragility"), .4),
-        "Piézo niveau": scale(piezo.get("percentile"), .60, .99) if piezo else np.nan,
-        "Piézo tendance": scale(piezo.get("delta_24h"), .02, .50) if piezo else np.nan,
-        "Prévision 72 h": scale(forecast.get("rain_72h"), 10, 100) if forecast and not historical else np.nan,
-        "Humidité sol": scale(forecast.get("soil"), .20, .50) if forecast and not historical else np.nan,
-        "Vigilance météo": LEVEL_RANK.get(mf, 0)/3 if not historical else np.nan,
-        "Vigicrues": LEVEL_RANK.get(vc, 0)/3 if not historical else np.nan,
+        "Pluie jour":scale(rain.get("rain_mm"),5,60), "Pluie 3 j":scale(rain.get("rain_3d"),15,100),
+        "Pluie 7 j":scale(rain.get("rain_7d"),25,150), "Pluie 30 j":scale(rain.get("rain_30d"),60,300),
+        "Sensibilité":safe_float(sector.get("susceptibility"),.4), "Sol":safe_float(sector.get("soil_fragility"),.4),
+        "Piézo niveau":scale(piezo.get("percentile"),.60,.99) if piezo else np.nan,
+        "Piézo tendance":scale(piezo.get("delta_24h"),.02,.50) if piezo else np.nan,
+        "Prévision 72 h":scale(forecast.get("rain_72h"),10,100) if forecast and not historical else np.nan,
+        "Humidité sol":scale(forecast.get("soil"),.20,.50) if forecast and not historical else np.nan,
+        "Vigilance météo":LEVEL_RANK.get(mf,0)/3 if not historical else np.nan,
+        "Vigicrues":LEVEL_RANK.get(vc,0)/3 if not historical else np.nan,
     }
-    valid = {k: v for k, v in c.items() if not pd.isna(v)}
-    valid_weight = sum(WEIGHTS[k] for k in valid)
-    score = 100 * sum(valid[k] * WEIGHTS[k] for k in valid) / valid_weight if valid_weight else np.nan
-    factors = [k for k, v in sorted(valid.items(), key=lambda x: x[1], reverse=True)[:4] if v >= .5]
-    return {"score": round(score, 1), "level": risk_level(score),
-            "confidence": round(100*valid_weight), "factors": factors}
+    weights = {"Pluie jour":.07,"Pluie 3 j":.11,"Pluie 7 j":.16,"Pluie 30 j":.08,"Sensibilité":.13,"Sol":.08,
+               "Piézo niveau":.14,"Piézo tendance":.10,"Prévision 72 h":.07,"Humidité sol":.03,"Vigilance météo":.02,"Vigicrues":.01}
+    valid = {k:v for k,v in c.items() if not pd.isna(v)}
+    valid_weight = sum(weights[k] for k in valid)
+    score = 100*sum(valid[k]*weights[k] for k in valid)/valid_weight if valid_weight else np.nan
+    factors = [k for k,v in sorted(valid.items(), key=lambda x:x[1], reverse=True)[:4] if v >= .5]
+    return {"score":round(score,1),"level":risk_level(score),"confidence":round(100*valid_weight),"factors":factors}
 
 # =============================================================================
 # APPLICATION LAZY LOAD
 # =============================================================================
 st.title("⚠️ LGV SEA - Surveillance optimisée des risques de glissement")
-st.caption("Chargement rapide : tous les secteurs sont affichés immédiatement. "
-           "Les API lourdes sont appelées uniquement dans le module choisi.")
+st.caption("Chargement rapide : tous les secteurs sont affichés immédiatement. Les API lourdes sont appelées uniquement dans le module choisi.")
 
 try:
-    snapshot = load_snapshot()
-    points = load_points(snapshot)
-    line = build_polyline(snapshot.get("lgv_lines"))
+    snapshot = load_snapshot(); points = load_points(snapshot); line = build_polyline(snapshot.get("lgv_lines"))
 except Exception as exc:
-    st.error(f"Snapshot indisponible : {exc}")
-    st.stop()
+    st.error(f"Snapshot indisponible : {exc}"); st.stop()
 if points.empty or not line:
-    st.error("Tracé LGV ou secteurs absents.")
-    st.stop()
+    st.error("Tracé LGV ou secteurs absents."); st.stop()
 sectors = make_sectors(points)
 
 with st.sidebar:
     st.header("Pilotage")
-    sector_name = st.selectbox("Secteur surveillé", ["Tous les secteurs"] + sectors["name"].tolist(), index=0)
-    module = st.radio("Module", ["Vue rapide", "Alertes et prévisions", "Pluie historique",
-                                  "Piézomètres actifs", "Risque historique", "Carte satellite"], index=0)
+    sector_name = st.selectbox("Secteur surveillé", ["Tous les secteurs"]+sectors["name"].tolist(), index=0)
+    module = st.radio("Module", ["Vue rapide", "Alertes et prévisions", "Pluie historique", "Piézomètres actifs", "Risque historique", "Carte satellite"], index=0)
     radius = st.slider("Rayon piézomètres", 1, 20, 8, format="%d km")
-    station_limit = st.slider("Stations à tester", 10, 60, 20, 10)
+    station_limit = st.slider("Stations à tester", 10, 60, 30, 10)
     if st.button("🔄 Actualiser"):
-        st.cache_data.clear()
-        st.rerun()
+        st.cache_data.clear(); st.rerun()
 
 all_selected = sector_name == "Tous les secteurs"
 selected_sectors = sectors if all_selected else sectors[sectors["name"] == sector_name]
@@ -529,253 +408,141 @@ else:
     selected_points = points[(points["pk_km"] >= s["pk_start"]) & (points["pk_km"] <= s["pk_end"])]
 lat_c, lon_c = float(selected_points["latitude"].mean()), float(selected_points["longitude"].mean())
 
-# ===================== VUE RAPIDE =====================
 if module == "Vue rapide":
     st.subheader("Vue rapide de tous les secteurs")
-    quick = sectors[["name", "pk_start", "pk_end", "communes", "static_score", "static_level"]].rename(columns={
-        "name": "Secteur", "pk_start": "PK début", "pk_end": "PK fin",
-        "communes": "Communes", "static_score": "Indice disponible", "static_level": "Niveau"
-    })
-    quick = quick.sort_values("Niveau", key=lambda x: x.map(LEVEL_RANK), ascending=False)
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Secteurs", len(quick))
-    c2.metric("Rouges", int((quick["Niveau"] == "ROUGE").sum()))
-    c3.metric("Orange", int((quick["Niveau"] == "ORANGE").sum()))
-    c4.metric("Jaune", int((quick["Niveau"] == "JAUNE").sum()))
-    st.dataframe(quick, use_container_width=True, hide_index=True, height=550)
+    quick = sectors[["name","pk_start","pk_end","communes","static_score","static_level"]].rename(columns={
+        "name":"Secteur","pk_start":"PK début","pk_end":"PK fin","communes":"Communes","static_score":"Indice disponible","static_level":"Niveau"})
+    quick = quick.sort_values("Niveau", key=lambda x:x.map(LEVEL_RANK), ascending=False)
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Secteurs",len(quick)); c2.metric("Rouges",int((quick["Niveau"]=="ROUGE").sum())); c3.metric("Orange",int((quick["Niveau"]=="ORANGE").sum())); c4.metric("Jaune",int((quick["Niveau"]=="JAUNE").sum()))
+    st.dataframe(quick,use_container_width=True,hide_index=True,height=550)
     st.info("Vue instantanée depuis le snapshot. Sélectionne un secteur et un module pour charger les données détaillées.")
 
-# ===================== ALERTES ET PRÉVISIONS =====================
 elif module == "Alertes et prévisions":
     st.subheader(f"Alertes et prévisions - {sector_name}")
     with st.spinner("Chargement parallèle des sources..."):
         with ThreadPoolExecutor(max_workers=3) as pool:
-            f_mf = pool.submit(load_mf_alerts)
-            f_vc = pool.submit(load_vigicrues)
-            f_fc = pool.submit(load_forecast, lat_c, lon_c)
-            mf_df = f_mf.result()
-            vc_df = f_vc.result()
-            try:
-                forecast = forecast_summary(f_fc.result())
-                fc_ok = True
-            except Exception:
-                forecast = {}
-                fc_ok = False
-
-    # Affichage en trois colonnes
-    col1, col2, col3 = st.columns([2, 1.5, 2])
-
-    with col1:
-        st.markdown("**Vigilance Météo-France par département**")
-        if mf_df.empty:
-            st.warning("Données météo non disponibles")
+            f_mf=pool.submit(load_mf_alerts); f_vc=pool.submit(load_vigicrues); f_fc=pool.submit(load_forecast,lat_c,lon_c)
+            mf_alerts,mf_ok=f_mf.result(); vc_alerts,vc_ok=f_vc.result()
+            try: forecast=forecast_summary(f_fc.result()); fc_ok=True
+            except Exception: forecast={}; fc_ok=False
+    a,b,c=st.columns(3)
+    with a:
+        st.markdown("**Vigilance Météo-France**")
+        if not mf_ok: st.warning("Non vérifiée")
+        elif not mf_alerts: st.success("Aucune vigilance non verte")
         else:
-            # Style conditionnel pour le niveau
-            def color_level(val):
-                return f"background-color: {LEVEL_COLOR.get(val, '#cccccc')}; color: white; font-weight: bold;"
-            styled = mf_df.style.applymap(color_level, subset=["level"])
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    with col2:
-        st.markdown("**Prévisions pluviométriques**")
-        if not fc_ok:
-            st.warning("Non vérifiées")
+            for x in mf_alerts: st.write(f"{x['level']} | Dép. {x['dep']} | {x['phenomenon']} | {x['day']}")
+    with b:
+        st.markdown("**Prévisions**")
+        if not fc_ok: st.warning("Non vérifiées")
         else:
-            st.metric("6 h", f"{forecast['rain_6h']:.1f} mm")
-            st.metric("24 h", f"{forecast['rain_24h']:.1f} mm")
-            st.metric("72 h", f"{forecast['rain_72h']:.1f} mm")
-            st.metric("7 j", f"{forecast['rain_7d']:.1f} mm")
-
-    with col3:
-        st.markdown("**Vigicrues - Cours d'eau suivis**")
-        if vc_df.empty:
-            st.success("Aucune vigilance particulière sur les cours d'eau suivis")
+            st.metric("6 h",f"{forecast['rain_6h']:.1f} mm"); st.metric("24 h",f"{forecast['rain_24h']:.1f} mm"); st.metric("72 h",f"{forecast['rain_72h']:.1f} mm"); st.metric("7 j",f"{forecast['rain_7d']:.1f} mm")
+    with c:
+        st.markdown("**Vigicrues**")
+        if not vc_ok: st.warning("Non vérifié")
+        elif not [x for x in vc_alerts if x["level"]!="VERT"]: st.success("Aucune vigilance non verte")
         else:
-            # Afficher seulement les non verts, ou tous avec tri par niveau
-            vc_display = vc_df[vc_df["level"] != "VERT"].sort_values(
-                "level", key=lambda x: x.map(LEVEL_RANK), ascending=False)
-            if vc_display.empty:
-                st.success("Tous les cours d'eau suivis sont en vert")
-            else:
-                st.dataframe(vc_display, use_container_width=True, hide_index=True)
+            for x in sorted(vc_alerts,key=lambda z:-LEVEL_RANK[z["level"]])[:15]: st.write(f"{x['level']} | {x['name']}")
 
-# ===================== PLUIE HISTORIQUE =====================
 elif module == "Pluie historique":
     st.subheader(f"Pluviométrie journalière - {sector_name}")
-    start_date = st.date_input("Début", date.today() - timedelta(days=365), max_value=date.today())
-    end_date = st.date_input("Fin", date.today() - timedelta(days=1), min_value=start_date, max_value=date.today())
-
-    coords = selected_points.groupby("commune_name")[["latitude", "longitude"]].mean().reset_index()
-    names = sorted(coords["commune_name"].tolist())
-    chosen_names = st.multiselect("Communes", names, default=names[:min(3, len(names))])
-    coords = coords[coords["commune_name"].isin(chosen_names)]
-
-    frames = []
+    start_date=st.date_input("Début",date.today()-timedelta(days=365),max_value=date.today())
+    end_date=st.date_input("Fin",date.today()-timedelta(days=1),min_value=start_date,max_value=date.today())
+    coords=selected_points.groupby("commune_name")[["latitude","longitude"]].mean().reset_index()
+    names=sorted(coords["commune_name"].tolist())
+    chosen_names=st.multiselect("Communes",names,default=names[:min(6,len(names))])
+    coords=coords[coords["commune_name"].isin(chosen_names)]
+    frames=[]
     with st.spinner(f"Chargement parallèle de {len(coords)} commune(s)..."):
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(coords)))) as pool:
-            jobs = {
-                pool.submit(load_daily_rain, r.latitude, r.longitude, start_date, end_date): r.commune_name
-                for r in coords.itertuples(index=False)
-            }
+        with ThreadPoolExecutor(max_workers=min(8,max(1,len(coords)))) as pool:
+            jobs={pool.submit(load_daily_rain,r.latitude,r.longitude,start_date,end_date):r.commune_name for r in coords.itertuples(index=False)}
             for future in as_completed(jobs):
                 try:
-                    df = future.result()
-                    df["commune"] = jobs[future]
-                    frames.append(df)
-                except Exception:
-                    pass
-    rain = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if rain.empty:
-        st.warning("Données indisponibles")
+                    df=future.result(); df["commune"]=jobs[future]; frames.append(df)
+                except Exception: pass
+    rain=pd.concat(frames,ignore_index=True) if frames else pd.DataFrame()
+    if rain.empty: st.warning("Données indisponibles")
     else:
-        fig = go.Figure()
-        for name, g in rain.groupby("commune"):
-            fig.add_scatter(x=g["date"], y=g["rain_mm"], mode="lines", name=name)
-        fig.update_layout(height=430, yaxis_title="Pluie journalière (mm)", hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        fig=go.Figure()
+        for name,g in rain.groupby("commune"): fig.add_scatter(x=g["date"],y=g["rain_mm"],mode="lines",name=name)
+        fig.update_layout(height=430,yaxis_title="Pluie journalière (mm)",hovermode="x unified")
+        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False})
+        maxima=rain.loc[rain.groupby("commune")["rain_mm"].idxmax(),["commune","date","rain_mm"]]
+        st.dataframe(maxima.rename(columns={"commune":"Commune","date":"Date du maximum","rain_mm":"Maximum (mm)"}),use_container_width=True,hide_index=True)
 
-        maxima = rain.loc[rain.groupby("commune")["rain_mm"].idxmax(), ["commune", "date", "rain_mm"]]
-        st.dataframe(maxima.rename(columns={"commune": "Commune", "date": "Date du maximum",
-                                            "rain_mm": "Maximum (mm)"}),
-                     use_container_width=True, hide_index=True)
-
-# ===================== PIÉZOMÈTRES ACTIFS =====================
 elif module == "Piézomètres actifs":
     st.subheader(f"Piézomètres qui émettent - {sector_name}")
-    pk_min = selected_sectors["pk_start"].min() if not all_selected else None
-    pk_max = selected_sectors["pk_end"].max() if not all_selected else None
+    pk_min=selected_sectors["pk_start"].min() if not all_selected else None; pk_max=selected_sectors["pk_end"].max() if not all_selected else None
     with st.spinner("Vérification parallèle des émissions..."):
-        stations = active_piezometers(line, radius, station_limit, pk_min, pk_max)
-    if stations.empty:
-        st.warning("Aucun piézomètre actif ou en retard léger trouvé.")
+        stations=active_piezometers(line,radius,station_limit,pk_min,pk_max)
+    if stations.empty: st.warning("Aucun piézomètre actif ou en retard léger trouvé.")
     else:
-        cols = ["code_bss", "nom_commune", "pk_km", "distance_km", "status",
-                "last_date", "level", "delta_24h", "delta_7d"]
-        display = stations[[c for c in cols if c in stations]].rename(columns={
-            "code_bss": "Code BSS", "nom_commune": "Commune", "pk_km": "PK (km)",
-            "distance_km": "Distance LGV (km)", "status": "Emission",
-            "last_date": "Dernière mesure", "level": "Niveau NGF",
-            "delta_24h": "Variation 24 h", "delta_7d": "Variation 7 j"
-        })
-        st.dataframe(display.sort_values("PK (km)"), use_container_width=True, hide_index=True)
+        cols=["code_bss","nom_commune","pk_km","distance_km","status","last_date","level","delta_24h","delta_7d"]
+        display=stations[[c for c in cols if c in stations]].rename(columns={"code_bss":"Code BSS","nom_commune":"Commune","pk_km":"PK (km)","distance_km":"Distance LGV (km)","status":"Emission","last_date":"Dernière mesure","level":"Niveau NGF","delta_24h":"Variation 24 h","delta_7d":"Variation 7 j"})
+        st.dataframe(display.sort_values("PK (km)"),use_container_width=True,hide_index=True)
 
-# ===================== RISQUE HISTORIQUE =====================
 elif module == "Risque historique":
     if all_selected:
-        st.warning("Sélectionne un secteur précis pour calculer son risque historique.")
-        st.stop()
+        st.warning("Sélectionne un secteur précis pour calculer son risque historique."); st.stop()
     st.subheader(f"Risque historique - {sector_name}")
-    data_start = st.date_input("Début des données", date(2021, 1, 1), max_value=date.today())
-    data_end = st.date_input("Fin des données", date.today() - timedelta(days=1),
-                             min_value=data_start, max_value=date.today())
-    mode = st.radio("Consultation", ["Un jour donné", "Une période"], horizontal=True)
-    if mode == "Un jour donné":
-        target = st.date_input("Jour", data_end, min_value=data_start, max_value=data_end)
-        period_start = period_end = target
+    data_start=st.date_input("Début des données",date(2021,1,1),max_value=date.today())
+    data_end=st.date_input("Fin des données",date.today()-timedelta(days=1),min_value=data_start,max_value=date.today())
+    mode=st.radio("Consultation",["Un jour donné","Une période"],horizontal=True)
+    if mode=="Un jour donné":
+        target=st.date_input("Jour",data_end,min_value=data_start,max_value=data_end); period_start=period_end=target
     else:
-        chosen_period = st.date_input(
-            "Période",
-            value=(max(data_start, data_end - timedelta(days=90)), data_end),
-            min_value=data_start, max_value=data_end
-        )
-        if not isinstance(chosen_period, (tuple, list)) or len(chosen_period) != 2:
-            st.info("Choisis deux dates")
-            st.stop()
-        period_start, period_end = chosen_period
-
-    sector = selected_sectors.iloc[0]
-    coords = selected_points.groupby("commune_name")[["latitude", "longitude"]].mean().reset_index()
-    names = sorted(coords["commune_name"].tolist())
-    chosen_names = st.multiselect("Communes pour la pluie", names, default=names[:min(3, len(names))])
-    coords = coords[coords["commune_name"].isin(chosen_names)]
-
-    frames = []
+        chosen_period=st.date_input("Période",value=(max(data_start,data_end-timedelta(days=90)),data_end),min_value=data_start,max_value=data_end)
+        if not isinstance(chosen_period,(tuple,list)) or len(chosen_period)!=2: st.info("Choisis deux dates"); st.stop()
+        period_start,period_end=chosen_period
+    sector=selected_sectors.iloc[0]
+    coords=selected_points.groupby("commune_name")[["latitude","longitude"]].mean().reset_index()
+    frames=[]
     with st.spinner("Chargement parallèle des pluies du secteur..."):
-        with ThreadPoolExecutor(max_workers=min(8, max(1, len(coords)))) as pool:
-            jobs = [pool.submit(load_daily_rain, r.latitude, r.longitude, data_start, data_end)
-                    for r in coords.itertuples(index=False)]
+        with ThreadPoolExecutor(max_workers=min(8,max(1,len(coords)))) as pool:
+            jobs=[pool.submit(load_daily_rain,r.latitude,r.longitude,data_start,data_end) for r in coords.itertuples(index=False)]
             for future in as_completed(jobs):
-                try:
-                    frames.append(future.result())
-                except Exception:
-                    pass
-    if not frames:
-        st.error("Pluie indisponible")
-        st.stop()
-    rain = add_rain_features(pd.concat(frames).groupby("date", as_index=False)["rain_mm"].max())
-
-    piezo_history = pd.DataFrame()
+                try: frames.append(future.result())
+                except Exception: pass
+    if not frames: st.error("Pluie indisponible"); st.stop()
+    rain=add_rain_features(pd.concat(frames).groupby("date",as_index=False)["rain_mm"].max())
+    piezo_history=pd.DataFrame()
     with st.spinner("Recherche rapide d'un piézomètre actif..."):
-        stations = active_piezometers(line, radius, min(20, station_limit),
-                                      sector["pk_start"], sector["pk_end"])
+        stations=active_piezometers(line,radius,min(20,station_limit),sector["pk_start"],sector["pk_end"])
     if not stations.empty:
-        station = stations.sort_values("distance_km").iloc[0]
+        station=stations.sort_values("distance_km").iloc[0]
         try:
-            piezo_history = load_piezo_history(str(station["code_bss"]), data_start, data_end)
+            piezo_history=load_piezo_history(str(station["code_bss"]),data_start,data_end)
             st.caption(f"Piézomètre utilisé : {station['code_bss']} | PK {station['pk_km']:.1f}")
-        except Exception:
-            pass
-
-    period = rain[(rain["date"].dt.date >= period_start) & (rain["date"].dt.date <= period_end)]
-    rows = []
-    for _, rr in period.iterrows():
-        ctx = historical_piezo_context(piezo_history, rr["date"]) if not piezo_history.empty else None
-        result = calculate_risk(rr, sector, ctx, historical=True)
-        rows.append({
-            "Date": rr["date"],
-            "Indice": result["score"],
-            "Niveau": result["level"],
-            "Confiance (%)": result["confidence"],
-            "Pluie jour": rr["rain_mm"],
-            "Pluie 7 j": rr["rain_7d"],
-            "Pluie 30 j": rr["rain_30d"],
-            "Facteurs": ", ".join(result["factors"])
-        })
-    history = pd.DataFrame(rows)
-    if history.empty:
-        st.info("Aucune donnée")
+        except Exception: pass
+    period=rain[(rain["date"].dt.date>=period_start)&(rain["date"].dt.date<=period_end)]
+    rows=[]
+    for _,rr in period.iterrows():
+        ctx=historical_piezo_context(piezo_history,rr["date"]) if not piezo_history.empty else None
+        result=calculate_risk(rr,sector,ctx,historical=True)
+        rows.append({"Date":rr["date"],"Indice":result["score"],"Niveau":result["level"],"Confiance (%)":result["confidence"],"Pluie jour":rr["rain_mm"],"Pluie 7 j":rr["rain_7d"],"Pluie 30 j":rr["rain_30d"],"Facteurs":", ".join(result["factors"])})
+    history=pd.DataFrame(rows)
+    if history.empty: st.info("Aucune donnée")
     else:
-        fig = go.Figure()
-        fig.add_scatter(x=history["Date"], y=history["Indice"], mode="lines+markers", name="Indice")
-        for y, label, color in [(25, "Jaune", "#eab308"), (50, "Orange", "#ea580c"), (75, "Rouge", "#dc2626")]:
-            fig.add_hline(y=y, line_dash="dash", line_color=color, annotation_text=label)
-        fig.update_layout(height=430, yaxis=dict(title="Indice / 100", range=[0, 100]), hovermode="x unified")
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+        fig=go.Figure(); fig.add_scatter(x=history["Date"],y=history["Indice"],mode="lines+markers",name="Indice")
+        for y,label,color in [(25,"Jaune","#eab308"),(50,"Orange","#ea580c"),(75,"Rouge","#dc2626")]: fig.add_hline(y=y,line_dash="dash",line_color=color,annotation_text=label)
+        fig.update_layout(height=430,yaxis=dict(title="Indice / 100",range=[0,100]),hovermode="x unified")
+        st.plotly_chart(fig,use_container_width=True,config={"displayModeBar":False})
+        worst=history.loc[history["Indice"].idxmax()]
+        c1,c2,c3,c4=st.columns(4); c1.metric("Niveau maximal",worst["Niveau"]); c2.metric("Indice maximal",f"{worst['Indice']:.1f}/100"); c3.metric("Date",worst["Date"].strftime("%d/%m/%Y")); c4.metric("Confiance",f"{worst['Confiance (%)']} %")
+        st.dataframe(history.sort_values("Date",ascending=False),use_container_width=True,hide_index=True)
+        st.download_button("⬇️ Export CSV",history.to_csv(index=False).encode("utf-8-sig"),f"risque_{sector['sector_id']}.csv","text/csv")
+        st.caption("Pour les dates passées, les anciennes prévisions et vigilances ne sont pas inventées. La confiance est réduite lorsqu'elles ne sont pas archivées.")
 
-        worst = history.loc[history["Indice"].idxmax()]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Niveau maximal", worst["Niveau"])
-        c2.metric("Indice maximal", f"{worst['Indice']:.1f}/100")
-        c3.metric("Date", worst["Date"].strftime("%d/%m/%Y"))
-        c4.metric("Confiance", f"{worst['Confiance (%)']} %")
-        st.dataframe(history.sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-        st.download_button("⬇️ Export CSV", history.to_csv(index=False).encode("utf-8-sig"),
-                           f"risque_{sector['sector_id']}.csv", "text/csv")
-        st.caption("Pour les dates passées, les anciennes prévisions et vigilances ne sont pas inventées. "
-                   "La confiance est réduite lorsqu'elles ne sont pas archivées.")
-
-# ===================== CARTE SATELLITE =====================
 elif module == "Carte satellite":
     st.subheader(f"Carte satellite - {sector_name}")
-    m = folium.Map(location=[lat_c, lon_c], zoom_start=8 if all_selected else 11,
-                   tiles=None, control_scale=True)
-    folium.TileLayer(
-        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri, Maxar, Earthstar Geographics, GIS User Community",
-        name="Satellite", max_zoom=19
-    ).add_to(m)
+    m=folium.Map(location=[lat_c,lon_c],zoom_start=8 if all_selected else 11,tiles=None,control_scale=True)
+    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",attr="Esri, Maxar, Earthstar Geographics, GIS User Community",name="Satellite",max_zoom=19).add_to(m)
     for segment in snapshot.get("lgv_lines") or []:
-        pts = [[p["lat"], p["lon"]] for p in segment if isinstance(p, dict) and "lat" in p and "lon" in p]
-        if pts:
-            folium.PolyLine(pts, color="#ef4444", weight=3, opacity=.9).add_to(m)
-    for _, sector in selected_sectors.iterrows():
-        folium.CircleMarker(
-            [sector["latitude"], sector["longitude"]],
-            radius=8, color=LEVEL_COLOR[sector["static_level"]],
-            fill=True, fill_opacity=.85,
-            tooltip=f"{sector['name']} | {sector['static_level']} | {sector['static_score']:.0f}/100"
-        ).add_to(m)
-    st_folium(m, use_container_width=True, height=560, returned_objects=[])
+        pts=[[p["lat"],p["lon"]] for p in segment if isinstance(p,dict) and "lat" in p and "lon" in p]
+        if pts: folium.PolyLine(pts,color="#ef4444",weight=3,opacity=.9).add_to(m)
+    for _,sector in selected_sectors.iterrows():
+        folium.CircleMarker([sector["latitude"],sector["longitude"]],radius=8,color=LEVEL_COLOR[sector["static_level"]],fill=True,fill_opacity=.85,tooltip=f"{sector['name']} | {sector['static_level']} | {sector['static_score']:.0f}/100").add_to(m)
+    st_folium(m,use_container_width=True,height=560,returned_objects=[])
 
-st.caption("Optimisations : vue par défaut sans API lourde, chargement à la demande, "
-           "requêtes groupées pour Hub'Eau, session HTTP réutilisable, cache prolongé pour les données historiques.")
+st.caption("Optimisations : vue par défaut sans API lourde, chargement à la demande, requêtes parallèles limitées et cache par source.")
