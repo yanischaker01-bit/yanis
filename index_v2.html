@@ -985,7 +985,7 @@ var GPS_CFG={
   measurementNoiseFloor:4.0,
 
   // Durée de l'interpolation visuelle entre deux mesures.
-  drawDurationMs:450,
+  drawDurationMs:180,
 
   // Distance de recherche des PK métriques autour de la position.
   pkSearchRadiusM:250
@@ -1186,46 +1186,32 @@ function _gpsAccept(pos){
   var lat=Number(pos.coords.latitude);
   var lng=Number(pos.coords.longitude);
   var acc=Number(pos.coords.accuracy);
+  var ts=Number(pos.timestamp)||Date.now();
 
   if(!Number.isFinite(lat)||!Number.isFinite(lng))return false;
   if(lat<-90||lat>90||lng<-180||lng>180)return false;
-
-  // Une précision annoncée énorme ne doit pas contaminer le filtre.
-  // On accepte quand même la mesure, mais elle aura peu de poids dans Kalman.
   acc=Number.isFinite(acc)&&acc>0?acc:50;
 
   if(!_gpsLastAccepted){
-    _gpsLastAccepted={
-      lat:lat,lng:lng,accuracy:acc,
-      ts:Date.now()
-    };
+    _gpsLastAccepted={lat:lat,lng:lng,accuracy:acc,ts:ts};
     return true;
   }
 
-  var now=Date.now();
-  var dt=Math.max(0.05,(now-_gpsLastAccepted.ts)/1000);
-  var d=_haversine(_gpsLastAccepted.lat,_gpsLastAccepted.lng,lat,lng);
+  var dt=Math.max(0.1,(ts-_gpsLastAccepted.ts)/1000);
+  // Si le timestamp du navigateur est incohérent, on retombe sur une mesure temps réel.
+  if(dt>30)dt=Math.max(0.1,(Date.now()-_gpsLastAccepted.ts)/1000);
 
-  // Limite dynamique :
-  //   déplacement physique autorisé + marge liée à l'incertitude GPS.
-  var allowed=Math.max(
-    GPS_CFG.outlierMinJump,
-    GPS_CFG.maxSpeedMps*dt+
-      Math.max(acc,_gpsLastAccepted.accuracy)*GPS_CFG.outlierAccuracyFactor
-  );
+  var d=_haversine(_gpsLastAccepted.lat,_gpsLastAccepted.lng,lat,lng);
+  var uncertainty=Math.max(acc,_gpsLastAccepted.accuracy);
+  var allowed=GPS_CFG.maxSpeedMps*dt + uncertainty*GPS_CFG.outlierAccuracyFactor;
+  allowed=Math.max(GPS_CFG.outlierMinJump,allowed);
 
   if(d>allowed){
-    console.warn(
-      '[GPS] mesure rejetée',
-      Math.round(d)+'m > '+Math.round(allowed)+'m',
-      'dt='+dt.toFixed(2)+'s'
-    );
+    console.warn('[GPS] outlier rejeté:',Math.round(d)+'m > '+Math.round(allowed)+'m');
     return false;
   }
 
-  _gpsLastAccepted={
-    lat:lat,lng:lng,accuracy:acc,ts:now
-  };
+  _gpsLastAccepted={lat:lat,lng:lng,accuracy:acc,ts:ts};
   return true;
 }
 
@@ -1328,11 +1314,13 @@ function _drawGps(p){
 /* ── Centrage GPS façon navigation ── */
 function _followGps(p){
   if(!p)return;
-  map.easeTo({
-    center:[p.lng,p.lat],
-    duration:Math.min(450,GPS_CFG.drawDurationMs),
-    essential:true
-  });
+  // Le point bleu reste indépendant de la carte. Le centrage suit le GPS sans
+  // empiler plusieurs easeTo() qui peuvent donner une impression de retard.
+  var c=map.getCenter();
+  var dist=_haversine(c.lat,c.lng,p.lat,p.lng);
+  if(dist>2){
+    map.jumpTo({center:[p.lng,p.lat]});
+  }
 }
 
 /* ── Une mesure GPS entrante ── */
@@ -1727,8 +1715,8 @@ function _findNearestPk(lat,lng){
   var candidates=_queryPkMetricLoaded(lat,lng);
 
   if(candidates.length){
-    var b0=_extractBranch(candidates[0].branch);
-    candidates=_filterPkBranch(candidates,b0);
+    // Le PK métrique réellement le plus proche définit la branche et le côté.
+    // Ne pas filtrer les candidats avant le choix : deux voies peuvent être très proches.
     var best=candidates[0];
     return {
       level:'1m',
@@ -1741,8 +1729,6 @@ function _findNearestPk(lat,lng){
 
   candidates=_queryPkRendered(lat,lng);
   if(candidates.length){
-    var b1=_extractBranch(candidates[0].branch);
-    candidates=_filterPkBranch(candidates,b1);
     var best2=candidates[0];
     return {
       level:'1m',
@@ -1817,21 +1803,24 @@ function _preparePkMetricAround(lat,lng){
 
 /* ── Recherche Accès/PAM, filtrée par branche quand possible. ── */
 function _findNearestAccessPam(lat,lng,branch){
+  var voieN=branch?String(branch).slice(-1):'';
   var accPool=layerData.acces||[];
   var pamPool=layerData.pam||[];
 
-  if(branch){
-    var accSame=accPool.filter(function(f){
+  // Même logique que la version initiale qui donnait les bons résultats :
+  // Accès selon AXE et PAM selon axe, avec conservation des objets génériques LGV.
+  if(voieN==='1'||voieN==='2'){
+    var filtAcc=accPool.filter(function(f){
       var ax=String(f.props&&f.props.AXE||'');
-      return _extractBranch(ax)===branch;
+      return ax.endsWith(voieN)||ax.includes('V'+voieN);
     });
-    if(accSame.length)accPool=accSame;
+    if(filtAcc.length)accPool=filtAcc;
 
-    var pamSame=pamPool.filter(function(f){
+    var filtPam=pamPool.filter(function(f){
       var ax=String(f.props&&f.props.axe||'');
-      return ax.toUpperCase()==='LGV'||_extractBranch(ax)===branch;
+      return ax==='LGV'||ax.endsWith(voieN);
     });
-    if(pamSame.length)pamPool=pamSame;
+    if(filtPam.length)pamPool=filtPam;
   }
 
   return {
@@ -1852,34 +1841,15 @@ function _updateNearestFromGps(p){
   if(_gpsNearestBusy)return;
   _gpsNearestBusy=true;
 
-  Promise.resolve()
-    .then(function(){
-      // Priorité absolue : exploiter d'abord les PK métriques déjà chargés.
-      // On ne déplace donc PAS la carte à chaque mesure GPS.
-      var pk=_findNearestPk(p.lat,p.lng);
-      if(pk&&pk.level==='1m')return pk;
-
-      // Si aucune feature métrique n'est chargée autour de la position,
-      // on force une fois le chargement z20 puis on réessaie.
-      return _preparePkMetricAround(p.lat,p.lng).then(function(){
-        return _findNearestPk(p.lat,p.lng);
-      });
-    })
-    .then(function(pk){
-      var branch=pk?pk.branch:'';
-      var ap=_findNearestAccessPam(p.lat,p.lng,branch);
-
-      window._gpsNearestResult={
-        position:p,
-        pk:pk,
-        access:ap.access,
-        pam:ap.pam
-      };
-    })
-    .catch(function(e){console.warn('[Nearest]',e);})
-    .finally(function(){
-      _gpsNearestBusy=false;
-    });
+  Promise.resolve().then(function(){
+    // Pendant le suivi, on exploite uniquement les tuiles déjà chargées.
+    // IMPORTANT : aucune animation/vol de carte ici.
+    var pk=_findNearestPk(p.lat,p.lng);
+    var branch=pk?pk.branch:'';
+    var ap=_findNearestAccessPam(p.lat,p.lng,branch);
+    window._gpsNearestResult={position:p,pk:pk,access:ap.access,pam:ap.pam};
+  }).catch(function(e){console.warn('[Nearest]',e);})
+    .finally(function(){_gpsNearestBusy=false;});
 }
 
 /* ── Bouton "PK?" ── */
