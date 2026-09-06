@@ -985,7 +985,7 @@ var GPS_CFG={
   measurementNoiseFloor:4.0,
 
   // Durée de l'interpolation visuelle entre deux mesures.
-  drawDurationMs:180,
+  drawDurationMs:90,
 
   // Distance de recherche des PK métriques autour de la position.
   pkSearchRadiusM:250
@@ -1049,134 +1049,29 @@ function _mat4Mul(A,B){
  *   {lat,lng,accuracy,speed,ts}
  */
 function _kfUpdate(lat,lng,acc,ts){
-  acc=Math.max(1,Number(acc)||20);
-  ts=Number(ts)||Date.now();
-
-  var xy=_llToXY(lat,lng);
-
+  // Filtre adaptatif Alpha-Beta : beaucoup plus réactif qu'un Kalman
+  // classique pour une navigation terrain sur smartphone.
+  acc=Math.max(1,Number(acc)||30); ts=Number(ts)||Date.now();
+  var z=_llToXY(lat,lng);
   if(!_kf.initialized){
-    _kf.initialized=true;
-    _kf.x[0]=xy.x; _kf.x[1]=xy.y;
-    _kf.x[2]=0;    _kf.x[3]=0;
-
-    // Incertitude initiale.
-    _kf.P.fill(0);
-    _kf.P[0]=acc*acc;
-    _kf.P[5]=acc*acc;
-    _kf.P[10]=25;
-    _kf.P[15]=25;
+    _kf.initialized=true; _kf.x[0]=z.x; _kf.x[1]=z.y; _kf.x[2]=0; _kf.x[3]=0;
     _gpsLastTs=ts;
-
-    return {
-      lat:lat,lng:lng,accuracy:acc,speed:0,ts:ts
-    };
+    return {lat:lat,lng:lng,accuracy:acc,speed:0,ts:ts,predicted:false};
   }
-
-  var dt=Math.max(0.001,Math.min(5,(ts-_gpsLastTs)/1000));
+  var dt=Math.max(.02,Math.min(5,(ts-_gpsLastTs)/1000));
   _gpsLastTs=ts;
-
-  // Matrice de transition F.
-  var F=[
-    1,0,dt,0,
-    0,1,0,dt,
-    0,0,1,0,
-    0,0,0,1
-  ];
-
-  // Prédiction x = F*x.
-  var px=new Float64Array(4);
-  for(var r=0;r<4;r++){
-    var s=0;
-    for(var k=0;k<4;k++)s+=F[r*4+k]*_kf.x[k];
-    px[r]=s;
-  }
-
-  // Q : bruit de processus, modèle accélération.
-  var q=Math.max(0.01,GPS_CFG.processNoise);
-  var dt2=dt*dt,dt3=dt2*dt,dt4=dt3*dt;
-  var Q=[
-    dt4/4*q,0,dt3/2*q,0,
-    0,dt4/4*q,0,dt3/2*q,
-    dt3/2*q,0,dt2*q,0,
-    0,dt3/2*q,0,dt2*q
-  ];
-
-  var FP=_mat4Mul(F,_kf.P);
-  var Ft=[
-    1,0,0,0,
-    0,1,0,0,
-    dt,0,1,0,
-    0,dt,0,1
-  ];
-  var Ppred=_mat4Mul(FP,Ft);
-  for(var i=0;i<16;i++)_kf.P[i]=Ppred[i]+Q[i];
-  for(i=0;i<4;i++)_kf.x[i]=px[i];
-
-  // Observation z=[x,y].
-  var Rm=Math.max(
-    GPS_CFG.measurementNoiseFloor*GPS_CFG.measurementNoiseFloor,
-    acc*acc
-  );
-
-  // H = [[1,0,0,0],[0,1,0,0]]
-  // S = HPH' + R, donc matrice 2×2.
-  var S00=_kf.P[0]+Rm;
-  var S01=_kf.P[1];
-  var S10=_kf.P[4];
-  var S11=_kf.P[5]+Rm;
-
-  var det=S00*S11-S01*S10;
-  if(Math.abs(det)<1e-12)det=1e-12;
-
-  var iS00=S11/det, iS01=-S01/det;
-  var iS10=-S10/det, iS11=S00/det;
-
-  // Innovation y=z-Hx.
-  var y0=xy.x-_kf.x[0];
-  var y1=xy.y-_kf.x[1];
-
-  // K=P H' S^-1.
-  var K=new Float64Array(8);
-  for(i=0;i<4;i++){
-    var p0=_kf.P[i*4],p1=_kf.P[i*4+1];
-    K[i*2]=p0*iS00+p1*iS10;
-    K[i*2+1]=p0*iS01+p1*iS11;
-  }
-
-  for(i=0;i<4;i++)
-    _kf.x[i]+=K[i*2]*y0+K[i*2+1]*y1;
-
-  // P=(I-KH)P.
-  var oldP=new Float64Array(_kf.P);
-  for(var rr=0;rr<4;rr++){
-    for(var cc=0;cc<4;cc++){
-      var kh=(cc===0?K[rr*2]:cc===1?K[rr*2+1]:0);
-      _kf.P[rr*4+cc]=oldP[rr*4+cc]-kh*oldP[cc];
-    }
-  }
-
-  // Symétrisation numérique.
-  for(rr=0;rr<4;rr++){
-    for(cc=rr+1;cc<4;cc++){
-      var av=(_kf.P[rr*4+cc]+_kf.P[cc*4+rr])/2;
-      _kf.P[rr*4+cc]=av;
-      _kf.P[cc*4+rr]=av;
-    }
-  }
-
-  var ll=_xyToLL(_kf.x[0],_kf.x[1]);
+  var px=_kf.x[0]+_kf.x[2]*dt, py=_kf.x[1]+_kf.x[3]*dt;
+  var rx=z.x-px, ry=z.y-py, innovation=Math.hypot(rx,ry);
+  var quality=Math.max(0,Math.min(1,(40-acc)/35));
+  var alpha=.35+.57*quality;
+  var beta=.05+.45*quality;
+  if(innovation>Math.max(8,acc*.8)) alpha=Math.min(.95,alpha+.15);
+  _kf.x[0]=px+alpha*rx; _kf.x[1]=py+alpha*ry;
+  _kf.x[2]=_kf.x[2]+(beta/dt)*rx; _kf.x[3]=_kf.x[3]+(beta/dt)*ry;
   var speed=Math.hypot(_kf.x[2],_kf.x[3]);
-
-  // Incertitude horizontale approximative.
-  var sigma=Math.sqrt(Math.max(1,(_kf.P[0]+_kf.P[5])/2));
-
-  return {
-    lat:ll.lat,
-    lng:ll.lng,
-    accuracy:Math.max(acc,sigma),
-    speed:speed,
-    ts:ts
-  };
+  if(speed>90){var k=90/speed;_kf.x[2]*=k;_kf.x[3]*=k;speed=90;}
+  var ll=_xyToLL(_kf.x[0],_kf.x[1]);
+  return {lat:ll.lat,lng:ll.lng,accuracy:Math.max(acc,3),speed:speed,ts:ts,predicted:false};
 }
 
 /* ── Rejet des outliers AVANT Kalman ── */
@@ -1311,6 +1206,26 @@ function _drawGps(p){
   _gpsAnimation=requestAnimationFrame(frame);
 }
 
+/* Prévision visuelle entre deux fixes : le point continue à avancer à la
+   vitesse estimée pendant quelques centaines de ms. Jamais utilisée pour PK. */
+var _gpsRenderLoop=null;
+function _startGpsRenderLoop(){
+  if(_gpsRenderLoop)cancelAnimationFrame(_gpsRenderLoop);
+  function loop(){
+    if(_gpsLastFiltered && _kf.initialized){
+      var dt=Math.min(1.2,Math.max(0,(Date.now()-_gpsLastFiltered.ts)/1000));
+      if(dt>0.05){
+        var ll=_xyToLL(_kf.x[0]+_kf.x[2]*dt,_kf.x[1]+_kf.x[3]*dt);
+        var p={lat:ll.lat,lng:ll.lng,accuracy:_gpsLastFiltered.accuracy,ts:_gpsLastFiltered.ts};
+        _setGpsDraw(p.lat,p.lng,p.accuracy);
+      }
+    }
+    _gpsRenderLoop=requestAnimationFrame(loop);
+  }
+  _gpsRenderLoop=requestAnimationFrame(loop);
+}
+function _stopGpsRenderLoop(){if(_gpsRenderLoop){cancelAnimationFrame(_gpsRenderLoop);_gpsRenderLoop=null;}}
+
 /* ── Centrage GPS façon navigation ── */
 function _followGps(p){
   if(!p)return;
@@ -1343,12 +1258,10 @@ function _onGpsPosition(pos){
   if(_gpsFollowing)_followGps(filtered);
 
   // Le calcul du PK est déclenché après une mesure stable.
-  if(!_gpsNearestBusy){
-    clearTimeout(_gpsNearestTimer);
-    _gpsNearestTimer=setTimeout(function(){
-      if(_gpsLastFiltered)_updateNearestFromGps(_gpsLastFiltered);
-    },180);
-  }
+  clearTimeout(_gpsNearestTimer);
+  _gpsNearestTimer=setTimeout(function(){
+    if(_gpsLastRaw && (Date.now()-_gpsLastRaw.ts)<8000)_updateNearestFromGps(_gpsLastRaw);
+  },250);
 }
 
 function _onGpsError(err){
@@ -1385,6 +1298,7 @@ function locateMe(){
   _gpsFollowing=true;
 
   _ensureGpsLayers();
+  _startGpsRenderLoop();
   showNetToast('📍 Suivi GPS haute précision activé');
 
   _gpsWatchId=navigator.geolocation.watchPosition(
@@ -1416,6 +1330,7 @@ function _stopGps(){
     _gpsWatchId=null;
   }
   _gpsFollowing=false;
+  _stopGpsRenderLoop();
 
   var btn=document.querySelector('#fab-bar button[title="Arrêter le suivi GPS"]');
   if(btn){
@@ -1859,7 +1774,7 @@ function findNearest(){
     return;
   }
 
-  var p=_gpsLastFiltered||_gpsLastAccepted;
+  var p=_gpsLastRaw||_gpsLastAccepted||_gpsLastFiltered;
   if(p){
     _showNearestResult(p);
     return;
