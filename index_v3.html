@@ -326,7 +326,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script>
 /* ── Version applicative sans boucle de rechargement ── */
 (function(){
-  var V='v3.93-gps-sans-cache-position';
+  var V='v3.92-terrain-pk1m';
   try{
     var previous=localStorage.getItem('lgv_app_ver');
     localStorage.setItem('lgv_app_ver',V);
@@ -340,7 +340,7 @@ button,a,[onclick]{touch-action:manipulation}
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v3.93-gps-sans-cache-position';
+var APP_VER = 'v3.92-terrain-pk1m';
 /* Mise à jour applicative : supprime les anciens caches une seule fois pour cette version. */
 (function(){
   var k='lgv_cache_clean_'+APP_VER;
@@ -362,7 +362,7 @@ fetch('data/pk.geojson?_v='+APP_VER)
   .catch(function(e){console.warn('PK prefetch:',e);_loading.pk=false;});
 
 // ── PMTiles protocol ──
-var _pkMetricBase = new URL('data/pk_metric.pmtiles?v=393', document.baseURI).href;
+var _pkMetricBase = new URL('data/pk_metric.pmtiles?v=392', document.baseURI).href;
 var _pmProtocol = new pmtiles.Protocol();
 var _pkMetricArchive = new pmtiles.PMTiles(_pkMetricBase);
 _pmProtocol.add(_pkMetricArchive);
@@ -529,7 +529,7 @@ var _pkHData=null,_pkHLoaded=false;
 var searchIndex=[];
 // Position sauvegardée au moment du chargement (avant tout moveend)
 var _savedPosAtLoad=null;
-try{localStorage.removeItem('lgv_map_pos');sessionStorage.removeItem('lgv_map_pos');}catch(e){}
+try{localStorage.removeItem('lgv_map_pos');}catch(e){}
 
 // ── Visibilité couches (état utilisateur) ──
 var _vis={rail:true,pk:true,pkhecto:true,pkmetric:true,oa:true,oh:true,pam:true,acces:true,
@@ -1133,7 +1133,8 @@ window._forceLayerOn=function(type){
 // ══════════════════════════════════════════════════════════
 function _isOnLGV(lat,lng){return lat>=44.3&&lat<=47.7&&lng>=-1.7&&lng<=1.3;}
 function _restoreMapPos(){
-  try{localStorage.removeItem('lgv_map_pos');sessionStorage.removeItem('lgv_map_pos');}catch(e){}
+  /* Terrain: ne jamais restaurer ni enregistrer un ancien centre comme s'il s'agissait du GPS. */
+  try{localStorage.removeItem('lgv_map_pos');}catch(e){}
 }
 
 /* ── État GPS centralisé ── */
@@ -1259,8 +1260,8 @@ function _gpsFilterPosition(raw){
 }
 function _gpsAccept(pos){
   var c=pos.coords,lat=+c.latitude,lng=+c.longitude,acc=+c.accuracy,ts=+pos.timestamp||Date.now();
-  if(!isFinite(lat)||!isFinite(lng)||!isFinite(acc)||acc<=0||acc>500||Date.now()-ts>5000)return null;
-  if(_gpsLastDeviceTs&&ts<_gpsLastDeviceTs-250)return null;
+  if(!isFinite(lat)||!isFinite(lng)||!isFinite(acc)||acc<=0||acc>500||Date.now()-ts>8000)return null;
+  if(_gpsLastDeviceTs&&ts<_gpsLastDeviceTs-500)return null;
   _gpsLastDeviceTs=Math.max(_gpsLastDeviceTs,ts);
   _gpsLastCallback=Date.now();
   _gpsRequestPending=false;
@@ -1342,12 +1343,8 @@ function startLiveLocation(follow){
   if(typeof follow==='boolean')_gpsFollowing=follow;
   if(_gpsWatch!==null){_setLocateButton();_gpsFreshRequest();return;}
   _gpsFilter={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,ts:0};
-  _gpsLastAccepted=null;_gpsLastRaw=null;_gpsDisplayed=null;_gpsMatch=null;_gpsLastCallback=0;_gpsLastDeviceTs=0;
-  var ps=map.getSource('_gpsPoint');if(ps)ps.setData(emptyFC());
-  var cs=map.getSource('_gpsCircle');if(cs)cs.setData(emptyFC());
-  var hs=map.getSource('_gpsHeading');if(hs)hs.setData(emptyFC());
-  _updateGpsStatus(null);
-  showNetToast('📡 Recherche d’une position GPS fraîche…');
+  _gpsLastAccepted=null;_gpsLastRaw=null;_gpsMatch=null;_gpsLastCallback=0;_gpsLastDeviceTs=0;
+  showNetToast('📡 Recherche du signal GPS haute précision…');
   _gpsRestartWatch();_gpsFreshRequest();
   clearInterval(_gpsPoll);_gpsPoll=setInterval(_gpsFreshRequest,5000);
   clearInterval(_gpsWatchdog);_gpsWatchdog=setInterval(function(){
@@ -1359,7 +1356,7 @@ function startLiveLocation(follow){
 }
 function stopLiveLocation(showMessage){
   if(_gpsWatch!==null){try{navigator.geolocation.clearWatch(_gpsWatch);}catch(e){}_gpsWatch=null;}
-  clearInterval(_gpsPoll);clearInterval(_gpsWatchdog);_gpsPoll=null;_gpsWatchdog=null;_gpsRequestPending=false;_gpsLastRaw=null;_gpsLastAccepted=null;_gpsDisplayed=null;_gpsMatch=null;_gpsLastDeviceTs=0;
+  clearInterval(_gpsPoll);clearInterval(_gpsWatchdog);_gpsPoll=null;_gpsWatchdog=null;_gpsRequestPending=false;
   _setLocateButton();if(showMessage!==false)showNetToast('📍 Suivi GPS arrêté');
 }
 function locateMe(){
@@ -1395,8 +1392,6 @@ document.addEventListener('visibilitychange',function(){
   }
 });
 window.addEventListener('pageshow',function(){
-  try{localStorage.removeItem('lgv_map_pos');sessionStorage.removeItem('lgv_map_pos');}catch(e){}
-  if(_gpsWatch!==null){_gpsLastAccepted=null;_gpsLastRaw=null;_gpsDisplayed=null;_gpsLastDeviceTs=0;_gpsRequestPending=false;_gpsRestartWatch();_gpsFreshRequest();return;}
   if(_gpsWatch!==null&&_gpsLastAccepted&&Date.now()-_gpsLastAccepted.timestamp>7000){
     try{navigator.geolocation.getCurrentPosition(function(pos){var p=_gpsAccept(pos);if(p)_gpsDrawAndMatch(p);},function(){},{enableHighAccuracy:true,maximumAge:0,timeout:8000});}catch(e){}
   }
