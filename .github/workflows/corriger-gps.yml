@@ -1,4 +1,4 @@
-name: GPS terrain et PK metrique v3.78
+name: Generer HTML GPS corrige
 
 on:
   workflow_dispatch:
@@ -28,69 +28,39 @@ jobs:
             exit 1
           }
 
-          test -f corriger_gps_terrain_v377.py || {
-            echo "ERREUR : corriger_gps_terrain_v377.py introuvable"
+          test -f corriger_gps_lgv.py || {
+            echo "ERREUR : corriger_gps_lgv.py introuvable"
             exit 1
           }
 
-          test -f corriger_pk_metrique_v378.py || {
-            echo "ERREUR : corriger_pk_metrique_v378.py introuvable"
-            exit 1
-          }
-
-      - name: Verifier les scripts
+      - name: Verifier le script
         run: |
-          python -m py_compile corriger_gps_terrain_v377.py
-          python -m py_compile corriger_pk_metrique_v378.py
+          python -m py_compile corriger_gps_lgv.py
 
-      - name: Appliquer la correction GPS terrain
+      - name: Generer le HTML complet
         run: |
-          python corriger_gps_terrain_v377.py
+          python corriger_gps_lgv.py
 
-      - name: Appliquer la correction PK metrique
+      - name: Verifier le resultat
         run: |
-          python corriger_pk_metrique_v378.py
+          test -s index_v3_gps_corrige.html || {
+            echo "ERREUR : HTML corrige absent ou vide"
+            exit 1
+          }
 
-      - name: Verifier le HTML complet
+          grep -q "v3.90-gps-mapmatch" index_v3_gps_corrige.html
+          grep -q "_gpsFilter={ready:false" index_v3_gps_corrige.html
+          grep -q "_bestPkMetricMatch(p)" index_v3_gps_corrige.html
+          grep -q "pkm-query" index_v3_gps_corrige.html
+          grep -q "enableHighAccuracy:true,maximumAge:0,timeout:20000" index_v3_gps_corrige.html
+          grep -q "visibilitychange" index_v3_gps_corrige.html
+          grep -q "PK métrique 1 m" index_v3_gps_corrige.html
+
+      - name: Remplacer le HTML principal
         run: |
-          grep -q "v3.78-pk-metrique" index_v3.html || {
-            echo "ERREUR : version v3.78 absente"
-            exit 1
-          }
+          mv index_v3_gps_corrige.html index_v3.html
 
-          grep -q "GPS TERRAIN v3.77" index_v3.html || {
-            echo "ERREUR : correction GPS terrain absente"
-            exit 1
-          }
-
-          grep -q "_pkMetricCache=new Map()" index_v3.html || {
-            echo "ERREUR : cache PK metrique absent"
-            exit 1
-          }
-
-          grep -q "_nearestPkMetric" index_v3.html || {
-            echo "ERREUR : recherche PK metrique absente"
-            exit 1
-          }
-
-          grep -q "zoom:20" index_v3.html || {
-            echo "ERREUR : zoom technique absent"
-            exit 1
-          }
-
-          grep -q "secours 100 m" index_v3.html || {
-            echo "ERREUR : statut PK 100 m absent"
-            exit 1
-          }
-
-          grep -q "PK métrique indisponible" index_v3.html || {
-            echo "ERREUR : avertissement terrain absent"
-            exit 1
-          }
-
-          echo "HTML GPS terrain et PK metrique valide"
-
-      - name: Enregistrer dans main
+      - name: Publier dans main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -100,6 +70,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Aucune modification detectee"
           else
-            git commit -m "GPS terrain et detection PK metrique v3.78"
+            git commit -m "Amelioration du suivi GPS et du map-matching PK"
             git push origin HEAD:main
           fi
