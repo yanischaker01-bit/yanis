@@ -1,0 +1,50 @@
+name: Corriger le GPS LGV SEA
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  correction-gps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verifier les fichiers
+        run: |
+          echo "Fichiers disponibles :"
+          ls -la
+          test -f index_v3.html
+          test -f corriger_gps_lgv.py
+
+      - name: Executer la correction GPS
+        run: |
+          python corriger_gps_lgv.py
+
+      - name: Remplacer le fichier HTML
+        run: |
+          test -f index_v3_gps_corrige.html
+          mv index_v3_gps_corrige.html index_v3.html
+
+      - name: Enregistrer la correction dans main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add index_v3.html
+
+          if git diff --cached --quiet; then
+            echo "Aucune modification detectee."
+          else
+            git commit -m "Amelioration du suivi GPS temps reel"
+            git push
+          fi
