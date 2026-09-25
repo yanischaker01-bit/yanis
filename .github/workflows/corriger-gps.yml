@@ -1,4 +1,4 @@
-name: Corriger le GPS LGV SEA
+name: Generer HTML GPS corrige
 
 on:
   workflow_dispatch:
@@ -7,12 +7,14 @@ permissions:
   contents: write
 
 jobs:
-  correction-gps:
+  correction:
     runs-on: ubuntu-latest
 
     steps:
       - name: Recuperer le depot
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -21,21 +23,41 @@ jobs:
 
       - name: Verifier les fichiers
         run: |
-          echo "Fichiers disponibles :"
-          ls -la
-          test -f index_v3.html
-          test -f corriger_gps_lgv.py
+          test -f index_v3.html || {
+            echo "ERREUR : index_v3.html introuvable"
+            exit 1
+          }
 
-      - name: Executer la correction GPS
+          test -f corriger_gps_lgv.py || {
+            echo "ERREUR : corriger_gps_lgv.py introuvable"
+            exit 1
+          }
+
+      - name: Verifier le script
+        run: |
+          python -m py_compile corriger_gps_lgv.py
+
+      - name: Generer le HTML complet
         run: |
           python corriger_gps_lgv.py
 
-      - name: Remplacer le fichier HTML
+      - name: Verifier le resultat
         run: |
-          test -f index_v3_gps_corrige.html
+          test -s index_v3_gps_corrige.html || {
+            echo "ERREUR : HTML corrige absent ou vide"
+            exit 1
+          }
+
+          grep -q "v3.75-gps-fresh" index_v3_gps_corrige.html
+          grep -q "_gpsRequestFreshPosition" index_v3_gps_corrige.html
+          grep -q "GPS.requestPending" index_v3_gps_corrige.html
+          grep -q "maximumAge:0" index_v3_gps_corrige.html
+
+      - name: Remplacer le HTML principal
+        run: |
           mv index_v3_gps_corrige.html index_v3.html
 
-      - name: Enregistrer la correction dans main
+      - name: Publier dans main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -43,8 +65,8 @@ jobs:
           git add index_v3.html
 
           if git diff --cached --quiet; then
-            echo "Aucune modification detectee."
+            echo "Aucune modification detectee"
           else
-            git commit -m "Amelioration du suivi GPS temps reel"
-            git push
+            git commit -m "Correction du suivi GPS temps reel"
+            git push origin HEAD:main
           fi
