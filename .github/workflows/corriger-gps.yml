@@ -1,4 +1,4 @@
-name: Generer HTML GPS corrige
+name: GPS terrain v3.77
 
 on:
   workflow_dispatch:
@@ -28,36 +28,31 @@ jobs:
             exit 1
           }
 
-          test -f corriger_gps_lgv.py || {
-            echo "ERREUR : corriger_gps_lgv.py introuvable"
+          test -f corriger_gps_terrain_v377.py || {
+            echo "ERREUR : corriger_gps_terrain_v377.py introuvable"
             exit 1
           }
 
       - name: Verifier le script
         run: |
-          python -m py_compile corriger_gps_lgv.py
+          python -m py_compile corriger_gps_terrain_v377.py
 
-      - name: Generer le HTML complet
+      - name: Corriger le HTML
         run: |
-          python corriger_gps_lgv.py
+          python corriger_gps_terrain_v377.py
 
-      - name: Verifier le resultat
+      - name: Verifier la correction
         run: |
-          test -s index_v3_gps_corrige.html || {
-            echo "ERREUR : HTML corrige absent ou vide"
-            exit 1
-          }
+          grep -q "v3.77-gps-terrain" index_v3.html
+          grep -q "GPS TERRAIN v3.77" index_v3.html
+          grep -q "GPS.marker.setLngLat" index_v3.html
+          grep -q "_gpsFreshRequest" index_v3.html
+          grep -q "maximumAge:0" index_v3.html
+          grep -q "gps-status" index_v3.html
 
-          grep -q "v3.75-gps-fresh" index_v3_gps_corrige.html
-          grep -q "_gpsRequestFreshPosition" index_v3_gps_corrige.html
-          grep -q "GPS.requestPending" index_v3_gps_corrige.html
-          grep -q "maximumAge:0" index_v3_gps_corrige.html
+          echo "Correction GPS terrain valide"
 
-      - name: Remplacer le HTML principal
-        run: |
-          mv index_v3_gps_corrige.html index_v3.html
-
-      - name: Publier dans main
+      - name: Enregistrer dans main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -67,6 +62,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Aucune modification detectee"
           else
-            git commit -m "Correction du suivi GPS temps reel"
+            git commit -m "GPS terrain v3.77"
             git push origin HEAD:main
           fi
