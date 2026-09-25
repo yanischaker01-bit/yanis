@@ -22,7 +22,7 @@ import shutil
 
 INPUT = Path("index_v3.html")
 OUTPUT = Path("index_v3_gps_corrige.html")
-VERSION = "v3.90-gps-mapmatch"
+VERSION = "v3.92-terrain-pk1m"
 
 if not INPUT.exists():
     raise SystemExit("ERREUR : index_v3.html introuvable")
@@ -35,7 +35,7 @@ s = INPUT.read_text(encoding="utf-8")
 s = re.sub(r"var APP_VER\s*=\s*'[^']+';", f"var APP_VER = '{VERSION}';", s, count=1)
 s = re.sub(r"var V\s*=\s*'[^']+';", f"var V='{VERSION}';", s, count=1)
 s = re.sub(r"var _pkMetricBase = new URL\('data/pk_metric\.pmtiles\?v=[^']+'",
-           "var _pkMetricBase = new URL('data/pk_metric.pmtiles?v=390'", s, count=1)
+           "var _pkMetricBase = new URL('data/pk_metric.pmtiles?v=392'", s, count=1)
 
 # ---------------------------------------------------------------------------
 # Style + statut GPS
@@ -63,7 +63,7 @@ if '<div id="gps-status">' not in s:
 # ---------------------------------------------------------------------------
 # GPS section : remplacement complet
 # ---------------------------------------------------------------------------
-GPS_START = "// ══════════════════════════════════════════════════════════\n// LOCALISATION TEMPS REEL"
+GPS_START = "// ══════════════════════════════════════════════════════════\n// LOCALISATION TEMPS RÉEL"
 GPS_END = "// ══════════════════════════════════════════════════════════\n// DETECTION PK / ACCES / PAM LE PLUS PROCHE"
 start = s.find(GPS_START)
 end = s.find(GPS_END)
@@ -75,8 +75,7 @@ GPS_BLOCK = r'''// ════════════════════�
 // ══════════════════════════════════════════════════════════
 function _isOnLGV(lat,lng){return lat>=44.3&&lat<=47.7&&lng>=-1.7&&lng<=1.3;}
 function _restoreMapPos(){
-  try{var p=JSON.parse(localStorage.getItem('lgv_map_pos')||'null');if(p&&p.lat&&_isOnLGV(p.lat,p.lng))map.jumpTo({center:[p.lng,p.lat],zoom:Math.min(p.zoom,12)});}catch(e){}
-  var t=null;map.on('moveend',function(){clearTimeout(t);t=setTimeout(function(){try{var c=map.getCenter();localStorage.setItem('lgv_map_pos',JSON.stringify({lat:c.lat,lng:c.lng,zoom:map.getZoom()}));}catch(e){}},400);});
+  try{localStorage.removeItem('lgv_map_pos');}catch(e){}
 }
 
 /* ── État GPS centralisé ── */
@@ -93,6 +92,7 @@ var _gpsLastCameraTs=0;
 var _gpsFilter={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,ts:0};
 var _gpsLastError='';
 var _gpsMatch=null;
+var _gpsLastDeviceTs=0;
 
 /* fenêtre locale en mètres autour du premier point du filtre */
 function _gpsToXY(lat,lng){
@@ -177,8 +177,9 @@ function _gpsFilterPosition(raw){
   var prevAcc=_gpsLastAccepted?_gpsLastAccepted.accuracy:raw.accuracy;
   var predictedSpeed=Math.hypot(f.vx,f.vy);
   var maxJump=Math.max(50,raw.accuracy*3,prevAcc*2.5,(Math.max(raw.speed||0,predictedSpeed)*dt)+40);
-  if(res>maxJump&&raw.accuracy>=prevAcc*0.85){
-    return null;
+  if(res>maxJump){
+    f.x=xy.x;f.y=xy.y;f.vx=0;f.vy=0;f.ts=ts;
+    return {lat:raw.lat,lng:raw.lng,accuracy:raw.accuracy,timestamp:ts,speed:raw.speed,heading:raw.heading,rawLat:raw.lat,rawLng:raw.lng,innovation:res,reset:true};
   }
   var q=_gpsClamp(15/(raw.accuracy+15),.10,.95);
   var alpha=_gpsClamp(.22+.68*q, .18, .88);
@@ -200,7 +201,9 @@ function _gpsFilterPosition(raw){
 }
 function _gpsAccept(pos){
   var c=pos.coords,lat=+c.latitude,lng=+c.longitude,acc=+c.accuracy,ts=+pos.timestamp||Date.now();
-  if(!isFinite(lat)||!isFinite(lng)||!isFinite(acc)||acc<=0||acc>500||Date.now()-ts>15000)return null;
+  if(!isFinite(lat)||!isFinite(lng)||!isFinite(acc)||acc<=0||acc>500||Date.now()-ts>8000)return null;
+  if(_gpsLastDeviceTs&&ts<_gpsLastDeviceTs-500)return null;
+  _gpsLastDeviceTs=Math.max(_gpsLastDeviceTs,ts);
   var raw={lat:lat,lng:lng,accuracy:acc,timestamp:ts,
     speed:isFinite(+c.speed)&&+c.speed>=0?+c.speed:null,
     heading:isFinite(+c.heading)&&+c.heading>=0?+c.heading:null};
@@ -240,7 +243,10 @@ function _gpsAnimationFrame(now){
 
 function _drawGps(p,force){
   _ensureGpsLayers();
-  _animateGpsTo(p);
+  var liveLat=isFinite(p.rawLat)?p.rawLat:p.lat,liveLng=isFinite(p.rawLng)?p.rawLng:p.lng;
+  _gpsDisplayed={lat:liveLat,lng:liveLng};
+  var ps=map.getSource('_gpsPoint');if(ps)ps.setData({type:'Feature',properties:{accuracy:p.accuracy,heading:p.heading},geometry:{type:'Point',coordinates:[liveLng,liveLat]}});
+  var cs=map.getSource('_gpsCircle');if(cs)cs.setData(_gpsCircle(liveLng,liveLat,Math.max(3,p.accuracy)));
   _updateGpsStatus(p);
   var now=Date.now();
   if(_gpsFollowing&&(force||now-_gpsLastCameraTs>300)){
@@ -249,9 +255,9 @@ function _drawGps(p,force){
     var cur=map.getCenter(),moved=_haversine(cur.lat,cur.lng,p.lat,p.lng);
     _gpsCameraMoving=true;
     if(moved>150){
-      map.jumpTo({center:[p.lng,p.lat],zoom:Math.max(map.getZoom(),targetZoom)});
+      map.jumpTo({center:[liveLng,liveLat],zoom:Math.max(map.getZoom(),targetZoom)});
     }else{
-      map.easeTo({center:[p.lng,p.lat],zoom:Math.max(map.getZoom(),targetZoom),duration:220,essential:true});
+      map.easeTo({center:[liveLng,liveLat],zoom:Math.max(map.getZoom(),targetZoom),duration:220,essential:true});
     }
     setTimeout(function(){_gpsCameraMoving=false;},280);
   }
@@ -410,8 +416,8 @@ function _pkMetricLabel(p){
 }
 function _pkCandidateScore(f,p){
   var co=f.geom.coordinates,d=_haversine(p.lat,p.lng,co[1],co[0]);
-  if(p.accuracy>35)return null;
-  var maxD=Math.max(12,Math.min(55,p.accuracy*1.7));
+  if(p.accuracy>65)return null;
+  var maxD=Math.max(15,Math.min(70,p.accuracy*1.8));
   if(d>maxD)return null;
   var voie=String(f.props._voie||f.props.voie||'').trim();
   var score=d;
@@ -513,8 +519,8 @@ function findNearest(){
       if(done)return;tries++;
       _refreshPkMetricCache(p);
       var metric=_bestPkMetricMatch(p);
-      if(metric||tries>=8){done=true;_finishFindNearest(p.lat,p.lng,p.accuracy);return;}
-      setTimeout(finish,350);
+      if(metric||tries>=14){done=true;_finishFindNearest(p.lat,p.lng,p.accuracy);return;}
+      setTimeout(finish,500);
     }
     map.once('idle',finish);setTimeout(finish,1200);
   });
@@ -547,22 +553,11 @@ function _finishFindNearest(lat,lng,acc){
   var metric=_bestPkMetricMatch(live);
   if(metric){
     npk={f:{props:metric.props,geom:metric.geom},d:metric.d};
-    pkPrec='PK métrique 1 m · matchage LGV';
+    pkPrec='PK métrique source 1 m · GPS ±'+Math.round(acc)+' m';
   }
 
-  /* Pas d'interpolation artificielle : un PK 100 m reste 100 m. */
-  if(!npk&&_pkHData&&_pkHData.features&&_pkHData.features.length){
-    var candidates=[];
-    _pkHData.features.forEach(function(f){
-      if(!f.geometry||f.geometry.type!=='Point')return;
-      var d=_haversine(lat,lng,f.geometry.coordinates[1],f.geometry.coordinates[0]);
-      candidates.push({f:{props:f.properties,geom:f.geometry},d:d});
-    });
-    candidates.sort(function(a,b){return a.d-b.d;});
-    if(candidates.length){npk=candidates[0];pkPrec='secours PK 100 m';}
-  }
-  if(!npk&&layerData.pk.length){npk=_nearestOf(lat,lng,layerData.pk);if(npk)pkPrec='secours PK 1 km';}
-
+  /* Aucun fallback 100 m ou 1 km : pas de fausse précision. */
+  if(!npk)pkPrec='PK métrique indisponible';
   /* Détecter branche + côté depuis la voie du PK le plus proche */
 '''
 # Note: the replacement intentionally starts at the old findNearest and ends immediately before the existing branch logic.
@@ -581,7 +576,7 @@ s = s.replace("var rawLbl=p._pk_label!=null?p._pk_label:(p.pk!=null?p.pk:null);"
 
 # Message de secours : explicite mais non alarmiste.
 needle = "html+='<div style=\"font-size:18px;font-weight:700;color:#cc0000\">'+lbl+'</div>';"
-rep = needle + "\n    if(pkPrec&&pkPrec.indexOf('1 m')<0)html+='<div style=\"font-size:10.5px;color:#c62828;font-weight:700;margin-top:3px\">⚠ PK métrique indisponible : valeur de secours, pas une localisation au mètre.</div>';"
+rep = needle + "\n    if(pkPrec&&pkPrec.indexOf('1 m')<0)html+='<div style=\"font-size:10.5px;color:#c62828;font-weight:700;margin-top:3px\">⚠ PK métrique indisponible : aucune valeur PK de secours n’est affichée.</div>';"
 if needle in s:
     s = s.replace(needle, rep, 1)
 
@@ -601,6 +596,16 @@ if "id:'pkm-query'" not in s:
         raise SystemExit("ERREUR : couche PK métrique 1 m introuvable")
     s = s.replace(MARKER, HELPER, 1)
 
+
+# Fond IGN : migration de l'ancien endpoint avec clé vers la Géoplateforme sans clé.
+s = s.replace(
+    "https://wxs.ign.fr/decouverte/geoportail/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/png&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}",
+    "https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&STYLE=normal&FORMAT=image/png&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}"
+)
+s = s.replace("attribution:'© IGN Géoportail'", "attribution:'© IGN - Géoplateforme'")
+# Ne pas remettre l'ancien HTML dans le cache hors-ligne manuel.
+s = s.replace("'index_v3.html','sw.js','manifest.json'", "'sw.js','manifest.json'")
+
 # ---------------------------------------------------------------------------
 # Vérifications / sortie
 # ---------------------------------------------------------------------------
@@ -611,14 +616,17 @@ required = [
     "_pkMetricCache=new Map()",
     "_bestPkMetricMatch(p)",
     "pkm-query",
-    "PK métrique 1 m · matchage LGV",
-    "pas une localisation au mètre",
+    "PK métrique source 1 m",
+    "aucune valeur PK de secours",
+    "https://data.geopf.fr/wmts?",
     "visibilitychange",
 ]
 for marker in required:
     if marker not in s:
         raise SystemExit(f"ERREUR vérification : marqueur absent : {marker}")
 
+if 'wxs.ign.fr/decouverte' in s:
+    raise SystemExit('ERREUR : ancien endpoint IGN encore présent')
 # Contrôle structurel minimal.
 if s.count("function startLiveLocation(") != 1:
     raise SystemExit("ERREUR : startLiveLocation dupliquée")
