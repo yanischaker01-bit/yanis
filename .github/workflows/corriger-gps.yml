@@ -1,4 +1,4 @@
-name: Generer HTML GPS corrige
+name: Publier GPS terrain et PK 1 m v3.92
 
 on:
   workflow_dispatch:
@@ -7,69 +7,39 @@ permissions:
   contents: write
 
 jobs:
-  correction:
+  publication:
     runs-on: ubuntu-latest
-
     steps:
       - name: Recuperer le depot
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Verifier les fichiers
         run: |
-          test -f index_v3.html || {
-            echo "ERREUR : index_v3.html introuvable"
-            exit 1
-          }
-
-          test -f corriger_gps_lgv.py || {
-            echo "ERREUR : corriger_gps_lgv.py introuvable"
-            exit 1
-          }
-
-      - name: Verifier le script
+          test -s index_v3_reviewed.html
+          test -s corriger_gps_lgv.py
+      - name: Publier le HTML relu
+        run: python corriger_gps_lgv.py
+      - name: Verifier la version et les corrections
         run: |
-          python -m py_compile corriger_gps_lgv.py
-
-      - name: Generer le HTML complet
-        run: |
-          python corriger_gps_lgv.py
-
-      - name: Verifier le resultat
-        run: |
-          test -s index_v3_gps_corrige.html || {
-            echo "ERREUR : HTML corrige absent ou vide"
-            exit 1
-          }
-
-          grep -q "v3.90-gps-mapmatch" index_v3_gps_corrige.html
-          grep -q "_gpsFilter={ready:false" index_v3_gps_corrige.html
-          grep -q "_bestPkMetricMatch(p)" index_v3_gps_corrige.html
-          grep -q "pkm-query" index_v3_gps_corrige.html
-          grep -q "enableHighAccuracy:true,maximumAge:0,timeout:20000" index_v3_gps_corrige.html
-          grep -q "visibilitychange" index_v3_gps_corrige.html
-          grep -q "PK métrique 1 m" index_v3_gps_corrige.html
-
-      - name: Remplacer le HTML principal
-        run: |
-          mv index_v3_gps_corrige.html index_v3.html
-
-      - name: Publier dans main
+          grep -q "v3.92-terrain-pk1m" index_v3.html
+          grep -q "https://data.geopf.fr/wmts?" index_v3.html
+          grep -q "function _gpsFreshRequest()" index_v3.html
+          grep -q "PK métrique source 1 m" index_v3.html
+          grep -q "aucune valeur PK de secours" index_v3.html
+          ! grep -q "wxs.ign.fr/decouverte" index_v3.html
+      - name: Commit
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git add index_v3.html
-
           if git diff --cached --quiet; then
-            echo "Aucune modification detectee"
+            echo "Aucune modification"
           else
-            git commit -m "Amelioration du suivi GPS et du map-matching PK"
+            git commit -m "GPS terrain PK 1 m et fond IGN v3.92"
             git push origin HEAD:main
           fi
