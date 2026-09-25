@@ -1,4 +1,4 @@
-name: GPS terrain v3.77
+name: GPS terrain et PK metrique v3.78
 
 on:
   workflow_dispatch:
@@ -33,24 +33,62 @@ jobs:
             exit 1
           }
 
-      - name: Verifier le script
+          test -f corriger_pk_metrique_v378.py || {
+            echo "ERREUR : corriger_pk_metrique_v378.py introuvable"
+            exit 1
+          }
+
+      - name: Verifier les scripts
         run: |
           python -m py_compile corriger_gps_terrain_v377.py
+          python -m py_compile corriger_pk_metrique_v378.py
 
-      - name: Corriger le HTML
+      - name: Appliquer la correction GPS terrain
         run: |
           python corriger_gps_terrain_v377.py
 
-      - name: Verifier la correction
+      - name: Appliquer la correction PK metrique
         run: |
-          grep -q "v3.77-gps-terrain" index_v3.html
-          grep -q "GPS TERRAIN v3.77" index_v3.html
-          grep -q "GPS.marker.setLngLat" index_v3.html
-          grep -q "_gpsFreshRequest" index_v3.html
-          grep -q "maximumAge:0" index_v3.html
-          grep -q "gps-status" index_v3.html
+          python corriger_pk_metrique_v378.py
 
-          echo "Correction GPS terrain valide"
+      - name: Verifier le HTML complet
+        run: |
+          grep -q "v3.78-pk-metrique" index_v3.html || {
+            echo "ERREUR : version v3.78 absente"
+            exit 1
+          }
+
+          grep -q "GPS TERRAIN v3.77" index_v3.html || {
+            echo "ERREUR : correction GPS terrain absente"
+            exit 1
+          }
+
+          grep -q "_pkMetricCache=new Map()" index_v3.html || {
+            echo "ERREUR : cache PK metrique absent"
+            exit 1
+          }
+
+          grep -q "_nearestPkMetric" index_v3.html || {
+            echo "ERREUR : recherche PK metrique absente"
+            exit 1
+          }
+
+          grep -q "zoom:20" index_v3.html || {
+            echo "ERREUR : zoom technique absent"
+            exit 1
+          }
+
+          grep -q "secours 100 m" index_v3.html || {
+            echo "ERREUR : statut PK 100 m absent"
+            exit 1
+          }
+
+          grep -q "PK métrique indisponible" index_v3.html || {
+            echo "ERREUR : avertissement terrain absent"
+            exit 1
+          }
+
+          echo "HTML GPS terrain et PK metrique valide"
 
       - name: Enregistrer dans main
         run: |
@@ -62,6 +100,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "Aucune modification detectee"
           else
-            git commit -m "GPS terrain v3.77"
+            git commit -m "GPS terrain et detection PK metrique v3.78"
             git push origin HEAD:main
           fi
