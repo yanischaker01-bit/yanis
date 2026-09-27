@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Permissions-Policy" content="geolocation=(self)">
-<title>Carte LGV SEA v3</title>
+<title>Carte LGV SEA v4.0 — GPS Firefox A56</title>
 <link rel="manifest" href="manifest.json">
 <link rel="preload" as="fetch" href="data/rail.geojson" crossorigin="anonymous">
 <link rel="preload" as="fetch" href="data/pk.geojson" crossorigin="anonymous">
@@ -263,14 +263,9 @@ button,a,[onclick]{touch-action:manipulation}
       localStorage.removeItem(k); sessionStorage.removeItem(k);
     });
   }catch(e){}
-  if(navigator.serviceWorker){
-    try{
-      navigator.serviceWorker.getRegistrations().then(function(rs){rs.forEach(function(r){try{r.unregister();}catch(e){}});}).catch(function(){});
-      if(window.caches)caches.keys().then(function(keys){
-        return Promise.all(keys.filter(function(k){return /(^|[-_])(lgv|gps)([-_]|$)/i.test(k);}).map(function(k){return caches.delete(k);}));
-      }).catch(function(){});
-    }catch(e){}
-  }
+  /* Aucun Service Worker n'est installé par cette page : on ne touche pas aux
+     registrations existantes, afin de ne pas casser le raccourci Android ni
+     un éventuel cache hors-ligne géré séparément. */
 })();
 </script>
 
@@ -352,7 +347,7 @@ button,a,[onclick]{touch-action:manipulation}
     var previous=localStorage.getItem('lgv_app_ver');
     localStorage.setItem('lgv_app_ver',V);
     /* Une nouvelle version ne doit jamais forcer un reload automatique.
-       Le service worker actualise ses ressources sans interrompre la carte. */
+       La page reste autonome et ne dépend d'aucun Service Worker. */
     if(previous && previous!==V) sessionStorage.setItem('lgv_update_notice','1');
   }catch(e){}
 })();
@@ -361,7 +356,7 @@ button,a,[onclick]{touch-action:manipulation}
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v4.0-firefox-samsung-a56';
+var APP_VER = 'v4.0-firefox-samsung-a56-gps-strict';
 /* v3.96 : aucune position GPS n'est persistée entre deux ouvertures. */
 try{
   localStorage.removeItem('lgv_map_pos');
@@ -1141,14 +1136,15 @@ function _restoreMapPos(){try{['lgv_map_pos','gps_last','gps_last_position','lgv
 var _gpsWatch=null,_gpsFollowing=true,_gpsAutoStarted=false,_gpsAnimRaf=null,_gpsLoopRaf=null,_gpsCameraMoving=false;
 var _gpsLastRaw=null,_gpsLastAccepted=null,_gpsDisplayed=null,_gpsMatch=null;
 var _gpsLastCameraTs=0,_gpsLastPKUpdate=0,_gpsFreshInFlight=false;
-var GPS_BLUE_MAX_ACCURACY=80,GPS_PK_MAX_ACCURACY=45,GPS_STALE_MS=2500;
+var GPS_BLUE_MAX_ACCURACY=40,GPS_PK_MAX_ACCURACY=30,GPS_STALE_MS=2200,GPS_HARD_JUMP_M=180,GPS_INIT_GOOD_ACCURACY=20;
+var _gpsPendingFix=null,_gpsConsecutiveGood=0,_gpsLastGoodRaw=null;
 var _gpsFilter={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,ts:0};
 var _gpsModel=null,_gpsLastRender=0;
 
 function _gpsResetState(){
   _gpsFilter={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,ts:0};
   _gpsLastRaw=null;_gpsLastAccepted=null;_gpsDisplayed=null;_gpsMatch=null;
-  _gpsLastPKUpdate=0;_gpsFreshInFlight=false;_gpsModel=null;_gpsLastRender=0;
+  _gpsLastPKUpdate=0;_gpsFreshInFlight=false;_gpsModel=null;_gpsLastRender=0;_gpsPendingFix=null;_gpsConsecutiveGood=0;_gpsLastGoodRaw=null;
   if(typeof _pkMatchState!=='undefined')_pkMatchState.last=null;
   try{window.GPS=null;}catch(e){}
 }
@@ -1174,7 +1170,7 @@ function _ensureGpsLayers(){
 function _updateGpsStatus(p){
   var el=document.getElementById('gps-status');if(!el)return;
   if(!p){el.style.display='none';return;}
-  var age=_gpsAge(p),sp=p.speed!=null&&p.speed>.4?Math.round(p.speed*3.6)+' km/h':'0 km/h',state=age>GPS_STALE_MS?'SIGNAL ANCIEN':_gpsQuality(p.accuracy),m=_gpsMatch&&_gpsMatch.label?' · PK '+_gpsMatch.label:' · PK —';
+  var age=_gpsAge(p),sp=p.speed!=null&&p.speed>.4?Math.round(p.speed*3.6)+' km/h':'0 km/h',state=age>GPS_STALE_MS?'SIGNAL ANCIEN':(p.accuracy<=20?'GPS PRÉCIS':p.accuracy<=35?'GPS BON':'GPS À CONFIRMER'),m=_gpsMatch&&_gpsMatch.label?' · PK '+_gpsMatch.label:' · PK —';
   el.innerHTML='<div class="gps-title">📍 GPS temps réel</div><div class="gps-line">±'+Math.round(p.accuracy)+' m · '+sp+' · '+state+'</div><div class="gps-line">'+(_gpsFollowing?'🎯 Suivi actif':'🖐 Carte libre')+m+'</div>';el.style.display='block';
 }
 function _setLocateButton(){var b=document.getElementById('locate-btn');if(!b)return;if(_gpsWatch===null){b.style.background='white';b.style.color='#111';}else if(_gpsFollowing){b.style.background='#4285f4';b.style.color='white';}else{b.style.background='#dbeafe';b.style.color='#1565c0';}}
@@ -1204,14 +1200,50 @@ function _gpsPositionToModel(raw){
   var g=_gpsToGeo(f.x,f.y),v=Math.min(70,Math.hypot(f.vx,f.vy)),hd=raw.heading;if(v>1&&_gpsLastAccepted){hd=_gpsBearing(_gpsLastAccepted.lat,_gpsLastAccepted.lng,g.lat,g.lng);}
   return{lat:g.lat,lng:g.lng,speed:v,heading:hd,accuracy:raw.accuracy,receivedAt:raw.receivedAt,timestamp:raw.timestamp,rawLat:raw.lat,rawLng:raw.lng,innovation:res};
 }
+function _gpsRawDistance(a,b){
+  return _haversine(a.lat,a.lng,b.lat,b.lng);
+}
 function _gpsAccept(pos){
   var c=pos&&pos.coords||{},lat=Number(c.latitude),lng=Number(c.longitude),acc=Number(c.accuracy),receivedAt=Date.now(),deviceTs=Number(pos&&pos.timestamp)||receivedAt;
   if(!Number.isFinite(lat)||!Number.isFinite(lng)||!Number.isFinite(acc)||acc<=0||acc>GPS_BLUE_MAX_ACCURACY)return null;
-  if(_gpsLastRaw&&receivedAt-_gpsLastRaw.receivedAt<80&&Math.abs(lat-_gpsLastRaw.lat)<1e-7&&Math.abs(lng-_gpsLastRaw.lng)<1e-7)return null;
-  var speed=Number(c.speed);if(!Number.isFinite(speed)||speed<0||speed>70)speed=null;var heading=Number(c.heading);if(!Number.isFinite(heading)||heading<0||heading>=360)heading=null;
+  /* Ne jamais utiliser une mesure réellement ancienne. */
+  var age=Math.abs(receivedAt-deviceTs);
+  if(age>15000)return null;
+  var speed=Number(c.speed);if(!Number.isFinite(speed)||speed<0||speed>70)speed=null;
+  var heading=Number(c.heading);if(!Number.isFinite(heading)||heading<0||heading>=360)heading=null;
   var raw={lat:lat,lng:lng,accuracy:acc,timestamp:deviceTs,receivedAt:receivedAt,speed:speed,heading:heading};
-  _gpsLastRaw=raw;var p=_gpsPositionToModel(raw);if(!p)return null;_gpsModel=p;_gpsLastAccepted=p;
-  window.GPS={last:p,raw:raw,filtered:p,match:_gpsMatch};
+
+  /* Anti-position-fantôme Firefox/Android : une grosse téléportation n'est
+     jamais affichée sur la base d'une seule mesure. */
+  if(_gpsLastRaw){
+    var dt=Math.max(.2,(receivedAt-_gpsLastRaw.receivedAt)/1000),dist=_gpsRawDistance(raw,_gpsLastRaw);
+    var expected=(speed!=null?speed:(_gpsLastAccepted&&_gpsLastAccepted.speed)||0)*dt;
+    var jumpLimit=Math.max(GPS_HARD_JUMP_M,expected*3+Math.max(25,acc*2.5));
+    if(dist>jumpLimit){
+      /* Si la nouvelle mesure est excellente, on demande une confirmation
+         avant de déplacer le point bleu. Sinon on l'écarte. */
+      if(acc<=GPS_INIT_GOOD_ACCURACY || (_gpsLastRaw.accuracy<=GPS_INIT_GOOD_ACCURACY && acc<=25)){
+        if(!_gpsPendingFix || _gpsRawDistance(_gpsPendingFix,raw)>80){_gpsPendingFix=raw;return null;}
+        _gpsPendingFix=null;
+      }else return null;
+    }
+  }
+
+  /* Première localisation : une précision >20 m n'est pas immédiatement
+     considérée comme fiable. Deux fixes cohérents sont nécessaires. */
+  if(!_gpsLastAccepted && acc>GPS_INIT_GOOD_ACCURACY){
+    if(!_gpsPendingFix){_gpsPendingFix=raw;return null;}
+    var d0=_gpsRawDistance(_gpsPendingFix,raw);
+    if(d0>Math.max(80,acc*3)){
+      _gpsPendingFix=raw;return null;
+    }
+    _gpsPendingFix=null;
+  }
+
+  _gpsLastRaw=raw;
+  var p=_gpsPositionToModel(raw);if(!p)return null;
+  _gpsModel=p;_gpsLastAccepted=p;_gpsLastGoodRaw=raw;_gpsConsecutiveGood++;
+  window.GPS={last:p,raw:raw,filtered:p,match:_gpsMatch,accuracy:acc,age:0};
   return p;
 }
 function _drawGps(p,force){
@@ -1233,7 +1265,6 @@ function _gpsRenderLoop(){
   if(_gpsLastRaw&&_gpsAge(_gpsLastRaw)<=GPS_STALE_MS){var pred=_gpsPredicted();if(pred&&performance.now()-_gpsLastRender>33){_gpsLastRender=performance.now();var q=Object.assign({},pred,{accuracy:_gpsLastRaw.accuracy,speed:_gpsLastAccepted?_gpsLastAccepted.speed:0,heading:_gpsLastAccepted?_gpsLastAccepted.heading:null});var s=map.getSource('_gpsPoint');if(s)s.setData({type:'Feature',properties:{accuracy:q.accuracy,heading:q.heading},geometry:{type:'Point',coordinates:[q.lng,q.lat]}});_gpsMoveCamera(q,false);}}
   _gpsLoopRaf=requestAnimationFrame(_gpsRenderLoop);
 }
-var _gpsLastRender=0;
 function _gpsErrorMessage(e){
   if(!e)return 'erreur GPS';
   if(e.code===1)return 'autorisation refusée';
@@ -1328,7 +1359,7 @@ function startLiveLocation(follow){
   return true;
 }
 function stopLiveLocation(){_gpsClearWatchdog();if(_gpsWatch!==null){navigator.geolocation.clearWatch(_gpsWatch);_gpsWatch=null;}if(_gpsLoopRaf!==null){cancelAnimationFrame(_gpsLoopRaf);_gpsLoopRaf=null;}if(_gpsAnimRaf!==null){cancelAnimationFrame(_gpsAnimRaf);_gpsAnimRaf=null;} _gpsAnim=null;_gpsResetState();_setLocateButton();_updateGpsStatus(null);showNetToast('📍 Suivi GPS arrêté');}
-function _gpsFreshOneShot(done){if(_gpsFreshInFlight)return;_gpsFreshInFlight=true;navigator.geolocation.getCurrentPosition(function(pos){_gpsFreshInFlight=false;done(_gpsAccept(pos));},function(){_gpsFreshInFlight=false;done(null);},{enableHighAccuracy:true,maximumAge:0,timeout:10000});}
+function _gpsFreshOneShot(done){if(_gpsFreshInFlight)return;_gpsFreshInFlight=true;navigator.geolocation.getCurrentPosition(function(pos){_gpsFreshInFlight=false;done(_gpsAccept(pos));},function(){_gpsFreshInFlight=false;done(null);},{enableHighAccuracy:true,maximumAge:0,timeout:12000});}
 function locateMe(){if(_gpsWatch===null)startLiveLocation(true);else{_gpsFollowing=true;_setLocateButton();_gpsFreshOneShot(function(p){if(p)_gpsMoveCamera(p,true);showNetToast('📍 Suivi temps réel actif');});}}
 window.locateMe=locateMe;window.startLiveLocation=startLiveLocation;window.stopLiveLocation=stopLiveLocation;
 map.on('dragstart',function(){if(_gpsWatch!==null&&!_gpsCameraMoving){_gpsFollowing=false;_setLocateButton();_updateGpsStatus(_gpsLastAccepted);}});
@@ -1355,7 +1386,7 @@ function findNearest(){
   _getFreshHighAccuracyPosition(function(p){
     if(!p){closeDetail();showNetToast('📍 Position GPS indisponible ou précision insuffisante');return;}
     _gpsFollowing=true;_setLocateButton();_drawGps(p,true);
-    _gpsCameraMoving=true;map.jumpTo({center:[p.lng,p.lat],zoom:Math.max(map.getZoom(),20.5)});setTimeout(function(){_gpsCameraMoving=false;},120);
+    _gpsMoveCamera(p,true);map.easeTo({center:[p.lng,p.lat],zoom:Math.max(map.getZoom(),19.5),duration:260,essential:true});
     var start=Date.now(),done=false;
     function run(){
       if(done)return;
@@ -2059,7 +2090,7 @@ function showNetToast(msg){
 function updateNetBadge(){
   var b=document.getElementById('ver-badge');if(b)b.textContent=APP_VER+(navigator.onLine?' 🟢':' 🔴');
   var ob=document.getElementById('offline-btn');
-  if(ob){var cached=localStorage.getItem('lgv_cached_v3');
+  if(ob){var cached=localStorage.getItem('lgv_cached_v4');
     ob.dataset.state=!navigator.onLine?(cached?'ready':'offline'):(cached?'ready':'');}
 }
 window.addEventListener('online',function(){updateNetBadge();showNetToast('🟢 En ligne');});
@@ -2075,7 +2106,7 @@ async function warmOfflineCache(){
     'data/oa.geojson','data/oh.geojson','data/pam.geojson','data/acces.geojson','data/oa_poly.geojson',
     'data/bois.pmtiles','data/oa_poly.pmtiles','data/pk_metric.pmtiles',
     'data/n2.geojson','data/old.geojson','data/mc.geojson','data/eco.geojson',
-    'index_v3.html','manifest.json','icons/icon-192.png','icons/icon-512.png'
+    'index_v4.0_firefox_samsung_a56.html','manifest.json','icons/icon-192.png','icons/icon-512.png'
   ];
   var done=0;
   for(var i=0;i<files.length;i+=4){
@@ -2104,7 +2135,7 @@ async function warmOfflineCache(){
     }));
   }
 
-  try{localStorage.setItem('lgv_cached_v3','1');}catch(e){}
+  try{localStorage.setItem('lgv_cached_v4','1');}catch(e){}
   if(btn){btn.textContent='✅';btn.title='Carte offline ✓ (données + orthophoto IGN z5→11)';}
   showNetToast('✅ Carte disponible hors-ligne (données + orthophoto IGN z5–11)');
   setTimeout(function(){if(btn){btn.textContent='📶';btn.disabled=false;}updateNetBadge();},3000);
