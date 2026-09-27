@@ -327,7 +327,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 /* ── Version applicative ── */
-var APP_VER = 'v4.10-terrain-gps-raw-firefox-a56';
+var APP_VER = 'v4.11-firefox-a56-gps-live-esri-fallback';
 (function(){
   try{
     var previous=localStorage.getItem('lgv_app_ver');
@@ -454,7 +454,8 @@ var map = new maplibregl.Map({
     version: 8,
     glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
-      'bm-sat': {type:'raster',tiles:['https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'© Esri World Imagery',maxzoom:19},
+      'bm-sat': {type:'raster',tiles:['https://server.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'© Esri World Imagery',maxzoom:19},
+      'bm-sat-fallback': {type:'raster',tiles:['https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],tileSize:256,attribution:'© Esri World Imagery',maxzoom:19},
       'bm-sat-labels': {type:'raster',tiles:['https://a.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png','https://b.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png','https://c.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png'],tileSize:512,attribution:'© CARTO / © OpenStreetMap contributors',maxzoom:20},
       'bm-plan': {type:'raster',tiles:['https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/png&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}'],tileSize:256,attribution:'© IGN – Géoplateforme',maxzoom:19},
       'bm-osm': {type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors',maxzoom:19}
@@ -462,6 +463,7 @@ var map = new maplibregl.Map({
     layers: [
       {id:'bm-sat',type:'raster',source:'bm-sat',layout:{visibility:'visible'}},
       {id:'bm-sat-labels',type:'raster',source:'bm-sat-labels',layout:{visibility:'visible'}},
+      {id:'bm-sat-fallback',type:'raster',source:'bm-sat-fallback',layout:{visibility:'none'}},
       {id:'bm-osm',type:'raster',source:'bm-osm',layout:{visibility:'none'}},
       {id:'bm-plan',type:'raster',source:'bm-plan',layout:{visibility:'none'}}
     ]
@@ -480,8 +482,14 @@ map.on('error',function(e){
   var msg='';
   try{msg=String((e&&e.error&&e.error.message)||'');}catch(_){}
   if(/api key required|apikey|api key/i.test(msg)){
+    /* Si un proxy/CDN renvoie un message d'authentification sur l'endpoint
+       principal, on bascule immédiatement sur l'autre endpoint Esri public. */
+    if(map.getLayer('bm-sat-fallback')){
+      map.setLayoutProperty('bm-sat','visibility','none');
+      map.setLayoutProperty('bm-sat-fallback','visibility','visible');
+    }
     if(map.getLayer('bm-sat-labels'))map.setLayoutProperty('bm-sat-labels','visibility','visible');
-    showNetToast('ℹ Étiquettes : source CARTO/OSM sans clé API');
+    showNetToast('ℹ Esri : bascule automatique de l’imagerie');
   }
 });
 
@@ -1017,6 +1025,8 @@ window.switchBM=function(name){
     if(map.getLayer('bm-'+id))map.setLayoutProperty('bm-'+id,'visibility',id===name?'visible':'none');
     var btn=document.getElementById('bm-'+id);if(btn)btn.classList.toggle('active',id===name);
   });
+  if(map.getLayer('bm-sat-fallback'))map.setLayoutProperty('bm-sat-fallback','visibility','none');
+  if(name==='sat' && map.getLayer('bm-sat'))map.setLayoutProperty('bm-sat','visibility','visible');
   if(map.getLayer('bm-sat-labels'))map.setLayoutProperty('bm-sat-labels','visibility',name==='sat'?'visible':'none');
 };
 function _updateLpCount(key,n){
@@ -1054,6 +1064,8 @@ var _gpsLastPKUpdate=0;
 var _gpsLastFixAt=0;
 var _gpsFixCount=0;
 var _gpsLastRender=0;
+var _gpsLastCoordChangeAt=0;
+var _gpsSameCoordCount=0;
 
 /* Seuils */
 var GPS_MAX_ACCURACY=500;      /* au-delà : fix clairement inutilisable */
@@ -1070,7 +1082,7 @@ var _gpsSm={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,lastTs:0};
 function _gpsResetState(){
   _gpsSm={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,lastTs:0};
   _gpsLastRaw=null;_gpsLastAccepted=null;_gpsDisplayed=null;_gpsMatch=null;
-  _gpsLastPKUpdate=0;_gpsLastFixAt=0;_gpsFixCount=0;_gpsLastRender=0;
+  _gpsLastPKUpdate=0;_gpsLastFixAt=0;_gpsFixCount=0;_gpsLastRender=0;_gpsLastCoordChangeAt=0;_gpsSameCoordCount=0;
   if(typeof _pkMatchState!=='undefined')_pkMatchState.last=null;
   try{window.GPS=null;}catch(e){}
 }
@@ -1134,7 +1146,8 @@ function _updateGpsStatus(p){
     '<div class="gps-line '+cls+'">'+state+' · ±'+Math.round(p.accuracy)+' m · '+sp+'</div>'+
     '<div class="gps-line">Lat '+p.lat.toFixed(6)+' · Lng '+p.lng.toFixed(6)+'</div>'+
     '<div class="gps-line">'+(_gpsFollowing?'🎯 Suivi actif':'🖐 Carte libre')+m+jump+'</div>'+
-    '<div class="gps-line" style="opacity:.6">Fixes: '+_gpsFixCount+' · âge '+(age===Infinity?'—':(age/1000).toFixed(1)+' s')+'</div>';
+    '<div class="gps-line" style="opacity:.6">Fixes: '+_gpsFixCount+' · âge '+(age===Infinity?'—':(age/1000).toFixed(1)+' s')+'</div>'+
+    '<div class="gps-line" style="opacity:.55">'+(_gpsLastRaw&&_gpsLastRaw.deltaMeters!=null?'Δ '+_gpsLastRaw.deltaMeters.toFixed(2)+' m':'Δ —')+' · mêmes fixes '+_gpsSameCoordCount+'</div>';
   el.style.display='block';
 }
 
@@ -1202,6 +1215,19 @@ function _gpsAccept(pos){
   _gpsLastRaw=raw;
   _gpsFixCount++;
   _gpsLastFixAt=receivedAt;
+
+  /* Diagnostic important sur Firefox Android : le callback peut être appelé
+     plusieurs fois alors que le fournisseur de localisation renvoie exactement
+     les mêmes coordonnées. On ne fabrique surtout pas de mouvement artificiel. */
+  var previousDisplayed=_gpsLastAccepted;
+  if(previousDisplayed){
+    var delta=_haversine(previousDisplayed.lat,previousDisplayed.lng,lat,lng);
+    raw.deltaMeters=delta;
+    if(delta>=0.2){_gpsLastCoordChangeAt=receivedAt;_gpsSameCoordCount=0;}
+    else {_gpsSameCoordCount++;}
+  }else{
+    raw.deltaMeters=null;_gpsLastCoordChangeAt=receivedAt;_gpsSameCoordCount=0;
+  }
 
   /* IMPORTANT : pas de rejet/lissage après validation.
      La position affichée est le fix GPS réellement reçu. */
@@ -1436,21 +1462,20 @@ map.once('load',function(){
   }
 });
 
-/* Retour dans l'app (Firefox Android, verrouillage écran, etc.) */
+/* Reprise Firefox Android : si l'onglet revient après une suspension,
+   on redémarre le watch afin de demander un fix frais. */
 document.addEventListener('visibilitychange',function(){
-  if(document.visibilityState==='visible'&&_gpsWatch!==null){
-    var age=_gpsLastFixAt?Date.now()-_gpsLastFixAt:1e9;
-    if(age>8000){_gpsRestartWatch();}
-    else if(_gpsLastAccepted){_gpsMoveCamera(_gpsLastAccepted,true);}
-  }
+  if(document.visibilityState!=='visible'||_gpsWatch===null)return;
+  var age=_gpsLastFixAt?Date.now()-_gpsLastFixAt:1e9;
+  if(age>3000)_gpsRestartWatch();
+  else if(_gpsLastAccepted)_gpsMoveCamera(_gpsLastAccepted,true);
 });
 window.addEventListener('pageshow',function(){
   if(_gpsWatch!==null){
     _gpsLastWatchEvent=Date.now();
-    if(_gpsLastAccepted)_gpsMoveCamera(_gpsLastAccepted,true);
+    _gpsRestartWatch();
   }
 });
-window.addEventListener('pagehide',function(){/* rien à faire : on n'écrit aucune position */});
 
 /* ── Attente d'un fix frais haute précision (pour findNearest) ── */
 function _getFreshHighAccuracyPosition(done){
