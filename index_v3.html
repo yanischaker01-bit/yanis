@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Permissions-Policy" content="geolocation=(self)">
-<title>Carte LGV SEA v4.12 — GPS terrain temps réel</title>
+<title>Carte LGV SEA v4.13 — GPS direct Firefox / Samsung A56</title>
 <link rel="manifest" href="manifest.json">
 <link rel="preload" as="fetch" href="data/rail.geojson" crossorigin="anonymous">
 <link rel="preload" as="fetch" href="data/pk.geojson" crossorigin="anonymous">
@@ -100,6 +100,21 @@ button,a,[onclick]{touch-action:manipulation}
 #offline-btn[data-state="ready"]::after{content:"✓";position:absolute;bottom:-2px;right:-2px;
   background:#2e7d32;color:white;font-size:8px;width:12px;height:12px;border-radius:50%;
   display:flex;align-items:center;justify-content:center;font-weight:700}
+
+#gps-marker-dot{
+  width:18px;height:18px;border-radius:50%;
+  background:#4285f4;border:3px solid #fff;
+  box-shadow:0 1px 5px rgba(0,0,0,.45);
+  transform:translateZ(0);
+  will-change:transform;
+  pointer-events:none;
+}
+#gps-marker-dot::after{
+  content:"";position:absolute;inset:-5px;border-radius:50%;
+  border:2px solid rgba(66,133,244,.28);
+  pointer-events:none;
+}
+
 #gps-status{position:absolute;left:10px;bottom:max(36px,calc(env(safe-area-inset-bottom,0px)+10px));
   z-index:801;background:rgba(255,255,255,.96);color:#1a1a2e;border-radius:10px;
   box-shadow:0 2px 12px rgba(0,0,0,.25);padding:7px 10px;min-width:158px;
@@ -325,7 +340,7 @@ button,a,[onclick]{touch-action:manipulation}
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 /* ── Version applicative ── */
-var APP_VER = 'v4.12-firefox-a56-gps-live-orthoign';
+var APP_VER = 'v4.13-firefox-a56-gps-marker-direct-esri';
 var _mapReady=false;
 (function(){
   try{
@@ -450,7 +465,7 @@ function emptyFC(){return{type:"FeatureCollection",features:[]};}
    v4.12 : Fond de carte par défaut = Orthophoto IGN (Géoplateforme)
    → aucune clé API requise, couverture France métropolitaine excellente.
    Esri World Imagery reste disponible via le bouton "Satellite Esri"
-   mais utilise l'hôte public historique `server.arcgisonline.com`. */
+   et utilise l'endpoint classique documenté par Esri `services.arcgisonline.com`. */
 var map = new maplibregl.Map({
   container: 'map',
   style: {
@@ -459,7 +474,7 @@ var map = new maplibregl.Map({
     sources: {
       'bm-sat': {
         type:'raster',
-        tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+        tiles:['https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
         tileSize:256,
         attribution:'© Esri World Imagery',
         maxzoom:19,
@@ -519,13 +534,25 @@ map.addControl(new maplibregl.ScaleControl({unit:'metric'}), 'bottom-left');
 
 /* Filet de sécurité : si Esri renvoie une erreur d'auth, basculer sur l'ortho IGN. */
 map.on('error',function(e){
-  var msg='';
-  try{msg=String((e&&e.error&&e.error.message)||'');}catch(_){}
-  if(/api key required|apikey|api key|401|403/i.test(msg)){
+  var msg='',url='';
+  try{
+    msg=String((e&&e.error&&e.error.message)||'');
+    url=String((e&&e.error&&e.error.url)||'');
+  }catch(_){}
+  if(/arcgisonline\.com/i.test(url) && /World_Imagery/i.test(url)){
     try{
       if(map.getLayer('bm-ortho'))map.setLayoutProperty('bm-ortho','visibility','visible');
       if(map.getLayer('bm-sat'))map.setLayoutProperty('bm-sat','visibility','none');
-      showNetToast('⚠ Esri indisponible — bascule automatique sur l’orthophoto IGN');
+      if(map.getLayer('bm-sat-labels'))map.setLayoutProperty('bm-sat-labels','visibility','visible');
+      var btn=document.getElementById('bm-ortho');if(btn)btn.classList.add('active');
+      var bs=document.getElementById('bm-sat');if(bs)bs.classList.remove('active');
+      showNetToast('⚠ Tuile Esri indisponible — orthophoto IGN active');
+    }catch(_){}
+  }else if(/api key required|apikey|api key|401|403/i.test(msg)){
+    try{
+      if(map.getLayer('bm-ortho'))map.setLayoutProperty('bm-ortho','visibility','visible');
+      if(map.getLayer('bm-sat'))map.setLayoutProperty('bm-sat','visibility','none');
+      showNetToast('⚠ Esri a refusé la tuile — orthophoto IGN active');
     }catch(_){}
   }
 });
@@ -1056,18 +1083,52 @@ window.setAllLayers=function(on){
   Object.keys(LAYER_IDS).forEach(function(k){setVis(k,on);});
   document.querySelectorAll('.lp-item input[type=checkbox]').forEach(function(cb){cb.checked=on;});
 };
-window.switchBM=function(name){
+function _setBasemapVisible(name){
   var ids=['sat','ortho','plan','osm'];
   ids.forEach(function(id){
     if(map.getLayer('bm-'+id))map.setLayoutProperty('bm-'+id,'visibility',id===name?'visible':'none');
     var btn=document.getElementById('bm-'+id);if(btn)btn.classList.toggle('active',id===name);
   });
-  /* Étiquettes CARTO/OSM visibles uniquement quand une couche satellite/ortho est active. */
   if(map.getLayer('bm-sat-labels')){
     var showLabels=(name==='sat'||name==='ortho')?'visible':'none';
     map.setLayoutProperty('bm-sat-labels','visibility',showLabels);
   }
-};
+}
+window.switchBM=function(name){
+  if(name!=='sat'){
+    _setBasemapVisible(name);
+    return;
+  }
+
+  /*
+   * Vérification légère avant d'activer Esri.
+   * L'endpoint services.arcgisonline.com correspond au service
+   * World_Imagery documenté par Esri.
+   */
+  try{
+    var z=Math.min(12,Math.max(2,Math.floor(map.getZoom())));
+    var c0=map.getCenter();
+    var n=Math.pow(2,z),x=Math.floor((c0.lng+180)/360*n);
+    var r=c0.lat*Math.PI/180;
+    var y=Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n);
+    var u='https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/'+z+'/'+y+'/'+x+'?v='+Date.now();
+
+    fetch(u,{method:'GET',cache:'no-store',mode:'cors'})
+      .then(function(resp){
+        if(!resp.ok)throw new Error('HTTP '+resp.status);
+        _setBasemapVisible('sat');
+      })
+      .catch(function(err){
+        console.warn('Esri indisponible:',err);
+        _setBasemapVisible('ortho');
+        showNetToast('⚠ Imagerie Esri indisponible — orthophoto IGN utilisée');
+      });
+  }catch(e){
+    _setBasemapVisible('ortho');
+    showNetToast('⚠ Esri indisponible — orthophoto IGN utilisée');
+  }
+}
+
 function _updateLpCount(key,n){
   var el=document.getElementById('lp-'+key);if(!el)return;
   el.textContent=n>0?' ('+n+')':'';el.style.color=n>0?'#888':'#ccc';
@@ -1081,9 +1142,9 @@ window._forceLayerOn=function(type){
 };
 
 /* ═══════════════════════════════════════════════════════════
-   LOCALISATION TEMPS RÉEL — v4.12
+   LOCALISATION TEMPS RÉEL — v4.13
    ────────────────────────────────────────────────────────────
-   Correctifs clés vs v4.11 :
+   Correctifs clés vs v4.12 :
    • _mapReady remplace map.loaded() (bug : map.loaded() = false
      pendant easeTo/pan → chaque fix GPS était rejeté → point bleu figé)
    • zone caméra resserrée (35–65 % / 40–60 %)
@@ -1121,7 +1182,8 @@ var GPS_STALE_MS=10000;
 var GPS_WATCH_TIMEOUT=20000;
 var GPS_PK_THROTTLE_MS=800;
 
-var _gpsSources={point:null,circle:null,heading:null};
+var _gpsSources={circle:null,heading:null};
+var _gpsMarker=null;
 var _gpsLayersReady=false;
 /* Cache du dernier rendu, sert à éviter des setData identiques. */
 var _gpsLastRendered=null;
@@ -1171,19 +1233,60 @@ function _gpsHeadingWedge(lng,lat,heading,r){
 function _gpsQuality(a){return a<=5?'EXCELLENTE':a<=10?'TRÈS BONNE':a<=20?'BONNE':a<=40?'MOYENNE':a<=80?'FAIBLE':'INSUFFISANTE';}
 
 function _ensureGpsLayers(){
-  if(_gpsLayersReady&&_gpsSources.point&&_gpsSources.circle&&_gpsSources.heading)return;
-  if(!map.getSource('_gpsCircle'))map.addSource('_gpsCircle',{type:'geojson',data:emptyFC()});
-  if(!map.getLayer('_gpsCircleFill'))map.addLayer({id:'_gpsCircleFill',type:'fill',source:'_gpsCircle',paint:{'fill-color':'#4285f4','fill-opacity':.12}});
-  if(!map.getLayer('_gpsCircleLine'))map.addLayer({id:'_gpsCircleLine',type:'line',source:'_gpsCircle',paint:{'line-color':'#4285f4','line-width':1.2,'line-opacity':.55}});
-  if(!map.getSource('_gpsHeading'))map.addSource('_gpsHeading',{type:'geojson',data:emptyFC()});
-  if(!map.getLayer('_gpsHeadingFill'))map.addLayer({id:'_gpsHeadingFill',type:'fill',source:'_gpsHeading',paint:{'fill-color':'#4285f4','fill-opacity':.10}});
-  if(!map.getSource('_gpsPoint'))map.addSource('_gpsPoint',{type:'geojson',data:emptyFC()});
-  if(!map.getLayer('_gpsHalo'))map.addLayer({id:'_gpsHalo',type:'circle',source:'_gpsPoint',paint:{'circle-radius':14,'circle-color':'#4285f4','circle-opacity':.18}});
-  if(!map.getLayer('_gpsDot'))map.addLayer({id:'_gpsDot',type:'circle',source:'_gpsPoint',paint:{'circle-radius':7,'circle-color':'#4285f4','circle-stroke-width':3,'circle-stroke-color':'#fff'}});
-  _gpsSources.point=map.getSource('_gpsPoint');
-  _gpsSources.circle=map.getSource('_gpsCircle');
-  _gpsSources.heading=map.getSource('_gpsHeading');
-  _gpsLayersReady=!!(_gpsSources.point&&_gpsSources.circle&&_gpsSources.heading);
+  if(!_mapReady)return false;
+
+  if(!_gpsSources.circle){
+    if(!map.getSource('_gpsCircle')){
+      map.addSource('_gpsCircle',{type:'geojson',data:emptyFC()});
+    }
+    if(!map.getLayer('_gpsCircleFill')){
+      map.addLayer({
+        id:'_gpsCircleFill',type:'fill',source:'_gpsCircle',
+        paint:{'fill-color':'#4285f4','fill-opacity':.12}
+      });
+    }
+    if(!map.getLayer('_gpsCircleLine')){
+      map.addLayer({
+        id:'_gpsCircleLine',type:'line',source:'_gpsCircle',
+        paint:{'line-color':'#4285f4','line-width':1.2,'line-opacity':.55}
+      });
+    }
+    _gpsSources.circle=map.getSource('_gpsCircle');
+  }
+
+  if(!_gpsSources.heading){
+    if(!map.getSource('_gpsHeading')){
+      map.addSource('_gpsHeading',{type:'geojson',data:emptyFC()});
+    }
+    if(!map.getLayer('_gpsHeadingFill')){
+      map.addLayer({
+        id:'_gpsHeadingFill',type:'fill',source:'_gpsHeading',
+        paint:{'fill-color':'#4285f4','fill-opacity':.10}
+      });
+    }
+    _gpsSources.heading=map.getSource('_gpsHeading');
+  }
+
+  /*
+   * POINT BLEU : DOM Marker MapLibre.
+   * Il ne dépend plus du rendu GeoJSON/WebGL des couches.
+   * Chaque nouveau fix GPS appelle directement marker.setLngLat().
+   */
+  if(!_gpsMarker){
+    var el=document.createElement('div');
+    el.id='gps-marker-dot';
+    el.setAttribute('aria-label','Position GPS');
+    _gpsMarker=new maplibregl.Marker({
+      element:el,
+      anchor:'center',
+      pitchAlignment:'map',
+      rotationAlignment:'map'
+    }).setLngLat([0,0]).addTo(map);
+    el.style.display='none';
+  }
+
+  _gpsLayersReady=!!(_gpsSources.circle&&_gpsSources.heading&&_gpsMarker);
+  return _gpsLayersReady;
 }
 
 function _updateGpsStatus(p,force){
@@ -1292,25 +1395,31 @@ function _gpsAccept(pos){
    On utilise le flag _mapReady levé une seule fois sur map.on('load'). */
 function _drawGpsFix(p,forceCamera){
   if(!p||!_mapReady)return;
-  _ensureGpsLayers();
-  if(!_gpsLayersReady)return;
+  if(!_ensureGpsLayers())return;
 
   var rlast=_gpsLastRendered;
   var moved=!rlast||rlast.lat!==p.lat||rlast.lng!==p.lng;
   var accuracyChanged=!rlast||rlast.accuracy!==p.accuracy||moved;
   var headingChanged=!rlast||rlast.heading!==p.heading||rlast.speed!==p.speed||moved;
 
-  if(moved){
-    _gpsSources.point.setData({
-      type:'Feature',
-      properties:{accuracy:p.accuracy,heading:p.heading,speed:p.speed,gpsJump:!!p.gpsJump},
-      geometry:{type:'Point',coordinates:[p.lng,p.lat]}
-    });
+  /*
+   * PRIORITÉ ABSOLUE :
+   * Le point bleu est positionné dès que le fix est validé.
+   * Aucun calcul PK ni aucune animation caméra ne peut retarder setLngLat().
+   */
+  if(_gpsMarker){
+    _gpsMarker.setLngLat([p.lng,p.lat]);
+    var markerEl=_gpsMarker.getElement();
+    if(markerEl)markerEl.style.display='block';
   }
-  if(accuracyChanged){
+
+  /* Le cercle de précision reste en GeoJSON : 1 mise à jour par fix utile,
+     jamais 25 fois/s. */
+  if(accuracyChanged&&_gpsSources.circle){
     _gpsSources.circle.setData(_gpsCircle(p.lng,p.lat,Math.max(3,p.accuracy)));
   }
-  if(headingChanged){
+
+  if(headingChanged&&_gpsSources.heading){
     _gpsSources.heading.setData(
       p.heading!=null&&p.speed!=null&&p.speed>1
         ?_gpsHeadingWedge(p.lng,p.lat,p.heading,Math.max(15,Math.min(55,p.speed*1.2+12)))
@@ -1318,8 +1427,13 @@ function _drawGpsFix(p,forceCamera){
     );
   }
 
-  _gpsLastRendered={lat:p.lat,lng:p.lng,accuracy:p.accuracy,heading:p.heading,speed:p.speed,receivedAt:p.receivedAt};
+  _gpsLastRendered={
+    lat:p.lat,lng:p.lng,accuracy:p.accuracy,
+    heading:p.heading,speed:p.speed,receivedAt:p.receivedAt
+  };
   _updateGpsStatus(p,false);
+
+  /* La caméra est totalement séparée du rendu du point bleu. */
   _gpsMoveCamera(p,!!forceCamera);
 }
 function _invalidateGpsRenderCache(){_gpsLastRendered=null;}
@@ -1331,32 +1445,48 @@ function _gpsCameraNeedsRecenter(p,force){
     var size=map.getContainer(),w=size.clientWidth,h=size.clientHeight;
     if(!w||!h)return true;
     var pt=map.project([p.lng,p.lat]);
-    return pt.x<w*0.35||pt.x>w*0.65||pt.y<h*0.40||pt.y>h*0.60;
+
+    /*
+     * Zone sûre : le point peut réellement bouger à l'écran sur plusieurs
+     * mètres avant que la carte ne recentre. Cela évite l'effet "point figé".
+     */
+    return pt.x<w*0.22||pt.x>w*0.78||pt.y<h*0.28||pt.y>h*0.72;
   }catch(e){return false;}
 }
 function _gpsMoveCamera(p,force){
   if(!_gpsFollowing||_gpsBackgrounded||!p||!_mapReady)return;
   if(!_gpsCameraNeedsRecenter(p,force))return;
+
   var now=Date.now();
-  if(!force&&now-_gpsLastCameraTs<180)return;
+  if(!force&&now-_gpsLastCameraTs<250)return;
   _gpsLastCameraTs=now;
-  _gpsCameraMoving=true;
 
   var firstFix=!_gpsCameraInitialized;
   _gpsCameraInitialized=true;
+  _gpsCameraMoving=true;
 
-  /* Au premier fix, on force un zoom exploitable (sinon on garde le zoom choisi). */
   var targetZoom=map.getZoom();
-  if(firstFix && targetZoom<14)targetZoom=16;
+  if(firstFix&&targetZoom<14)targetZoom=16;
 
-  try{map.stop();}catch(e){}
-  map.easeTo({
-    center:[p.lng,p.lat],
-    zoom:firstFix?targetZoom:map.getZoom(),
-    duration:firstFix?350:250,
-    essential:true
-  });
-  setTimeout(function(){_gpsCameraMoving=false;},firstFix?380:280);
+  try{
+    /*
+     * Ne jamais changer bearing/pitch et ne jamais utiliser jumpTo().
+     * Pas de map.stop() : cela évite d'annuler brutalement une interaction.
+     */
+    map.easeTo({
+      center:[p.lng,p.lat],
+      zoom:targetZoom,
+      duration:firstFix?350:220,
+      essential:true
+    });
+  }catch(e){
+    _gpsCameraMoving=false;
+    return;
+  }
+
+  setTimeout(function(){
+    _gpsCameraMoving=false;
+  },firstFix?380:250);
 }
 
 function _gpsErrorMessage(e){
@@ -1449,6 +1579,9 @@ function _gpsStartWatchdog(){
   _gpsWatchdog=setInterval(function(){
     if(_gpsWatch===null||_gpsBackgrounded)return;
     var silence=Date.now()-_gpsLastWatchEvent;
+    if(silence>GPS_STALE_MS){
+      _updateGpsStatus(_gpsLastAccepted,true);
+    }
     if(silence>16000)_gpsRestartWatch();
   },5000);
 }
