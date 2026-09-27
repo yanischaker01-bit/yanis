@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta http-equiv="Permissions-Policy" content="geolocation=(self)">
-<title>Carte LGV SEA v4.10 — GPS terrain temps réel</title>
+<title>Carte LGV SEA v4.12 — GPS terrain temps réel</title>
 <link rel="manifest" href="manifest.json">
 <link rel="preload" as="fetch" href="data/rail.geojson" crossorigin="anonymous">
 <link rel="preload" as="fetch" href="data/pk.geojson" crossorigin="anonymous">
@@ -241,8 +241,6 @@ button,a,[onclick]{touch-action:manipulation}
     });
   }catch(e){}
 
-  /* Si une ancienne version a installé un Service Worker, on le retire.
-     L'application courante n'en enregistre aucun. */
   try{
     if(navigator.serviceWorker&&navigator.serviceWorker.getRegistrations){
       navigator.serviceWorker.getRegistrations().then(function(regs){
@@ -327,7 +325,8 @@ button,a,[onclick]{touch-action:manipulation}
 <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 <script>
 /* ── Version applicative ── */
-var APP_VER = 'v4.11-firefox-a56-gps-live-esri-fallback';
+var APP_VER = 'v4.12-firefox-a56-gps-live-orthoign';
+var _mapReady=false;
 (function(){
   try{
     var previous=localStorage.getItem('lgv_app_ver');
@@ -447,23 +446,65 @@ function geomBounds(geom){
 }
 function emptyFC(){return{type:"FeatureCollection",features:[]};}
 
-/* ── MapLibre map ── */
+/* ── MapLibre map ──
+   v4.12 : Fond de carte par défaut = Orthophoto IGN (Géoplateforme)
+   → aucune clé API requise, couverture France métropolitaine excellente.
+   Esri World Imagery reste disponible via le bouton "Satellite Esri"
+   mais utilise l'hôte public historique `server.arcgisonline.com`. */
 var map = new maplibregl.Map({
   container: 'map',
   style: {
     version: 8,
     glyphs: 'https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf',
     sources: {
-      'bm-sat': {type:'raster',tiles:['https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}?v=412'],tileSize:256,attribution:'© Esri World Imagery',maxzoom:19,fadeDuration:0},
-      'bm-sat-labels': {type:'raster',tiles:['https://a.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png','https://b.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png','https://c.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png'],tileSize:512,attribution:'© CARTO / © OpenStreetMap contributors',maxzoom:20,fadeDuration:0},
-      'bm-ortho': {type:'raster',tiles:['https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/jpeg&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}'],tileSize:256,attribution:'© IGN – Géoplateforme',maxzoom:19,fadeDuration:0},
-      'bm-plan': {type:'raster',tiles:['https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/png&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}'],tileSize:256,attribution:'© IGN – Géoplateforme',maxzoom:19},
-      'bm-osm': {type:'raster',tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],tileSize:256,attribution:'© OpenStreetMap contributors',maxzoom:19}
+      'bm-sat': {
+        type:'raster',
+        tiles:['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
+        tileSize:256,
+        attribution:'© Esri World Imagery',
+        maxzoom:19,
+        fadeDuration:0
+      },
+      'bm-sat-labels': {
+        type:'raster',
+        tiles:[
+          'https://a.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png',
+          'https://b.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png',
+          'https://c.basemaps.cartocdn.com/rastertiles/voyager_only_labels/{z}/{x}/{y}@2x.png'
+        ],
+        tileSize:512,
+        attribution:'© CARTO / © OpenStreetMap contributors',
+        maxzoom:20,
+        fadeDuration:0
+      },
+      'bm-ortho': {
+        type:'raster',
+        tiles:['https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/jpeg&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}'],
+        tileSize:256,
+        attribution:'© IGN – Géoplateforme',
+        maxzoom:19,
+        fadeDuration:0
+      },
+      'bm-plan': {
+        type:'raster',
+        tiles:['https://data.geopf.fr/wmts?SERVICE=WMTS&REQUEST=GetTile&VERSION=1.0.0&STYLE=normal&TILEMATRIXSET=PM&FORMAT=image/png&LAYER=GEOGRAPHICALGRIDSYSTEMS.PLANIGNV2&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}'],
+        tileSize:256,
+        attribution:'© IGN – Géoplateforme',
+        maxzoom:19
+      },
+      'bm-osm': {
+        type:'raster',
+        tiles:['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+        tileSize:256,
+        attribution:'© OpenStreetMap contributors',
+        maxzoom:19
+      }
     },
     layers: [
-      {id:'bm-sat',type:'raster',source:'bm-sat',layout:{visibility:'visible'}},
+      /* Ortho IGN = défaut (aucune clé API) ; Esri = opt-in utilisateur. */
+      {id:'bm-sat',type:'raster',source:'bm-sat',layout:{visibility:'none'}},
       {id:'bm-sat-labels',type:'raster',source:'bm-sat-labels',layout:{visibility:'visible'}},
-      {id:'bm-ortho',type:'raster',source:'bm-ortho',layout:{visibility:'none'}},
+      {id:'bm-ortho',type:'raster',source:'bm-ortho',layout:{visibility:'visible'}},
       {id:'bm-osm',type:'raster',source:'bm-osm',layout:{visibility:'none'}},
       {id:'bm-plan',type:'raster',source:'bm-plan',layout:{visibility:'none'}}
     ]
@@ -475,16 +516,17 @@ var map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.NavigationControl({showCompass:false}), 'bottom-left');
 map.addControl(new maplibregl.ScaleControl({unit:'metric'}), 'bottom-left');
-/* Les étiquettes satellite sont indépendantes d'Esri : CARTO/OSM.
-   L'imagerie utilise uniquement l'endpoint World_Imagery public documenté par Esri.
-   Aucun fallback Esri à clé n'est chargé dans cette version. */
+
+/* Filet de sécurité : si Esri renvoie une erreur d'auth, basculer sur l'ortho IGN. */
 map.on('error',function(e){
   var msg='';
   try{msg=String((e&&e.error&&e.error.message)||'');}catch(_){}
-  if(/api key required|apikey|api key/i.test(msg)){
-    console.warn('Esri World_Imagery a retourné une erreur d’authentification:',msg);
-    try{switchBM('ortho');}catch(_){}
-    showNetToast('⚠ Esri indisponible — bascule automatique vers l’orthophoto IGN');
+  if(/api key required|apikey|api key|401|403/i.test(msg)){
+    try{
+      if(map.getLayer('bm-ortho'))map.setLayoutProperty('bm-ortho','visibility','visible');
+      if(map.getLayer('bm-sat'))map.setLayoutProperty('bm-sat','visibility','none');
+      showNetToast('⚠ Esri indisponible — bascule automatique sur l’orthophoto IGN');
+    }catch(_){}
   }
 });
 
@@ -585,6 +627,7 @@ if(location.protocol==='file:'){
   showError('Protocole file:// non supporté pour le GPS. Utilisez HTTPS (GitHub Pages, serveur interne) ou http://localhost.');
 } else {
   map.on('load', function(){
+    _mapReady=true;                       /* ← flag : remplace map.loaded() côté GPS */
     document.getElementById('loader').remove();
     _initVectorLayers();
     _pkMapReady=true;
@@ -808,23 +851,20 @@ function _initVectorLayers(){
 function _loadAllData(){
   loadJSON('rail').then(function(d){
     map.getSource('rail').setData(d);
-    var doFit=!_savedPosAtLoad;
-    if(doFit){
-      try{
-        var coords=[];
-        (d.features||[]).forEach(function(f){
-          var g=f.geometry;if(!g)return;
-          if(g.type==='LineString')coords=coords.concat(g.coordinates);
-          else if(g.type==='MultiLineString')g.coordinates.forEach(function(l){coords=coords.concat(l);});
-        });
-        if(coords.length){
-          var lngs=coords.map(function(c){return c[0];}),lats=coords.map(function(c){return c[1];});
-          map.fitBounds([[Math.min.apply(null,lngs),Math.min.apply(null,lats)],
-                         [Math.max.apply(null,lngs),Math.max.apply(null,lats)]],
-                        {padding:40,maxZoom:10,duration:600});
-        }
-      }catch(e){}
-    }
+    try{
+      var coords=[];
+      (d.features||[]).forEach(function(f){
+        var g=f.geometry;if(!g)return;
+        if(g.type==='LineString')coords=coords.concat(g.coordinates);
+        else if(g.type==='MultiLineString')g.coordinates.forEach(function(l){coords=coords.concat(l);});
+      });
+      if(coords.length){
+        var lngs=coords.map(function(c){return c[0];}),lats=coords.map(function(c){return c[1];});
+        map.fitBounds([[Math.min.apply(null,lngs),Math.min.apply(null,lats)],
+                       [Math.max.apply(null,lngs),Math.max.apply(null,lats)]],
+                      {padding:40,maxZoom:10,duration:600});
+      }
+    }catch(e){}
   });
 
   loadJSON('oa_poly').then(function(d){
@@ -961,11 +1001,11 @@ function _updateLoadStatus(){
 
 function _initLayersPanel(){
   var body=document.getElementById('layers-panel-body');if(!body)return;
+  /* v4.12 : Ortho IGN actif par défaut (aucune clé API) ; Esri = opt-in. */
   var bmHtml='<div class="bm-row">'+
-    '<button class="bm-btn active" id="bm-sat" onclick="switchBM(\'sat\')">🛰 Satellite Esri</button>'+
-    '<button class="bm-btn" id="bm-ortho" onclick="switchBM(\'ortho\')">🌿 Ortho IGN</button>'+
+    '<button class="bm-btn active" id="bm-ortho" onclick="switchBM(\'ortho\')">🌿 Ortho IGN</button>'+
+    '<button class="bm-btn" id="bm-sat" onclick="switchBM(\'sat\')">🛰 Satellite Esri</button>'+
     '<button class="bm-btn" id="bm-plan" onclick="switchBM(\'plan\')">🗺 Plan IGN</button>'+
-
     '<button class="bm-btn" id="bm-osm" onclick="switchBM(\'osm\')">🌍 OSM</button>'+
     '</div>';
   var toolbar='<div style="display:flex;gap:6px;padding:3px 2px 8px;border-bottom:1px solid #eee;margin-bottom:4px">'+
@@ -1022,8 +1062,11 @@ window.switchBM=function(name){
     if(map.getLayer('bm-'+id))map.setLayoutProperty('bm-'+id,'visibility',id===name?'visible':'none');
     var btn=document.getElementById('bm-'+id);if(btn)btn.classList.toggle('active',id===name);
   });
-  if(name==='sat' && map.getLayer('bm-sat'))map.setLayoutProperty('bm-sat','visibility','visible');
-  if(map.getLayer('bm-sat-labels'))map.setLayoutProperty('bm-sat-labels','visibility',(name==='sat'||name==='ortho')?'visible':'none');
+  /* Étiquettes CARTO/OSM visibles uniquement quand une couche satellite/ortho est active. */
+  if(map.getLayer('bm-sat-labels')){
+    var showLabels=(name==='sat'||name==='ortho')?'visible':'none';
+    map.setLayoutProperty('bm-sat-labels','visibility',showLabels);
+  }
 };
 function _updateLpCount(key,n){
   var el=document.getElementById('lp-'+key);if(!el)return;
@@ -1038,13 +1081,14 @@ window._forceLayerOn=function(type){
 };
 
 /* ═══════════════════════════════════════════════════════════
-   LOCALISATION TEMPS RÉEL — v4.12 / architecture directe GPS → point bleu
+   LOCALISATION TEMPS RÉEL — v4.12
    ────────────────────────────────────────────────────────────
-   GPS brut → validation → position affichée → point bleu
-                              └──────────────→ position PK
-
-   Règle absolue : le PK et la caméra ne doivent jamais empêcher le
-   rendu du point bleu. Aucun lissage prédictif, aucune position stockée.
+   Correctifs clés vs v4.11 :
+   • _mapReady remplace map.loaded() (bug : map.loaded() = false
+     pendant easeTo/pan → chaque fix GPS était rejeté → point bleu figé)
+   • zone caméra resserrée (35–65 % / 40–60 %)
+   • zoom 16 forcé au premier recentrage si zoom courant < 14
+   • watchdog relancé systématiquement à la reprise Firefox
    ═══════════════════════════════════════════════════════════ */
 var _gpsWatch=null;
 var _gpsFollowing=true;
@@ -1068,20 +1112,19 @@ var _gpsLastCameraTs=0;
 var _gpsLastPKUpdate=0;
 var _gpsLastFixAt=0;
 var _gpsFixCount=0;
-var _gpsLastCoordChangeAt=0;
 var _gpsSameCoordCount=0;
 var _gpsLastStatusTs=0;
 
-/* Seuils */
-var GPS_MAX_ACCURACY=500;      /* jusqu'à ~500 m : point bleu accepté */
-var GPS_PK_MAX_ACCURACY=30;    /* PK métrique validé seulement si <= 30 m */
-var GPS_STALE_MS=10000;        /* au-delà : statut GPS PERDU, pas de déplacement artificiel */
+var GPS_MAX_ACCURACY=500;
+var GPS_PK_MAX_ACCURACY=30;
+var GPS_STALE_MS=10000;
 var GPS_WATCH_TIMEOUT=20000;
 var GPS_PK_THROTTLE_MS=800;
 
-/* Références MapLibre mises en cache : aucun getSource/getLayer à chaque fix. */
 var _gpsSources={point:null,circle:null,heading:null};
 var _gpsLayersReady=false;
+/* Cache du dernier rendu, sert à éviter des setData identiques. */
+var _gpsLastRendered=null;
 
 function _gpsResetState(){
   _gpsLastRaw=null;
@@ -1091,11 +1134,11 @@ function _gpsResetState(){
   _gpsLastPKUpdate=0;
   _gpsLastFixAt=0;
   _gpsFixCount=0;
-  _gpsLastCoordChangeAt=0;
   _gpsSameCoordCount=0;
   _gpsLastStatusTs=0;
   _gpsCameraInitialized=false;
   _gpsLastCameraTs=0;
+  _gpsLastRendered=null;
   if(typeof _pkMatchState!=='undefined')_pkMatchState.last=null;
   try{window.GPS=null;}catch(e){}
 }
@@ -1180,8 +1223,7 @@ function _setLocateButton(){
   else{b.style.background='#dbeafe';b.style.color='#1565c0';}
 }
 
-/* Position affichée = copie exacte du dernier fix validé.
-   Pas de prédiction et pas de lissage : Firefox/Android reste la source de vérité. */
+/* Position affichée = copie exacte du dernier fix validé. */
 function _gpsBuildDisplayed(raw){
   return {
     lat:raw.lat,lng:raw.lng,accuracy:raw.accuracy,
@@ -1192,7 +1234,6 @@ function _gpsBuildDisplayed(raw){
   };
 }
 
-/* Accepte tout fix latitude/longitude valide avec accuracy <= 500 m. */
 function _gpsAccept(pos){
   var c=pos&&pos.coords||{};
   var lat=Number(c.latitude),lng=Number(c.longitude),acc=Number(c.accuracy);
@@ -1217,7 +1258,6 @@ function _gpsAccept(pos){
     var d=_haversine(_gpsLastRaw.lat,_gpsLastRaw.lng,lat,lng);
     raw.deltaMeters=d;
     raw.jumpDistance=d;
-    /* Diagnostic seulement : un saut >500 m en <10 s avec vitesse déclarée <2 m/s. */
     raw.gpsJump=(d>500&&dt<10&&speed!=null&&speed<2);
   }else{
     raw.deltaMeters=null;raw.jumpDistance=0;
@@ -1225,13 +1265,11 @@ function _gpsAccept(pos){
 
   if(_gpsLastAccepted){
     if(raw.deltaMeters!=null&&raw.deltaMeters>=.2){
-      _gpsLastCoordChangeAt=receivedAt;
       _gpsSameCoordCount=0;
     }else{
       _gpsSameCoordCount++;
     }
   }else{
-    _gpsLastCoordChangeAt=receivedAt;
     _gpsSameCoordCount=0;
   }
 
@@ -1248,26 +1286,26 @@ function _gpsAccept(pos){
   return displayed;
 }
 
-/* Dessin événementiel : 1 appel quand un fix arrive, pas de setData à 25 Hz. */
+/* Rendu événementiel : 1 appel quand un fix arrive.
+   ⚠ NE PAS utiliser map.loaded() : retourne false pendant easeTo, ce qui
+   rejetait silencieusement chaque fix et figeait le point bleu.
+   On utilise le flag _mapReady levé une seule fois sur map.on('load'). */
 function _drawGpsFix(p,forceCamera){
-  if(!p||!map.loaded())return;
+  if(!p||!_mapReady)return;
   _ensureGpsLayers();
   if(!_gpsLayersReady)return;
 
-  var old=_gpsDisplayed;
-  var moved=!old||old.lat!==p.lat||old.lng!==p.lng;
-  var accuracyChanged=!old||old.accuracy!==p.accuracy;
-  var headingChanged=!old||old.heading!==p.heading||old.speed!==p.speed;
-
-  /* _gpsDisplayed est défini avant l'appel dans _gpsAccept : utiliser le dernier rendu séparément. */
-  if(!_drawGpsFix.last){_drawGpsFix.last=null;}
-  var rlast=_drawGpsFix.last;
-  moved=!rlast||rlast.lat!==p.lat||rlast.lng!==p.lng;
-  accuracyChanged=!rlast||rlast.accuracy!==p.accuracy||moved;
-  headingChanged=!rlast||rlast.heading!==p.heading||rlast.speed!==p.speed||moved;
+  var rlast=_gpsLastRendered;
+  var moved=!rlast||rlast.lat!==p.lat||rlast.lng!==p.lng;
+  var accuracyChanged=!rlast||rlast.accuracy!==p.accuracy||moved;
+  var headingChanged=!rlast||rlast.heading!==p.heading||rlast.speed!==p.speed||moved;
 
   if(moved){
-    _gpsSources.point.setData({type:'Feature',properties:{accuracy:p.accuracy,heading:p.heading,speed:p.speed,gpsJump:!!p.gpsJump},geometry:{type:'Point',coordinates:[p.lng,p.lat]}});
+    _gpsSources.point.setData({
+      type:'Feature',
+      properties:{accuracy:p.accuracy,heading:p.heading,speed:p.speed,gpsJump:!!p.gpsJump},
+      geometry:{type:'Point',coordinates:[p.lng,p.lat]}
+    });
   }
   if(accuracyChanged){
     _gpsSources.circle.setData(_gpsCircle(p.lng,p.lat,Math.max(3,p.accuracy)));
@@ -1280,33 +1318,45 @@ function _drawGpsFix(p,forceCamera){
     );
   }
 
-  _drawGpsFix.last={lat:p.lat,lng:p.lng,accuracy:p.accuracy,heading:p.heading,speed:p.speed,receivedAt:p.receivedAt};
+  _gpsLastRendered={lat:p.lat,lng:p.lng,accuracy:p.accuracy,heading:p.heading,speed:p.speed,receivedAt:p.receivedAt};
   _updateGpsStatus(p,false);
   _gpsMoveCamera(p,!!forceCamera);
 }
-function _invalidateGpsRenderCache(){_drawGpsFix.last=null;}
+function _invalidateGpsRenderCache(){_gpsLastRendered=null;}
 
-/* Caméra : zone de suivi. Le point bleu peut donc bouger visuellement sur quelques mètres.
-   Recentrage uniquement quand le point sort de la zone sûre ou au premier fix. */
+/* Zone caméra resserrée : le point est recentré dès qu'il s'éloigne du cœur d'écran. */
 function _gpsCameraNeedsRecenter(p,force){
   if(force||!_gpsCameraInitialized)return true;
   try{
     var size=map.getContainer(),w=size.clientWidth,h=size.clientHeight;
     if(!w||!h)return true;
     var pt=map.project([p.lng,p.lat]);
-    return pt.x<w*.20||pt.x>w*.80||pt.y<h*.25||pt.y>h*.75;
+    return pt.x<w*0.35||pt.x>w*0.65||pt.y<h*0.40||pt.y>h*0.60;
   }catch(e){return false;}
 }
 function _gpsMoveCamera(p,force){
-  if(!_gpsFollowing||_gpsBackgrounded||!p||!map.loaded())return;
+  if(!_gpsFollowing||_gpsBackgrounded||!p||!_mapReady)return;
   if(!_gpsCameraNeedsRecenter(p,force))return;
   var now=Date.now();
   if(!force&&now-_gpsLastCameraTs<180)return;
   _gpsLastCameraTs=now;
   _gpsCameraMoving=true;
+
+  var firstFix=!_gpsCameraInitialized;
   _gpsCameraInitialized=true;
-  map.easeTo({center:[p.lng,p.lat],duration:180,essential:true});
-  setTimeout(function(){_gpsCameraMoving=false;},200);
+
+  /* Au premier fix, on force un zoom exploitable (sinon on garde le zoom choisi). */
+  var targetZoom=map.getZoom();
+  if(firstFix && targetZoom<14)targetZoom=16;
+
+  try{map.stop();}catch(e){}
+  map.easeTo({
+    center:[p.lng,p.lat],
+    zoom:firstFix?targetZoom:map.getZoom(),
+    duration:firstFix?350:250,
+    essential:true
+  });
+  setTimeout(function(){_gpsCameraMoving=false;},firstFix?380:280);
 }
 
 function _gpsErrorMessage(e){
@@ -1317,7 +1367,6 @@ function _gpsErrorMessage(e){
   return 'erreur GPS';
 }
 
-/* PK lancé après le rendu GPS ; un calcul PK lent ne peut pas empêcher le dessin du point. */
 function _gpsDrawAndMatch(p,force){
   if(!p)return;
   _drawGpsFix(p,!!force);
@@ -1331,7 +1380,6 @@ function _gpsDrawAndMatch(p,force){
   if(force||now-_gpsLastPKUpdate>=GPS_PK_THROTTLE_MS){
     _gpsLastPKUpdate=now;
     var snapshot={lat:p.lat,lng:p.lng,accuracy:p.accuracy,speed:p.speed,heading:p.heading,timestamp:p.timestamp,receivedAt:p.receivedAt};
-    /* setTimeout 0 is volontaire : le callback GPS termine avant le PK. Le PK reste throttlé. */
     setTimeout(function(){
       try{
         var m=_bestPkMetricMatch(snapshot);
@@ -1349,7 +1397,6 @@ function _gpsClearWatchdog(){
 function _gpsStopNativeWatch(){
   _gpsSessionId++;
   if(_gpsWatch!==null){try{navigator.geolocation.clearWatch(_gpsWatch);}catch(e){} _gpsWatch=null;}
-  _gpsClearWatchdog();
   _setLocateButton();
 }
 function _gpsStartWatch(){
@@ -1384,7 +1431,6 @@ function _gpsRestartWatch(){
   if(_gpsRestarting||!navigator.geolocation||!_gpsWanted||_gpsBackgrounded)return;
   _gpsRestarting=true;
   _gpsStopNativeWatch();
-  /* Nouveau watcher = nouvelle session. Aucun ancien callback ne peut modifier l'état. */
   _gpsRestartTimer=setTimeout(function(){
     _gpsRestartTimer=null;
     _gpsRestarting=false;
@@ -1430,6 +1476,7 @@ function stopLiveLocation(){
   _gpsBackgrounded=false;
   _gpsRestarting=false;
   _gpsStopNativeWatch();
+  _gpsClearWatchdog();
   _gpsResetState();
   _invalidateGpsRenderCache();
   _setLocateButton();
@@ -1448,27 +1495,28 @@ window.locateMe=locateMe;
 window.startLiveLocation=startLiveLocation;
 window.stopLiveLocation=stopLiveLocation;
 
-/* Interaction utilisateur : sortir du suivi dès qu'il manipule la carte. */
 map.on('dragstart',function(){if(_gpsWatch!==null&&!_gpsCameraMoving){_gpsFollowing=false;_setLocateButton();_updateGpsStatus(_gpsLastAccepted,true);}});
 map.on('zoomstart',function(){if(_gpsWatch!==null&&!_gpsCameraMoving){_gpsFollowing=false;_setLocateButton();}});
 map.on('rotatestart',function(){if(_gpsWatch!==null&&!_gpsCameraMoving){_gpsFollowing=false;_setLocateButton();}});
 
-/* Cycle de vie Firefox Android : pause du watcher en arrière-plan puis nouveau watcher au retour. */
 function _gpsPauseLifecycle(){
   if(!_gpsWanted)return;
   _gpsBackgrounded=true;
   _gpsRestarting=false;
   _gpsStopNativeWatch();
+  _gpsClearWatchdog();
   _updateGpsStatus(_gpsLastAccepted,true);
 }
 function _gpsResumeLifecycle(){
   if(!_gpsWanted)return;
   _gpsBackgrounded=false;
   if(_gpsWatch===null){
-    /* Ne pas restaurer l'ancien point : seul un nouveau fix peut le réafficher. */
     _gpsResetState();
     _invalidateGpsRenderCache();
-    if(_gpsStartWatch())_gpsStartWatchdog();
+    _gpsLastStatusTs=0;                    /* force refresh du panneau GPS */
+    if(_gpsStartWatch()){
+      _gpsStartWatchdog();                 /* ← toujours relancer le watchdog */
+    }
   }
 }
 
@@ -1476,7 +1524,6 @@ map.once('load',function(){
   _setLocateButton();
   _updateGpsStatus(null,true);
   if(navigator.geolocation){
-    /* On appelle watchPosition directement même si l'état est "prompt" : Firefox demandera l'autorisation. */
     startLiveLocation(true);
   }
 });
@@ -1488,14 +1535,9 @@ document.addEventListener('visibilitychange',function(){
     _gpsResumeLifecycle();
   }
 });
-window.addEventListener('pagehide',function(){
-  _gpsPauseLifecycle();
-});
-window.addEventListener('pageshow',function(){
-  _gpsResumeLifecycle();
-});
+window.addEventListener('pagehide',function(){_gpsPauseLifecycle();});
+window.addEventListener('pageshow',function(){_gpsResumeLifecycle();});
 
-/* Bouton PK : attend éventuellement un fix frais sans créer de watcher supplémentaire. */
 function _getFreshHighAccuracyPosition(done){
   if(_gpsWatch===null)startLiveLocation(false);
   var started=Date.now(),lastTs=_gpsLastAccepted?_gpsLastAccepted.receivedAt:0;
@@ -1521,8 +1563,9 @@ function findNearest(){
   openDetail('📍 Éléments LGV proches','<div style="padding:18px;text-align:center;color:#888"><p style="font-size:14px;margin:0">📡 Position GPS haute précision…</p><p style="font-size:11px;margin-top:8px">Mesure fraîche obligatoire avant le calcul PK.</p></div>');
   _getFreshHighAccuracyPosition(function(p){
     if(!p){closeDetail();showNetToast('📍 Position GPS indisponible ou précision insuffisante');_pkFindBusy=false;return;}
-    _gpsFollowing=true;_setLocateButton();_drawGps(p,true);
-    _gpsMoveCamera(p,true);
+    _gpsFollowing=true;_setLocateButton();
+    /* Correctif v4.12 : _drawGps → _drawGpsFix (l'ancien nom n'existe plus) */
+    _drawGpsFix(p,true);
     map.easeTo({center:[p.lng,p.lat],zoom:Math.max(map.getZoom(),19.5),duration:260,essential:true});
     var start=Date.now(),done=false;
     function run(){
@@ -1692,7 +1735,6 @@ function _nearestN(lat,lng,features,n){
   return scored.slice(0,n);
 }
 function _dStr(m){return m<1000?Math.round(m)+' m':(m/1000).toFixed(2)+' km';}
-function _sideNum(v){var m=String(v||'').match(/[12]/);return m?m[0]:'';}
 
 function _parseVoie(v){
   var raw=String(v||'').trim().toUpperCase();
@@ -2317,7 +2359,6 @@ async function warmOfflineCache(){
   setTimeout(function(){if(btn){btn.textContent='📶';btn.disabled=false;}updateNetBadge();},3000);
 }
 window.warmOfflineCache=warmOfflineCache;
-/* Service Worker désactivé dans la version autonome : évite le retour d'un ancien HTML/GPS. */
 
 /* Alias globaux attendus par les onclick inline */
 window.toggleLayersPanel=window.toggleLayersPanel||function(){document.getElementById('layers-panel').classList.toggle('open');};
