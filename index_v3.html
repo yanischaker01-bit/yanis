@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta http-equiv="Permissions-Policy" content="geolocation=(self)">
 <title>Carte LGV SEA v3</title>
 <link rel="manifest" href="manifest.json">
 <link rel="preload" as="fetch" href="data/rail.geojson" crossorigin="anonymous">
@@ -360,7 +361,7 @@ button,a,[onclick]{touch-action:manipulation}
 // ═══════════════════════════════════════════════════════════
 // CARTE LGV SEA  –  v3-ml  (MapLibre GL JS + PMTiles)
 // ═══════════════════════════════════════════════════════════
-var APP_VER = 'v4.01-samsung-a56-live-gps';
+var APP_VER = 'v4.0-firefox-samsung-a56';
 /* v3.96 : aucune position GPS n'est persistée entre deux ouvertures. */
 try{
   localStorage.removeItem('lgv_map_pos');
@@ -1133,14 +1134,14 @@ window._forceLayerOn=function(type){
 
 // ══════════════════════════════════════════════════════════
 // ══════════════════════════════════════════════════════════
-function _restoreMapPos(){try{['lgv_map_pos','gps_last','gps_last_position','lgv_gps_last','lgv_position','lgv_last_position'].forEach(function(k){localStorage.removeItem(k);sessionStorage.removeItem(k);});}catch(e){}}
+function _restoreMapPos(){try{['lgv_map_pos','gps_last','gps_last_position','lgv_gps_last','lgv_position','lgv_last_position','lgv_last_gps'].forEach(function(k){localStorage.removeItem(k);sessionStorage.removeItem(k);});}catch(e){}}
 // ══════════════════════════════════════════════════════════
 // LOCALISATION TEMPS RÉEL — Samsung Galaxy A56
 // ══════════════════════════════════════════════════════════
 var _gpsWatch=null,_gpsFollowing=true,_gpsAutoStarted=false,_gpsAnimRaf=null,_gpsLoopRaf=null,_gpsCameraMoving=false;
 var _gpsLastRaw=null,_gpsLastAccepted=null,_gpsDisplayed=null,_gpsMatch=null;
 var _gpsLastCameraTs=0,_gpsLastPKUpdate=0,_gpsFreshInFlight=false;
-var GPS_BLUE_MAX_ACCURACY=100,GPS_PK_MAX_ACCURACY=45,GPS_STALE_MS=4000;
+var GPS_BLUE_MAX_ACCURACY=80,GPS_PK_MAX_ACCURACY=45,GPS_STALE_MS=2500;
 var _gpsFilter={ready:false,lat0:0,lng0:0,x:0,y:0,vx:0,vy:0,ts:0};
 var _gpsModel=null,_gpsLastRender=0;
 
@@ -1200,7 +1201,7 @@ function _gpsPositionToModel(raw){
   if(raw.heading!=null&&usedSpeed>1){var h=raw.heading*Math.PI/180,svx=Math.sin(h)*usedSpeed,svy=Math.cos(h)*usedSpeed,blend=usedSpeed>8?.30:.18;f.vx=f.vx*(1-blend)+svx*blend;f.vy=f.vy*(1-blend)+svy*blend;}
   if(usedSpeed<.7&&distSpeed<.9){f.vx*=.22;f.vy*=.22;}
   f.ts=raw.receivedAt;
-  var g=_gpsToGeo(f.x,f.y),v=Math.min(70,Math.hypot(f.vx,f.vy)),hd=v>1?_gpsBearing((_gpsLastAccepted||raw),{lat:g.lat,lng:g.lng}):raw.heading;
+  var g=_gpsToGeo(f.x,f.y),v=Math.min(70,Math.hypot(f.vx,f.vy)),hd=raw.heading;if(v>1&&_gpsLastAccepted){hd=_gpsBearing(_gpsLastAccepted.lat,_gpsLastAccepted.lng,g.lat,g.lng);}
   return{lat:g.lat,lng:g.lng,speed:v,heading:hd,accuracy:raw.accuracy,receivedAt:raw.receivedAt,timestamp:raw.timestamp,rawLat:raw.lat,rawLng:raw.lng,innovation:res};
 }
 function _gpsAccept(pos){
@@ -1225,7 +1226,7 @@ function _drawGps(p,force){
   _updateGpsStatus(p);_gpsMoveCamera(p,force);
 }
 function _gpsMoveCamera(p,force){
-  if(!_gpsFollowing)return;var now=Date.now();if(!force&&now-_gpsLastCameraTs<140)return;_gpsLastCameraTs=now;var center=map.getCenter(),d=_haversine(center.lat,center.lng,p.lat,p.lng);if(!force&&d<8)return;_gpsCameraMoving=true;map.easeTo({center:[p.lng,p.lat],duration:140,essential:true});setTimeout(function(){_gpsCameraMoving=false;},180);
+  if(!_gpsFollowing)return;var now=Date.now();if(!force&&now-_gpsLastCameraTs<220)return;_gpsLastCameraTs=now;var center=map.getCenter(),d=_haversine(center.lat,center.lng,p.lat,p.lng);if(!force&&d<8)return;_gpsCameraMoving=true;map.easeTo({center:[p.lng,p.lat],duration:180,essential:true,animate:true});setTimeout(function(){_gpsCameraMoving=false;},180);
 }
 function _gpsRenderLoop(){
   if(_gpsWatch===null){_gpsLoopRaf=null;return;}
@@ -1233,15 +1234,100 @@ function _gpsRenderLoop(){
   _gpsLoopRaf=requestAnimationFrame(_gpsRenderLoop);
 }
 var _gpsLastRender=0;
+function _gpsErrorMessage(e){
+  if(!e)return 'erreur GPS';
+  if(e.code===1)return 'autorisation refusée';
+  if(e.code===2)return 'position indisponible';
+  if(e.code===3)return 'délai GPS dépassé';
+  return 'erreur GPS';
+}
+function _gpsDrawAndMatch(p,force){
+  if(!p)return;
+  /* Le rendu du point bleu est indépendant du calcul PK. */
+  _drawGps(p,!!force);
+  var now=Date.now();
+  if(force || now-_gpsLastPKUpdate>=450){
+    _gpsLastPKUpdate=now;
+    try{
+      var m=_bestPkMetricMatch(p);
+      if(m){
+        _gpsMatch=m;
+        window.GPS.match=m;
+        _updateGpsStatus(p);
+      }
+    }catch(e){console.warn('GPS map-match:',e);}
+  }
+}
+var _gpsWatchdog=null,_gpsLastWatchEvent=0,_gpsRestarting=false;
+function _gpsClearWatchdog(){
+  if(_gpsWatchdog){clearInterval(_gpsWatchdog);_gpsWatchdog=null;}
+}
+function _gpsStartWatch(){
+  if(!navigator.geolocation || _gpsWatch!==null || _gpsRestarting)return false;
+  _gpsLastWatchEvent=Date.now();
+  try{
+    _gpsWatch=navigator.geolocation.watchPosition(function(pos){
+      _gpsLastWatchEvent=Date.now();
+      var p=_gpsAccept(pos);
+      if(p)_gpsDrawAndMatch(p,false);
+    },function(e){
+      _gpsLastWatchEvent=Date.now();
+      showNetToast('📍 '+_gpsErrorMessage(e)+' — vérifie la localisation précise Firefox/Android');
+      _updateGpsStatus(_gpsLastAccepted);
+    },{
+      enableHighAccuracy:true,
+      maximumAge:0,
+      timeout:20000
+    });
+  }catch(e){
+    _gpsWatch=null;
+    showNetToast('📍 GPS non disponible dans ce navigateur');
+    return false;
+  }
+  return true;
+}
+function _gpsRestartWatch(){
+  if(_gpsRestarting || !navigator.geolocation)return;
+  _gpsRestarting=true;
+  if(_gpsWatch!==null){try{navigator.geolocation.clearWatch(_gpsWatch);}catch(e){} _gpsWatch=null;}
+  setTimeout(function(){
+    _gpsRestarting=false;
+    if(_gpsFollowing!==false || _gpsLastAccepted){
+      _gpsStartWatch();
+      _setLocateButton();
+    }
+  },250);
+}
+function _gpsStartWatchdog(){
+  _gpsClearWatchdog();
+  _gpsWatchdog=setInterval(function(){
+    if(_gpsWatch===null)return;
+    var silence=Date.now()-_gpsLastWatchEvent;
+    if(silence>9000 && !_gpsFreshInFlight){
+      /* Firefox Android peut parfois laisser un watcher silencieux.
+         On demande une mesure fraîche sans créer un second watcher. */
+      _gpsFreshOneShot(function(p){
+        if(p){_gpsDrawAndMatch(p,true);_gpsLastWatchEvent=Date.now();}
+        else if(Date.now()-_gpsLastWatchEvent>12000)_gpsRestartWatch();
+      });
+    }
+  },3000);
+}
 function startLiveLocation(follow){
   if(!navigator.geolocation){showNetToast('📍 Géolocalisation indisponible');return false;}
   if(_gpsWatch!==null){if(typeof follow==='boolean')_gpsFollowing=follow;_setLocateButton();if(_gpsLastAccepted)_gpsMoveCamera(_gpsLastAccepted,true);return true;}
-  _gpsResetState();_gpsFollowing=typeof follow==='boolean'?follow:true;
-  showNetToast('📡 GPS haute précision Samsung A56…');
-  _gpsWatch=navigator.geolocation.watchPosition(function(pos){var p=_gpsAccept(pos);if(p)_gpsDrawAndMatch(p);},function(e){var m=e.code===1?'autorisation refusée':e.code===2?'signal GPS indisponible':e.code===3?'délai GPS dépassé':'erreur GPS';showNetToast('📍 '+m);_updateGpsStatus(_gpsLastAccepted);}, {enableHighAccuracy:true,maximumAge:0,timeout:15000});
-  if(_gpsLoopRaf===null)_gpsLoopRaf=requestAnimationFrame(_gpsRenderLoop);_setLocateButton();return true;
+  _gpsResetState();
+  _gpsFollowing=typeof follow==='boolean'?follow:true;
+  showNetToast('📡 GPS haute précision…');
+  if(!_gpsStartWatch())return false;
+  _gpsStartWatchdog();
+  if(_gpsLoopRaf===null)_gpsLoopRaf=requestAnimationFrame(_gpsRenderLoop);
+  _setLocateButton();
+  /* Mesure initiale indépendante : elle ne remplace jamais le watcher. */
+  _gpsFreshOneShot(function(p){if(p)_gpsDrawAndMatch(p,true);});
+  return true;
 }
-function stopLiveLocation(){if(_gpsWatch!==null){navigator.geolocation.clearWatch(_gpsWatch);_gpsWatch=null;}if(_gpsLoopRaf!==null){cancelAnimationFrame(_gpsLoopRaf);_gpsLoopRaf=null;}if(_gpsAnimRaf!==null){cancelAnimationFrame(_gpsAnimRaf);_gpsAnimRaf=null;} _gpsAnim=null;_gpsResetState();_setLocateButton();_updateGpsStatus(null);showNetToast('📍 Suivi GPS arrêté');}
+function stopLiveLocation(){_gpsClearWatchdog();if(_gpsWatch!==null){navigator.geolocation.clearWatch(_gpsWatch);_gpsWatch=null;}if(_gpsLoopRaf!==null){cancelAnimationFrame(_gpsLoopRaf);_gpsLoopRaf=null;}if(_gpsAnimRaf!==null){cancelAnimationFrame(_gpsAnimRaf);_gpsAnimRaf=null;} _gpsAnim=null;_gpsResetState();_setLocateButton();_updateGpsStatus(null);showNetToast('📍 Suivi GPS arrêté');}
 function _gpsFreshOneShot(done){if(_gpsFreshInFlight)return;_gpsFreshInFlight=true;navigator.geolocation.getCurrentPosition(function(pos){_gpsFreshInFlight=false;done(_gpsAccept(pos));},function(){_gpsFreshInFlight=false;done(null);},{enableHighAccuracy:true,maximumAge:0,timeout:10000});}
 function locateMe(){if(_gpsWatch===null)startLiveLocation(true);else{_gpsFollowing=true;_setLocateButton();_gpsFreshOneShot(function(p){if(p)_gpsMoveCamera(p,true);showNetToast('📍 Suivi temps réel actif');});}}
 window.locateMe=locateMe;window.startLiveLocation=startLiveLocation;window.stopLiveLocation=stopLiveLocation;
@@ -1989,7 +2075,7 @@ async function warmOfflineCache(){
     'data/oa.geojson','data/oh.geojson','data/pam.geojson','data/acces.geojson','data/oa_poly.geojson',
     'data/bois.pmtiles','data/oa_poly.pmtiles','data/pk_metric.pmtiles',
     'data/n2.geojson','data/old.geojson','data/mc.geojson','data/eco.geojson',
-    'index_v3.html','sw.js','manifest.json','icons/icon-192.png','icons/icon-512.png'
+    'index_v3.html','manifest.json','icons/icon-192.png','icons/icon-512.png'
   ];
   var done=0;
   for(var i=0;i<files.length;i+=4){
