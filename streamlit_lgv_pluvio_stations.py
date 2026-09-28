@@ -1,7 +1,4 @@
 from __future__ import annotations
-
-
-
 import io
 import math
 import os
@@ -16,61 +13,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from streamlit_folium import st_folium
 
 SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-
-
-# Communes de surveillance prioritaires. Cette liste remplace la dépendance au
-# tableau « sectors » du snapshot pour la carte et les graphiques météo.
-# Les codes postaux permettent d'éviter les homonymes lors du géocodage.
-RISK_COMMUNES = [
-    {"commune_name": "Nouâtre", "postcode": "37800", "latitude": 47.0510, "longitude": 0.5500},
-    {"commune_name": "Fontaine-le-Comte", "postcode": "86240", "latitude": 46.5320, "longitude": 0.2620},
-    {"commune_name": "Poitiers", "postcode": "86000", "latitude": 46.5802, "longitude": 0.3404},
-    {"commune_name": "Biard", "postcode": "86580", "latitude": 46.5780, "longitude": 0.3050},
-    {"commune_name": "Villognon", "postcode": "16230", "latitude": 45.8620, "longitude": 0.0970},
-    {"commune_name": "Clérac", "postcode": "17270", "latitude": 45.1810, "longitude": -0.2280},
-    {"commune_name": "Ambarès-et-Lagrave", "postcode": "33440", "latitude": 44.9250, "longitude": -0.4860},
-]
-
-_RETRY = Retry(
-    total=4, connect=4, read=4, status=4, backoff_factor=0.8,
-    status_forcelist=(429, 500, 502, 503, 504),
-    allowed_methods=frozenset(["GET"]), respect_retry_after_header=True,
-    raise_on_status=False,
-)
-HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "MESEA-LGV-RiskCommunes/1.0"})
-HTTP.mount("https://", HTTPAdapter(max_retries=_RETRY, pool_connections=20, pool_maxsize=20))
-
-
-def get_json(url: str, params: dict | None = None, timeout=(5, 30)) -> dict:
-    response = HTTP.get(url, params=params, timeout=timeout)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict) or payload.get("error"):
-        raise RuntimeError(str(payload.get("reason") if isinstance(payload, dict) else payload))
-    return payload
-
-
-@st.cache_data(ttl=86400, show_spinner=False)
-def geocode_risk_communes() -> pd.DataFrame:
-    """Référentiel local des communes à risque, indépendant du snapshot secteurs.
-
-    Les coordonnées servent de points de référence communaux pour les requêtes météo.
-    La disponibilité d'un service de géocodage externe ne bloque donc plus l'application.
-    """
-    frame = pd.DataFrame(RISK_COMMUNES).copy()
-    for column in ("latitude", "longitude"):
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame["pk_km"] = pd.NA
-    return frame.dropna(subset=["commune_name", "latitude", "longitude"])
-
 
 # NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
 FIRMS_AREA_URL = "https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{source}/{area}/{day_range}/{date}"
@@ -135,7 +82,9 @@ def rain_color_mm(mm: float) -> str:
 
 @st.cache_data(ttl=900)
 def _fetch_snapshot_raw() -> dict:
-    return get_json(SNAPSHOT_URL, timeout=(5, 35))
+    r = requests.get(SNAPSHOT_URL, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 
 def load_snapshot() -> dict:
@@ -611,21 +560,15 @@ def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
 
 @st.cache_data(ttl=3600)
 def _fetch_commune_daily_series_raw(lat: float, lon: float, days: int) -> dict:
-    # Données historiques homogènes : ERA5-Land uniquement.
-    # Aucun secours par une prévision passée, car les deux produits ne sont pas équivalents.
-    end = datetime.now(timezone.utc).date() - timedelta(days=5)
+    end   = datetime.now(timezone.utc).date()
     start = end - timedelta(days=days - 1)
-    payload = get_json(ARCHIVE_URL, params={
-        "latitude": round(float(lat), 4), "longitude": round(float(lon), 4),
+    r = requests.get(ARCHIVE_URL, params={
+        "latitude": lat, "longitude": lon,
         "start_date": str(start), "end_date": str(end),
-        "daily": "precipitation_sum",
-        "models": "era5_land",
-        "timezone": "Europe/Paris",
-    }, timeout=(5, 40))
-    daily = payload.get("daily", {})
-    if not daily.get("time") or not daily.get("precipitation_sum"):
-        raise RuntimeError("Série ERA5-Land vide")
-    return daily
+        "daily": "precipitation_sum", "timezone": "Europe/Paris",
+    }, timeout=20)
+    r.raise_for_status()
+    return r.json().get("daily", {})
 
 
 def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
@@ -640,7 +583,7 @@ def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.Data
         return pd.DataFrame()
     df = pd.DataFrame({"date": daily.get("time", []),
                         "pluie_mm": daily.get("precipitation_sum", [])})
-    df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce")
+    df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
     return df
 
 
@@ -744,41 +687,24 @@ def load_forecast_dep(dep: str) -> dict:
         return {}
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=3600)
 def load_forecast_coord(lat: float, lon: float) -> pd.DataFrame:
-    """Prévision opérationnelle Open-Meteo Best Match, sans mélange manuel de modèles."""
-    for daily_vars in (
-        "precipitation_sum,precipitation_probability_max,temperature_2m_min,temperature_2m_max",
-        "precipitation_sum,temperature_2m_min,temperature_2m_max",
-    ):
-        try:
-            payload = get_json(FORECAST_URL, params={
-                "latitude": round(float(lat), 4), "longitude": round(float(lon), 4),
-                "daily": daily_vars, "forecast_days": 7,
-                "timezone": "Europe/Paris", "cell_selection": "land",
-            }, timeout=(5, 35))
-            daily = payload.get("daily", {})
-            dates = daily.get("time", [])
-            rain = daily.get("precipitation_sum", [])
-            if not dates or len(rain) != len(dates):
-                continue
-            n = len(dates)
-            def vals(name):
-                value = daily.get(name, [])
-                return value if len(value) == n else [None] * n
-            frame = pd.DataFrame({
-                "date": dates, "pluie_mm": rain,
-                "proba_%": vals("precipitation_probability_max"),
-                "tmin": vals("temperature_2m_min"),
-                "tmax": vals("temperature_2m_max"),
-            })
-            for column in ("pluie_mm", "proba_%", "tmin", "tmax"):
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            if not frame["pluie_mm"].dropna().empty:
-                return frame
-        except Exception:
-            continue
-    return pd.DataFrame()
+    try:
+        r = requests.get(FORECAST_URL, params={
+            "latitude": lat, "longitude": lon,
+            "daily": "precipitation_sum,precipitation_probability_max,temperature_2m_max",
+            "forecast_days": 7, "timezone": "Europe/Paris",
+        }, timeout=15)
+        r.raise_for_status()
+        daily = r.json().get("daily", {})
+        return pd.DataFrame({
+            "date":     daily.get("time", []),
+            "pluie_mm": daily.get("precipitation_sum", []),
+            "proba_%":  daily.get("precipitation_probability_max", []),
+            "tmax":     daily.get("temperature_2m_max", []),
+        })
+    except Exception:
+        return pd.DataFrame()
 
 
 @st.cache_data(ttl=3600)
@@ -906,7 +832,7 @@ st.title("🌧 LGV SEA – Pluviométrie")
 
 col_title, col_btn = st.columns([5, 1])
 col_title.caption(
-    "📡 Prévisions : **Open-Meteo Best Match** · Historique : **ERA5-Land** · "
+    "📡 Données météo : **Open-Meteo** (modèles ERA5 + ECMWF) · "
     "Crues : **Vigicrue** · Données non officielles — "
     "pour les alertes officielles : "
     "[vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) · "
@@ -916,33 +842,15 @@ if col_btn.button("🔄 Rafraîchir"):
     st.cache_data.clear()
     st.rerun()
 
-with st.expander("ℹ️ Fiabilité et sources des données", expanded=False):
-    st.markdown(
-        """
-- **Prévisions à 7 jours** : Open-Meteo Best Match, qui sélectionne automatiquement un modèle adapté à la localisation.
-- **Cumuls historiques** : ERA5-Land uniquement, avec décalage de 5 jours pour utiliser des journées consolidées.
-- **Vigilance météo** : bulletins Météo-France republiés en open data.
-- **Crues** : Vigicrue.
-- **Incendies** : NASA FIRMS VIIRS, détections satellitaires en temps quasi réel.
-- Une source indisponible est affichée **non vérifiée**. Aucune donnée manquante n'est remplacée par zéro.
-        """
-    )
-
 snapshot = load_snapshot()
 if "_error" in snapshot:
-    # Le snapshot reste utile au tracé LGV et à FIRMS, mais il ne bloque plus
-    # la carte ni les prévisions des communes à risque.
-    snapshot = {}
-    st.caption("Référentiel du tracé LGV non disponible : surveillance communale maintenue.")
-
-sectors_df = geocode_risk_communes()
-if sectors_df.empty:
-    st.error(
-        "Le référentiel local des communes à risque est vide ou invalide. "
-        "Vérifie la liste RISK_COMMUNES au début du script."
-    )
+    st.error(f"Erreur snapshot : {snapshot['_error']}")
     st.stop()
-for col in ["latitude", "longitude", "pk_km"]:
+
+_sec       = snapshot.get("sectors")
+sectors_df = safe_df(_sec.get("sectors", []) if isinstance(_sec, dict) else [])
+for col in ["weather_max_24h_mm","weather_max_7d_mm","weather_max_30d_mm",
+            "weather_max_month_mm","latitude","longitude","pk_km"]:
     if col in sectors_df.columns:
         sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
 
@@ -979,7 +887,7 @@ def nearest_dep(lat: float, lon: float) -> str:
 
 # ── 1. PLUIE PRÉVUE PAR DÉPARTEMENT ─────────────────────────────────────────
 st.subheader("Pluie prévue 7 jours par département")
-st.caption("Source : Open-Meteo Best Match · prévision 7 jours")
+st.caption("Source : Open-Meteo")
 dep_cols = st.columns(len(DEPS))
 for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
     d = dep_rain_data[dep]
@@ -1083,14 +991,25 @@ st.divider()
 communes = (sorted(sectors_df["commune_name"].dropna().unique())
             if "commune_name" in sectors_df.columns else [])
 
-# Toutes les communes à risque sont sélectionnées par défaut
-_default_communes = list(communes)
+# Communes par défaut : répartition géographique nord→sud sur la LGV SEA
+def _find_commune(kw: str) -> str | None:
+    k = unicodedata.normalize("NFD", kw.lower()).encode("ascii", "ignore").decode()
+    return next((c for c in communes
+                 if k in unicodedata.normalize("NFD", c.lower()).encode("ascii", "ignore").decode()), None)
+
+_DEFAULT_KW = ["nouatre", "fontaine", "poitier", "biard", "villognon", "clerac", "ambares"]
+_default_communes: list = []
+for _kw in _DEFAULT_KW:
+    _m = _find_commune(_kw)
+    if _m and _m not in _default_communes:
+        _default_communes.append(_m)
+_default_communes = _default_communes[:6] or (communes[:6] if len(communes) >= 6 else communes)
 
 with st.sidebar:
-    st.subheader("📍 Communes à risque")
-    selected_multi = st.multiselect("Communes à risque", communes,
+    st.subheader("📍 Communes")
+    selected_multi = st.multiselect("Comparer communes", communes,
                                      default=_default_communes)
-    selected_one   = st.selectbox("Commune affichée", ["— Toutes —"] + list(communes))
+    selected_one   = st.selectbox("Commune principale", ["— Toutes —"] + list(communes))
     periode  = st.selectbox("📅 Période pluvio", ["24h","7 jours","30 jours","Mois courant"])
 
     st.subheader("🔥 Incendies FIRMS")
@@ -1223,9 +1142,9 @@ else:
 st.divider()
 
 # ── 2quater. TOP 20 COMMUNES — CUMUL DE PRÉCIPITATION ───────────────────────
-st.subheader("🌧 Classement pluviométrique des communes à risque — 30 derniers jours")
+st.subheader("🌧 TOP 20 communes — cumul de précipitation le plus élevé (30 derniers jours)")
 
-with st.spinner("Chargement pluvio 30 jours pour les communes à risque…"):
+with st.spinner("Chargement pluvio 30 jours pour toutes les communes du corridor…"):
     all_rain_df = load_all_communes_daily_rain(sectors_df, days=30)
 
 _n_communes_total = (sectors_df["commune_name"].dropna().nunique()
@@ -1233,13 +1152,10 @@ _n_communes_total = (sectors_df["commune_name"].dropna().nunique()
 _n_communes_ok = all_rain_df["commune_name"].nunique() if not all_rain_df.empty else 0
 
 if all_rain_df.empty:
-    st.warning(
-        "Classement non vérifié : ERA5-Land n'a renvoyé aucune série exploitable. "
-        "Aucun cumul alternatif n'est affiché afin de ne pas mélanger historique et prévision."
-    )
+    st.info("Données pluvio indisponibles pour le classement.")
 else:
     if _n_communes_total and _n_communes_ok < _n_communes_total:
-        st.caption(f"⚠️ Données récupérées pour {_n_communes_ok}/{_n_communes_total} communes à risque "
+        st.caption(f"⚠️ Données récupérées pour {_n_communes_ok}/{_n_communes_total} communes du corridor "
                    "— le classement ci-dessous ne porte que sur les communes disponibles.")
     all_rain_df = all_rain_df.copy()
     all_rain_df["date"] = pd.to_datetime(all_rain_df["date"]).dt.date
@@ -1252,7 +1168,7 @@ else:
     filtered_rain = all_rain_df[(all_rain_df["date"] >= date_range[0]) &
                                  (all_rain_df["date"] <= date_range[1])]
 
-    totals = (filtered_rain.groupby("commune_name")["pluie_mm"].sum(min_count=1)
+    totals = (filtered_rain.groupby("commune_name")["pluie_mm"].sum()
               .sort_values(ascending=False).head(20))
 
     if totals.empty:
@@ -1308,10 +1224,8 @@ else:
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
                 use_container_width=True, hide_index=True,
             )
-    st.caption(
-        "Source : ERA5-Land · 30 jours consolidés jusqu'à J-5 · cache 1 h. "
-        "Les communes sans série complète sont exclues du classement."
-    )
+    st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
+               "une requête par commune, mise en cache 1h.")
 
 st.divider()
 
@@ -1405,24 +1319,18 @@ label_loc = "LGV SEA" if selected_one == "— Toutes —" else selected_one
 st.subheader(f"🔮 Prévisions 7 jours — {label_loc}")
 fc_df = load_forecast_coord(lat_c, lon_c)
 if not fc_df.empty:
-    fc_df["pluie_mm"] = pd.to_numeric(fc_df["pluie_mm"], errors="coerce")
-    fc_df["tmin"] = pd.to_numeric(fc_df["tmin"], errors="coerce")
-    fc_df["tmax"] = pd.to_numeric(fc_df["tmax"], errors="coerce")
+    fc_df["pluie_mm"] = pd.to_numeric(fc_df["pluie_mm"], errors="coerce").fillna(0)
+    fc_df["tmax"]     = pd.to_numeric(fc_df["tmax"],     errors="coerce").fillna(0)
     fc_df["color"]    = fc_df["pluie_mm"].apply(rain_color_mm)
     fig2 = go.Figure()
     fig2.add_bar(x=fc_df["date"], y=fc_df["pluie_mm"],
                  marker_color=fc_df["color"].tolist(),
-                 text=fc_df["pluie_mm"].apply(lambda v: f"{v:.0f} mm" if pd.notna(v) and v > 0 else ""),
+                 text=fc_df["pluie_mm"].apply(lambda v: f"{v:.0f}"),
                  textposition="outside", name="Pluie (mm)")
     if "proba_%" in fc_df.columns:
         fig2.add_scatter(x=fc_df["date"], y=fc_df["proba_%"],
                          mode="lines+markers", name="Proba pluie %",
                          yaxis="y2", line=dict(color="#6366f1", dash="dot"),
-                         marker=dict(size=5))
-    if "tmin" in fc_df.columns:
-        fig2.add_scatter(x=fc_df["date"], y=fc_df["tmin"],
-                         mode="lines+markers", name="T° min (°C)",
-                         yaxis="y3", line=dict(color="#0891b2", width=2, dash="dot"),
                          marker=dict(size=5))
     if "tmax" in fc_df.columns:
         fig2.add_scatter(x=fc_df["date"], y=fc_df["tmax"],
@@ -1467,7 +1375,7 @@ else:
     st.info("Historique indisponible.")
 
 # ── 6. CARTE ────────────────────────────────────────────────────────────────
-st.subheader("🗺 Carte des communes à risque LGV SEA")
+st.subheader("🗺 Carte des secteurs LGV SEA")
 if not map_df.empty:
     # Remplacement du fond de carte par satellite Esri World Imagery
     m = folium.Map(
@@ -1491,9 +1399,9 @@ if not map_df.empty:
             folium.CircleMarker(
                 [float(row["latitude"]), float(row["longitude"])],
                 radius=7, color=col_s, fill=True, fill_opacity=0.85, weight=1.5,
-                tooltip=f"{row.get('commune_name','')} — {rain_label_s} ({periode})",
+                tooltip=f"{row.get('commune_name','')} PK {row.get('pk_km','')} km — {rain_label_s} ({periode})",
                 popup=folium.Popup(
-                    f"<b>{row.get('commune_name','')}</b><br>"
+                    f"<b>{row.get('commune_name','')} — PK {row.get('pk_km','')} km</b><br>"
                     f"Cumul {periode} : <b>{rain_label_s}</b><br>"
                     f"<small>Source : Open-Meteo AROME 1,3 km</small>", max_width=250),
             ).add_to(m)
@@ -1506,10 +1414,10 @@ if not map_df.empty:
             folium.CircleMarker(
                 [rlat, rlon], radius=5,
                 color=d["color"], fill=True, fill_opacity=0.75, weight=1.2,
-                tooltip=(f"{row.get('commune_name','')} — "
+                tooltip=(f"{row.get('commune_name','')} (PK {row.get('pk_km','')}) — "
                          f"Dép.{dep} : {d['total']:.0f} mm prévu 7j"),
                 popup=folium.Popup(
-                    f"<b>{row.get('commune_name','')}</b><br>"
+                    f"<b>{row.get('commune_name','')} — PK {row.get('pk_km','')} km</b><br>"
                     f"Dép. {dep} — {d['total']:.0f} mm prévu sur 7j<br>"
                     f"Max journalier : {d['max']:.0f} mm/j<br>"
                     f"<small>Source : Open-Meteo prévision 7j</small>", max_width=260),
@@ -1546,9 +1454,9 @@ else:
     st.info("Pas de données de localisation.")
 
 # ── 7. TABLEAU ──────────────────────────────────────────────────────────────
-st.subheader("📋 Communes à risque surveillées")
-show_cols = [c for c in ["commune_name", "postcode"] if c in comm_df.columns]
-disp = comm_df[show_cols].rename(columns={"commune_name":"Commune", "postcode":"Code postal"})
+st.subheader("📋 Secteurs LGV SEA")
+show_cols = [c for c in ["commune_name","pk_km"] if c in comm_df.columns]
+disp = comm_df[show_cols].rename(columns={"commune_name":"Commune","pk_km":"PK (km)"})
 
 if selected_one != "— Toutes —" and not disp.empty:
     # Add Open-Meteo rain for the selected commune
@@ -1564,5 +1472,5 @@ elif not disp.empty:
     st.caption("ℹ️ Voir **Comparaison communes** ci-dessus pour les données pluvio fiables (Open-Meteo).")
 
 if not disp.empty:
-    st.dataframe(disp.sort_values("Commune") if "Commune" in disp.columns else disp,
+    st.dataframe(disp.sort_values("PK (km)") if "PK (km)" in disp.columns else disp,
                  use_container_width=True, hide_index=True, height=300)
