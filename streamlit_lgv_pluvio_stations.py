@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import io
 import math
 import os
@@ -49,6 +50,20 @@ DEPS = {
     "17": {"nom": "Charente-Maritime", "lat": 45.75, "lon": -0.63},
     "33": {"nom": "Gironde",            "lat": 44.84, "lon": -0.58},
 }
+
+
+# Référentiel local des communes à risque.
+# Il alimente toujours les listes, la carte et les graphiques, même si le snapshot
+# ne contient pas de tableau "sectors" ou si un service externe est indisponible.
+RISK_COMMUNES = [
+    {"commune_name": "Nouâtre", "postcode": "37800", "latitude": 47.0510, "longitude": 0.5500},
+    {"commune_name": "Fontaine-le-Comte", "postcode": "86240", "latitude": 46.5320, "longitude": 0.2620},
+    {"commune_name": "Poitiers", "postcode": "86000", "latitude": 46.5802, "longitude": 0.3404},
+    {"commune_name": "Biard", "postcode": "86580", "latitude": 46.5780, "longitude": 0.3050},
+    {"commune_name": "Villognon", "postcode": "16230", "latitude": 45.8620, "longitude": 0.0970},
+    {"commune_name": "Clérac", "postcode": "17270", "latitude": 45.1810, "longitude": -0.2280},
+    {"commune_name": "Ambarès-et-Lagrave", "postcode": "33440", "latitude": 44.9250, "longitude": -0.4860},
+]
 
 ALERT_CFG = {
     "ORAGE":      ("⛈️",  "Orage"),
@@ -844,15 +859,14 @@ if col_btn.button("🔄 Rafraîchir"):
 
 snapshot = load_snapshot()
 if "_error" in snapshot:
-    st.error(f"Erreur snapshot : {snapshot['_error']}")
-    st.stop()
+    st.caption("Tracé LGV non disponible : surveillance des communes maintenue.")
+    snapshot = {}
 
-_sec       = snapshot.get("sectors")
-sectors_df = safe_df(_sec.get("sectors", []) if isinstance(_sec, dict) else [])
-for col in ["weather_max_24h_mm","weather_max_7d_mm","weather_max_30d_mm",
-            "weather_max_month_mm","latitude","longitude","pk_km"]:
-    if col in sectors_df.columns:
-        sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
+# Ne dépend plus du champ sectors du snapshot.
+sectors_df = pd.DataFrame(RISK_COMMUNES).copy()
+sectors_df["pk_km"] = pd.NA
+for col in ["latitude", "longitude", "pk_km"]:
+    sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
 
 # Pre-compute dept forecast rain (used for map coloring + dept cards)
 RAIN_LABELS = {
@@ -988,28 +1002,14 @@ if tab_labels:
 st.divider()
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
-communes = (sorted(sectors_df["commune_name"].dropna().unique())
-            if "commune_name" in sectors_df.columns else [])
-
-# Communes par défaut : répartition géographique nord→sud sur la LGV SEA
-def _find_commune(kw: str) -> str | None:
-    k = unicodedata.normalize("NFD", kw.lower()).encode("ascii", "ignore").decode()
-    return next((c for c in communes
-                 if k in unicodedata.normalize("NFD", c.lower()).encode("ascii", "ignore").decode()), None)
-
-_DEFAULT_KW = ["nouatre", "fontaine", "poitier", "biard", "villognon", "clerac", "ambares"]
-_default_communes: list = []
-for _kw in _DEFAULT_KW:
-    _m = _find_commune(_kw)
-    if _m and _m not in _default_communes:
-        _default_communes.append(_m)
-_default_communes = _default_communes[:6] or (communes[:6] if len(communes) >= 6 else communes)
+communes = [item["commune_name"] for item in RISK_COMMUNES]
+_default_communes = list(communes)
 
 with st.sidebar:
     st.subheader("📍 Communes")
-    selected_multi = st.multiselect("Comparer communes", communes,
+    selected_multi = st.multiselect("Communes à risque", communes,
                                      default=_default_communes)
-    selected_one   = st.selectbox("Commune principale", ["— Toutes —"] + list(communes))
+    selected_one = st.selectbox("Commune principale", communes, index=0)
     periode  = st.selectbox("📅 Période pluvio", ["24h","7 jours","30 jours","Mois courant"])
 
     st.subheader("🔥 Incendies FIRMS")
@@ -1315,7 +1315,7 @@ map_df = (comm_df.dropna(subset=["latitude","longitude"])
 lat_c = float(map_df["latitude"].mean())  if not map_df.empty else 46.2
 lon_c = float(map_df["longitude"].mean()) if not map_df.empty else 0.2
 
-label_loc = "LGV SEA" if selected_one == "— Toutes —" else selected_one
+label_loc = selected_one
 st.subheader(f"🔮 Prévisions 7 jours — {label_loc}")
 fc_df = load_forecast_coord(lat_c, lon_c)
 if not fc_df.empty:
@@ -1375,12 +1375,12 @@ else:
     st.info("Historique indisponible.")
 
 # ── 6. CARTE ────────────────────────────────────────────────────────────────
-st.subheader("🗺 Carte des secteurs LGV SEA")
+st.subheader("🗺 Carte des communes à risque LGV SEA")
 if not map_df.empty:
     # Remplacement du fond de carte par satellite Esri World Imagery
     m = folium.Map(
         location=[lat_c, lon_c],
-        zoom_start=8 if selected_one == "— Toutes —" else 11,
+        zoom_start=10,
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri",
         control_scale=True,
@@ -1454,9 +1454,9 @@ else:
     st.info("Pas de données de localisation.")
 
 # ── 7. TABLEAU ──────────────────────────────────────────────────────────────
-st.subheader("📋 Secteurs LGV SEA")
-show_cols = [c for c in ["commune_name","pk_km"] if c in comm_df.columns]
-disp = comm_df[show_cols].rename(columns={"commune_name":"Commune","pk_km":"PK (km)"})
+st.subheader("📋 Communes à risque surveillées")
+show_cols = [c for c in ["commune_name", "postcode"] if c in comm_df.columns]
+disp = comm_df[show_cols].rename(columns={"commune_name":"Commune", "postcode":"Code postal"})
 
 if selected_one != "— Toutes —" and not disp.empty:
     # Add Open-Meteo rain for the selected commune
@@ -1472,5 +1472,5 @@ elif not disp.empty:
     st.caption("ℹ️ Voir **Comparaison communes** ci-dessus pour les données pluvio fiables (Open-Meteo).")
 
 if not disp.empty:
-    st.dataframe(disp.sort_values("PK (km)") if "PK (km)" in disp.columns else disp,
+    st.dataframe(disp.sort_values("Commune") if "Commune" in disp.columns else disp,
                  use_container_width=True, hide_index=True, height=300)
