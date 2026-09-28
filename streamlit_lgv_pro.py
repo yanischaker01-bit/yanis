@@ -63,8 +63,11 @@ def load_snapshot():
                     payload = file.read()
                 data = requests.models.complexjson.loads(payload)
                 if isinstance(data, dict) and data:
-                    candidates.append(("local", str(path), data))
-                    break
+                    usable, reason = _snapshot_is_usable(data)
+                    if usable:
+                        candidates.append(("local", str(path), data))
+                        break
+                    errors.append(f"Local {path}: snapshot inutilisable ({reason})")
         except Exception as error:
             errors.append(f"Local {path}: {error}")
 
@@ -83,6 +86,9 @@ def load_snapshot():
         data = response.json()
         if not isinstance(data, dict) or not data:
             raise ValueError("réponse JSON vide ou de format inattendu")
+        usable, reason = _snapshot_is_usable(data)
+        if not usable:
+            raise ValueError(f"snapshot inutilisable ({reason})")
         candidates.append(("distant", SNAPSHOT_URL, data))
     except Exception as error:
         errors.append(f"Distant {SNAPSHOT_URL}: {error}")
@@ -115,6 +121,89 @@ def safe_df(records) -> pd.DataFrame:
         except Exception:
             pass
     return pd.DataFrame()
+
+
+
+def _normalize_column_name(value: object) -> str:
+    text = str(value).strip().lower()
+    replacements = {" ": "_", "-": "_", ".": "_", "/": "_"}
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    while "__" in text:
+        text = text.replace("__", "_")
+    return text
+
+
+def _extract_sector_records(payload: dict) -> list:
+    """Extrait les secteurs sans accepter silencieusement un snapshot vide."""
+    if not isinstance(payload, dict):
+        return []
+    candidates = [payload.get("sectors"), payload.get("data"), payload.get("snapshot")]
+    for candidate in candidates:
+        if isinstance(candidate, list) and candidate:
+            return candidate
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("sectors", "records", "items", "features"):
+            records = candidate.get(key)
+            if not isinstance(records, list) or not records:
+                continue
+            if key != "features":
+                return records
+            normalized = []
+            for feature in records:
+                if not isinstance(feature, dict):
+                    continue
+                props = dict(feature.get("properties") or {})
+                geometry = feature.get("geometry") or {}
+                coords = geometry.get("coordinates") or []
+                if geometry.get("type") == "Point" and len(coords) >= 2:
+                    props.setdefault("longitude", coords[0])
+                    props.setdefault("latitude", coords[1])
+                normalized.append(props)
+            if normalized:
+                return normalized
+    return []
+
+
+def _normalize_sectors(records: list) -> pd.DataFrame:
+    frame = safe_df(records)
+    if frame.empty:
+        return frame
+    frame = frame.copy()
+    frame.columns = [_normalize_column_name(column) for column in frame.columns]
+    aliases = {
+        "lat": "latitude", "y": "latitude", "latitude_wgs84": "latitude",
+        "lon": "longitude", "lng": "longitude", "long": "longitude",
+        "x": "longitude", "longitude_wgs84": "longitude",
+        "pk": "pk_km", "pk_gps": "pk_km", "pk_theorique": "pk_km",
+        "commune": "commune_name", "nom_commune": "commune_name",
+        "libelle_commune": "commune_name",
+    }
+    for source, target in aliases.items():
+        if source in frame.columns and target not in frame.columns:
+            frame = frame.rename(columns={source: target})
+    if "pk_km" not in frame.columns and "pk_m" in frame.columns:
+        frame["pk_km"] = pd.to_numeric(frame["pk_m"], errors="coerce") / 1000.0
+    for column in ("latitude", "longitude", "pk_km"):
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def _snapshot_is_usable(payload: dict) -> tuple[bool, str]:
+    records = _extract_sector_records(payload)
+    if not records:
+        return False, "aucun secteur"
+    frame = _normalize_sectors(records)
+    required = {"commune_name", "latitude", "longitude", "pk_km"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        return False, "colonnes manquantes : " + ", ".join(missing)
+    localized = frame.dropna(subset=["latitude", "longitude", "pk_km"])
+    if localized.empty:
+        return False, "aucun secteur avec latitude, longitude et PK valides"
+    return True, "ok"
 
 
 def safe_dict(value) -> dict:
@@ -337,7 +426,7 @@ if ts:
     st.caption(caption)
 
 sectors_payload = safe_dict(snapshot.get("sectors"))
-sectors_df = safe_df(sectors_payload.get("sectors", []))
+sectors_df = _normalize_sectors(_extract_sector_records(snapshot))
 sector_summary = safe_dict(sectors_payload.get("summary"))
 sector_alerts = sectors_payload.get("alerts", []) if isinstance(sectors_payload.get("alerts"), list) else []
 commune_ranking = safe_df(snapshot.get("commune_ranking", []))
@@ -446,11 +535,17 @@ with tab_carte:
                 name="Satellite", overlay=False, control=False, max_zoom=19,
             ).add_to(m)
             for seg in (snapshot.get("lgv_lines") or []):
-                if isinstance(seg, list):
-                    pts = [[p[0], p[1]] for p in seg if isinstance(p, (list, tuple)) and len(p) >= 2]
-                    if pts:
-                        folium.PolyLine(pts, color="#1d4ed8", weight=2.5, opacity=0.7,
-                                         tooltip="Trace LGV SEA").add_to(m)
+                if not isinstance(seg, list):
+                    continue
+                pts = []
+                for point in seg:
+                    if isinstance(point, dict) and "lat" in point and "lon" in point:
+                        pts.append([point["lat"], point["lon"]])
+                    elif isinstance(point, (list, tuple)) and len(point) >= 2:
+                        pts.append([point[0], point[1]])
+                if pts:
+                    folium.PolyLine(pts, color="#1d4ed8", weight=2.5, opacity=0.7,
+                                     tooltip="Trace LGV SEA").add_to(m)
             for row in map_df.itertuples(index=False):
                 risk_lvl_row = str(getattr(row, "risk_level", "INDETERMINE"))
                 ai_lvl_row = str(getattr(row, "ai_pred_risk_level", "INDETERMINE"))
