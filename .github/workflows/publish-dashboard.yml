@@ -21,6 +21,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -29,52 +30,87 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run dashboard generation
+      - name: Fetch current GitHub Pages site
+        run: |
+          mkdir -p site
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin gh-pages
+            git archive origin/gh-pages | tar -x -C site/
+          else
+            echo "No gh-pages branch yet; starting with an empty site."
+          fi
+
+      - name: Generate dashboard and snapshot
         env:
           LGV_MAX_CYCLE_SECONDS: "600"
           LGV_WEATHER_CORRIDOR_KM: "15"
           LGV_SYNOP_CACHE_TTL_HOURS: "6"
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          python run_once_dashboard.py || (sleep 20 && python run_once_dashboard.py) || true
+          set -o pipefail
+          rm -f reports/lgv_dashboard_latest.html reports/streamlit_snapshot_latest.json
 
-      - name: Fetch carte LGV SEA from gh-pages
+          if ! python run_once_dashboard.py; then
+            echo "First generation attempt failed; retrying once..."
+            sleep 20
+            python run_once_dashboard.py
+          fi
+
+      - name: Validate generated outputs
         run: |
-          git fetch origin gh-pages
-          mkdir -p site
-          git archive origin/gh-pages | tar -x -C site/
+          python - <<'PY'
+          import json
+          from pathlib import Path
 
-      - name: Add dashboard and snapshot
+          html_path = Path("reports/lgv_dashboard_latest.html")
+          json_path = Path("reports/streamlit_snapshot_latest.json")
+
+          if not html_path.is_file() or html_path.stat().st_size < 500:
+              raise SystemExit("Dashboard HTML missing or abnormally small")
+          if not json_path.is_file() or json_path.stat().st_size < 100:
+              raise SystemExit("Snapshot JSON missing or abnormally small")
+
+          with json_path.open(encoding="utf-8") as fh:
+              data = json.load(fh)
+
+          sectors_obj = data.get("sectors")
+          sectors = sectors_obj.get("sectors", []) if isinstance(sectors_obj, dict) else []
+          lgv_lines = data.get("lgv_lines") or []
+
+          if not sectors:
+              raise SystemExit("Snapshot invalid: sectors.sectors is empty")
+          if not lgv_lines:
+              raise SystemExit("Snapshot invalid: lgv_lines is empty")
+
+          print(f"Snapshot valid: {len(sectors)} sectors, {len(lgv_lines)} LGV line segment(s)")
+          PY
+
+      - name: Publish dashboard and snapshot into site
         run: |
           mkdir -p site/dashboard/reports site/reports
-          if [ ! -f reports/lgv_dashboard_latest.html ]; then
-            echo "<html><body><h1>LGV Dashboard indisponible</h1></body></html>" > reports/lgv_dashboard_latest.html
-          fi
-          if [ ! -f reports/streamlit_snapshot_latest.json ]; then
-            echo "{}" > reports/streamlit_snapshot_latest.json
-          fi
           cp reports/lgv_dashboard_latest.html site/dashboard/index.html
           cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
           cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
           cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
 
       - name: Wake Streamlit apps
+        continue-on-error: true
         run: |
           echo "Waking up Streamlit apps..."
           for app_url in \
             "https://lgv-sea-monitoring-meteo-gc.streamlit.app/" \
             "https://lgvpluviostations.streamlit.app/"
           do
-            echo "  → $app_url"
+            echo "  -> $app_url"
             curl -L --silent --show-error --max-time 120 "$app_url" > /dev/null 2>&1 || true
           done
-          echo "Done waking up apps"
 
       - name: Setup Pages
         uses: actions/configure-pages@v5
