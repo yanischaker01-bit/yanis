@@ -762,7 +762,7 @@ def load_forecast_coord(lat: float, lon: float) -> tuple[pd.DataFrame, str | Non
         payload, model_code = _forecast_json({
             "latitude": round(float(lat), 4),
             "longitude": round(float(lon), 4),
-            "daily": "precipitation_sum,weather_code",
+            "daily": "precipitation_sum,temperature_2m_min,temperature_2m_max,weather_code",
             "forecast_days": 7,
             "timezone": "Europe/Paris",
             "cell_selection": "land",
@@ -771,9 +771,12 @@ def load_forecast_coord(lat: float, lon: float) -> tuple[pd.DataFrame, str | Non
         frame = pd.DataFrame({
             "date": daily.get("time", []),
             "pluie_mm": daily.get("precipitation_sum", []),
+            "tmin_c": daily.get("temperature_2m_min", []),
+            "tmax_c": daily.get("temperature_2m_max", []),
             "weather_code": daily.get("weather_code", []),
         })
-        frame["pluie_mm"] = pd.to_numeric(frame["pluie_mm"], errors="coerce")
+        for column in ("pluie_mm", "tmin_c", "tmax_c", "weather_code"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
         return frame, model_code
     except Exception:
         return pd.DataFrame(), None
@@ -1427,10 +1430,10 @@ lat_c = float(map_df["latitude"].mean()) if not map_df.empty else 46.2
 lon_c = float(map_df["longitude"].mean()) if not map_df.empty else 0.2
 label_loc = "LGV SEA" if selected_one == "— Toutes —" else selected_one
 
-st.subheader("🔮 Prévisions de pluie à 7 jours — communes à fort risque")
+st.subheader("🔮 Prévisions pluie et températures à 7 jours — communes à fort risque")
 st.caption(
     "Une prévision unique par commune, issue du même modèle ECMWF IFS que les prévisions "
-    "et alertes départementales. Toutes les communes à fort risque localisables sont affichées."
+    "et alertes départementales. Le graphique réunit pluie, température minimale et maximale."
 )
 
 _communes_forecast = selected_multi or _default_communes
@@ -1460,24 +1463,39 @@ if _commune_forecasts:
     _palette = ["#0f766e", "#2563eb", "#7c3aed", "#c2410c", "#15803d", "#be123c", "#475569"]
     fig2 = go.Figure()
     for _idx, (_commune, _fc) in enumerate(_commune_forecasts.items()):
-        fig2.add_scatter(
+        _color = _palette[_idx % len(_palette)]
+        fig2.add_bar(
             x=_fc["date"], y=_fc["pluie_mm"],
-            mode="lines+markers", name=_commune,
-            line=dict(color=_palette[_idx % len(_palette)], width=2.7),
-            marker=dict(size=7),
+            name=f"{_commune} · pluie",
+            marker_color=_color,
+            opacity=0.42,
             hovertemplate=(
                 f"<b>{_commune}</b><br>%{{x|%d/%m/%Y}}<br>"
-                "%{y:.1f} mm<extra></extra>"
+                "Pluie : %{y:.1f} mm<extra></extra>"
+            ),
+        )
+        fig2.add_scatter(
+            x=_fc["date"], y=_fc["tmax_c"],
+            mode="lines+markers", name=f"{_commune} · T° max",
+            yaxis="y2", line=dict(color=_color, width=2.6),
+            marker=dict(size=6),
+            customdata=_fc[["tmin_c"]].to_numpy(),
+            hovertemplate=(
+                f"<b>{_commune}</b><br>%{{x|%d/%m/%Y}}<br>"
+                "T° min : %{customdata[0]:.1f} °C<br>"
+                "T° max : %{y:.1f} °C<extra></extra>"
             ),
         )
     fig2.update_layout(
         height=430,
         hovermode="x unified",
-        yaxis=dict(title="Pluie prévue (mm/jour)", rangemode="tozero"),
+        barmode="group",
+        yaxis=dict(title="Pluie (mm/jour)", rangemode="tozero"),
+        yaxis2=dict(title="Température (°C)", overlaying="y", side="right", showgrid=False),
         xaxis=dict(title=None, tickformat="%d/%m"),
-        legend=dict(orientation="h", y=1.13, x=0),
+        legend=dict(orientation="h", y=1.15, x=0),
         plot_bgcolor="white", paper_bgcolor="white",
-        margin=dict(t=70, b=40, l=55, r=30),
+        margin=dict(t=85, b=40, l=55, r=60),
     )
     show_weather_chart(fig2, height=430)
 
@@ -1492,6 +1510,10 @@ if _commune_forecasts:
             st.caption(RAIN_LABELS.get(_level, "Prévision non vérifiée"))
             if pd.notna(_total):
                 st.write(f"Cumul prévu : **{_total:.0f} mm sur 7 jours**")
+            _tmin = _fc["tmin_c"].min()
+            _tmax = _fc["tmax_c"].max()
+            if pd.notna(_tmin) and pd.notna(_tmax):
+                st.caption(f"Températures prévues : {_tmin:.0f} à {_tmax:.0f} °C")
             if _risk_works.get(_commune):
                 st.caption(f"Zones : {_risk_works[_commune]}")
 
