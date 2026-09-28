@@ -1335,9 +1335,23 @@ else:
             hovermode="closest",
         )
 
+        # Pour garder le graphe journalier lisible, seules les communes les plus
+        # arrosées sont affichées. Le tableau conserve toutes les communes.
+        _max_daily_communes = min(10, len(_g_totals))
+        _daily_count = st.slider(
+            "Nombre de communes à afficher dans le graphe journalier",
+            min_value=1,
+            max_value=_max_daily_communes,
+            value=min(5, _max_daily_communes),
+            key="glissement_daily_commune_count",
+            help="Les communes sont sélectionnées selon le cumul de pluie sur la période choisie.",
+        )
+        _daily_communes = _g_totals.head(_daily_count)["Commune"].tolist()
+
         _fig_g_daily = go.Figure()
-        _g_palette = ["#0f766e", "#2563eb", "#c2410c", "#7c3aed", "#15803d", "#be123c"]
-        for _idx, _commune in enumerate(_g_totals["Commune"].tolist()):
+        _g_palette = ["#0f766e", "#2563eb", "#c2410c", "#7c3aed", "#15803d",
+                      "#be123c", "#0369a1", "#a16207", "#4338ca", "#047857"]
+        for _idx, _commune in enumerate(_daily_communes):
             _series = _g_filtered[
                 _g_filtered["commune_name"] == _commune
             ].sort_values("date")
@@ -1346,23 +1360,31 @@ else:
                 y=_series["pluie_mm"],
                 mode="lines+markers",
                 name=_commune,
-                line=dict(color=_g_palette[_idx % len(_g_palette)], width=2.3),
-                marker=dict(size=5),
+                line=dict(color=_g_palette[_idx % len(_g_palette)], width=2.5),
+                marker=dict(size=6),
                 hovertemplate=(
                     f"<b>{_commune}</b><br>%{{x|%d/%m}} : "
                     "%{y:.1f} mm<extra></extra>"
                 ),
             )
         _fig_g_daily.update_layout(
-            height=340,
+            height=380,
+            hovermode="x unified",
             yaxis=dict(title="Pluie par jour (mm)", rangemode="tozero"),
-            xaxis=dict(title=None),
-            legend=dict(orientation="h", y=1.14, x=0),
+            xaxis=dict(title=None, tickformat="%d/%m"),
+            legend=dict(
+                orientation="h", yanchor="bottom", y=1.02,
+                xanchor="left", x=0,
+            ),
             plot_bgcolor="white",
             paper_bgcolor="white",
-            margin=dict(t=60, b=35, l=55, r=25),
+            margin=dict(t=75, b=35, l=55, r=25),
         )
-        show_weather_chart(_fig_g_daily, height=360)
+        show_weather_chart(_fig_g_daily, height=400, hovermode="x unified")
+        st.caption(
+            f"Courbes affichées : les {_daily_count} communes les plus arrosées "
+            "parmi les communes de glissement."
+        )
 
         with st.expander("📋 Détail pluviométrie des communes de glissement"):
             st.dataframe(
