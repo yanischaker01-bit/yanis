@@ -1469,6 +1469,12 @@ if _commune_forecasts:
             name=f"{_commune} · pluie",
             marker_color=_color,
             opacity=0.42,
+            text=_fc["pluie_mm"].apply(
+                lambda value: f"{value:.0f} mm" if pd.notna(value) and value > 0 else ""
+            ),
+            textposition="outside",
+            textfont=dict(size=10, color="#334155"),
+            cliponaxis=False,
             hovertemplate=(
                 f"<b>{_commune}</b><br>%{{x|%d/%m/%Y}}<br>"
                 "Pluie : %{y:.1f} mm<extra></extra>"
@@ -1490,7 +1496,7 @@ if _commune_forecasts:
         height=430,
         hovermode="x unified",
         barmode="group",
-        yaxis=dict(title="Pluie (mm/jour)", rangemode="tozero"),
+        yaxis=dict(title="Pluie (mm/jour)", rangemode="tozero", automargin=True),
         yaxis2=dict(title="Température (°C)", overlaying="y", side="right", showgrid=False),
         xaxis=dict(title=None, tickformat="%d/%m"),
         legend=dict(orientation="h", y=1.15, x=0),
