@@ -1,12 +1,16 @@
 name: Publish LGV Dashboard
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
   schedule:
     - cron: "15 * * * *"
+  push:
+    branches: [main]
+    paths:
+      - "run_once_dashboard.py"
+      - "meteo_test.py"
+      - "requirements.txt"
+      - ".github/workflows/publish-dashboard.yml"
 
 permissions:
   contents: read
@@ -14,16 +18,15 @@ permissions:
   id-token: write
 
 concurrency:
-  group: "pages"
-  cancel-in-progress: false
+  group: lgv-dashboard-pages
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-
     steps:
-      - name: Checkout
+      - name: Checkout main
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -37,14 +40,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Fetch current GitHub Pages site
+      - name: Restore current published site
         run: |
-          mkdir -p site
+          set -euo pipefail
+          mkdir -p site reports
           if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
             git fetch --depth=1 origin gh-pages
             git archive origin/gh-pages | tar -x -C site/
-          else
-            echo "No gh-pages branch yet; starting with an empty site."
+          fi
+          if [ -f site/reports/streamlit_snapshot_latest.json ]; then
+            cp site/reports/streamlit_snapshot_latest.json reports/streamlit_snapshot_last_valid.json
+          elif [ -f site/dashboard/reports/streamlit_snapshot_latest.json ]; then
+            cp site/dashboard/reports/streamlit_snapshot_latest.json reports/streamlit_snapshot_last_valid.json
           fi
 
       - name: Generate dashboard and snapshot
@@ -54,80 +61,85 @@ jobs:
           LGV_SYNOP_CACHE_TTL_HOURS: "6"
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          set -o pipefail
-          rm -f reports/lgv_dashboard_latest.html reports/streamlit_snapshot_latest.json
+          set -euo pipefail
+          python run_once_dashboard.py
 
-          if ! python run_once_dashboard.py; then
-            echo "First generation attempt failed; retrying once..."
-            sleep 20
-            python run_once_dashboard.py
-          fi
-
-      - name: Validate generated outputs
+      - name: Validate generated files
         run: |
+          set -euo pipefail
           python - <<'PY'
           import json
           from pathlib import Path
 
           html_path = Path("reports/lgv_dashboard_latest.html")
           json_path = Path("reports/streamlit_snapshot_latest.json")
-
           if not html_path.is_file() or html_path.stat().st_size < 500:
-              raise SystemExit("Dashboard HTML missing or abnormally small")
+              raise SystemExit("Dashboard HTML absent ou anormalement petit")
           if not json_path.is_file() or json_path.stat().st_size < 100:
-              raise SystemExit("Snapshot JSON missing or abnormally small")
+              raise SystemExit("Snapshot JSON absent ou anormalement petit")
 
-          with json_path.open(encoding="utf-8") as fh:
-              data = json.load(fh)
+          with json_path.open(encoding="utf-8") as handle:
+              snapshot = json.load(handle)
 
-          sectors_obj = data.get("sectors")
-          sectors = sectors_obj.get("sectors", []) if isinstance(sectors_obj, dict) else []
-          lgv_lines = data.get("lgv_lines") or []
+          container = snapshot.get("sectors")
+          sectors = container.get("sectors", []) if isinstance(container, dict) else container
+          if not isinstance(sectors, list) or not sectors:
+              raise SystemExit("Snapshot refusé : aucun secteur")
 
-          if not sectors:
-              raise SystemExit("Snapshot invalid: sectors.sectors is empty")
-          if not lgv_lines:
-              raise SystemExit("Snapshot invalid: lgv_lines is empty")
+          aliases = {
+              "commune": "commune_name", "nom_commune": "commune_name",
+              "libelle_commune": "commune_name", "lat": "latitude", "y": "latitude",
+              "lon": "longitude", "lng": "longitude", "long": "longitude",
+              "x": "longitude", "pk": "pk_km", "pk_gps": "pk_km",
+              "pk_theorique": "pk_km", "pk_m": "pk_km",
+          }
+          required = {"commune_name", "latitude", "longitude", "pk_km"}
+          available, usable = set(), 0
+          for sector in sectors:
+              if not isinstance(sector, dict):
+                  continue
+              keys = set()
+              for raw_key in sector:
+                  key = str(raw_key).strip().lower()
+                  key = key.replace(" ", "_").replace("-", "_").replace(".", "_")
+                  keys.add(aliases.get(key, key))
+              available.update(keys)
+              usable += required.issubset(keys)
 
-          print(f"Snapshot valid: {len(sectors)} sectors, {len(lgv_lines)} LGV line segment(s)")
+          missing = sorted(required - available)
+          if missing:
+              raise SystemExit("Snapshot refusé : colonnes manquantes : " + ", ".join(missing))
+          if usable == 0:
+              raise SystemExit("Snapshot refusé : aucun secteur complet")
+          print(f"Snapshot valide : {len(sectors)} secteurs, {usable} exploitables")
           PY
 
-      - name: Publish dashboard and snapshot into site
+      - name: Publish validated files into site
         run: |
+          set -euo pipefail
           mkdir -p site/dashboard/reports site/reports
           cp reports/lgv_dashboard_latest.html site/dashboard/index.html
           cp reports/lgv_dashboard_latest.html site/dashboard/reports/lgv_dashboard_latest.html
           cp reports/streamlit_snapshot_latest.json site/dashboard/reports/streamlit_snapshot_latest.json
           cp reports/streamlit_snapshot_latest.json site/reports/streamlit_snapshot_latest.json
 
-      - name: Wake Streamlit apps
-        continue-on-error: true
-        run: |
-          echo "Waking up Streamlit apps..."
-          for app_url in \
-            "https://lgv-sea-monitoring-meteo-gc.streamlit.app/" \
-            "https://lgvpluviostations.streamlit.app/"
-          do
-            echo "  -> $app_url"
-            curl -L --silent --show-error --max-time 120 "$app_url" > /dev/null 2>&1 || true
-          done
-
       - name: Setup Pages
         uses: actions/configure-pages@v5
         with:
           enablement: true
 
-      - name: Upload artifact
+      - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
+    name: Deploy GitHub Pages
+    runs-on: ubuntu-latest
+    needs: build
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-latest
-    needs: build
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
