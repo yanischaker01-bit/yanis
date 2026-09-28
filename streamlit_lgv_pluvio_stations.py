@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import io
 import math
 import os
@@ -625,25 +626,21 @@ def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
 
 @st.cache_data(ttl=3600)
 def _fetch_commune_daily_series_raw(lat: float, lon: float, days: int) -> dict:
+    # Données historiques homogènes : ERA5-Land uniquement.
+    # Aucun secours par une prévision passée, car les deux produits ne sont pas équivalents.
     end = datetime.now(timezone.utc).date() - timedelta(days=5)
     start = end - timedelta(days=days - 1)
-    try:
-        payload = get_json(ARCHIVE_URL, params={
-            "latitude": round(float(lat), 4), "longitude": round(float(lon), 4),
-            "start_date": str(start), "end_date": str(end),
-            "daily": "precipitation_sum", "timezone": "Europe/Paris",
-        }, timeout=(5, 35))
-        daily = payload.get("daily", {})
-        if daily.get("time"):
-            return daily
-    except Exception:
-        pass
-    payload = get_json(FORECAST_URL, params={
+    payload = get_json(ARCHIVE_URL, params={
         "latitude": round(float(lat), 4), "longitude": round(float(lon), 4),
-        "daily": "precipitation_sum", "past_days": min(int(days), 92),
-        "forecast_days": 0, "timezone": "Europe/Paris",
-    }, timeout=(5, 35))
-    return payload.get("daily", {})
+        "start_date": str(start), "end_date": str(end),
+        "daily": "precipitation_sum",
+        "models": "era5_land",
+        "timezone": "Europe/Paris",
+    }, timeout=(5, 40))
+    daily = payload.get("daily", {})
+    if not daily.get("time") or not daily.get("precipitation_sum"):
+        raise RuntimeError("Série ERA5-Land vide")
+    return daily
 
 
 def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
@@ -764,6 +761,7 @@ def load_forecast_dep(dep: str) -> dict:
 
 @st.cache_data(ttl=1800)
 def load_forecast_coord(lat: float, lon: float) -> pd.DataFrame:
+    """Prévision opérationnelle Open-Meteo Best Match, sans mélange manuel de modèles."""
     for daily_vars in (
         "precipitation_sum,precipitation_probability_max,temperature_2m_min,temperature_2m_max",
         "precipitation_sum,temperature_2m_min,temperature_2m_max",
@@ -923,7 +921,7 @@ st.title("🌧 LGV SEA – Pluviométrie")
 
 col_title, col_btn = st.columns([5, 1])
 col_title.caption(
-    "📡 Données météo : **Open-Meteo** (modèles ERA5 + ECMWF) · "
+    "📡 Prévisions : **Open-Meteo Best Match** · Historique : **ERA5-Land** · "
     "Crues : **Vigicrue** · Données non officielles — "
     "pour les alertes officielles : "
     "[vigilance.meteofrance.fr](https://vigilance.meteofrance.fr/) · "
@@ -932,6 +930,18 @@ col_title.caption(
 if col_btn.button("🔄 Rafraîchir"):
     st.cache_data.clear()
     st.rerun()
+
+with st.expander("ℹ️ Fiabilité et sources des données", expanded=False):
+    st.markdown(
+        """
+- **Prévisions à 7 jours** : Open-Meteo Best Match, qui sélectionne automatiquement un modèle adapté à la localisation.
+- **Cumuls historiques** : ERA5-Land uniquement, avec décalage de 5 jours pour utiliser des journées consolidées.
+- **Vigilance météo** : bulletins Météo-France republiés en open data.
+- **Crues** : Vigicrue.
+- **Incendies** : NASA FIRMS VIIRS, détections satellitaires en temps quasi réel.
+- Une source indisponible est affichée **non vérifiée**. Aucune donnée manquante n'est remplacée par zéro.
+        """
+    )
 
 snapshot = load_snapshot()
 if "_error" in snapshot:
@@ -984,7 +994,7 @@ def nearest_dep(lat: float, lon: float) -> str:
 
 # ── 1. PLUIE PRÉVUE PAR DÉPARTEMENT ─────────────────────────────────────────
 st.subheader("Pluie prévue 7 jours par département")
-st.caption("Source : Open-Meteo")
+st.caption("Source : Open-Meteo Best Match · prévision 7 jours")
 dep_cols = st.columns(len(DEPS))
 for col_w, (dep, info) in zip(dep_cols, DEPS.items()):
     d = dep_rain_data[dep]
@@ -1238,7 +1248,10 @@ _n_communes_total = (sectors_df["commune_name"].dropna().nunique()
 _n_communes_ok = all_rain_df["commune_name"].nunique() if not all_rain_df.empty else 0
 
 if all_rain_df.empty:
-    st.info("Données pluvio indisponibles pour le classement.")
+    st.warning(
+        "Classement non vérifié : ERA5-Land n'a renvoyé aucune série exploitable. "
+        "Aucun cumul alternatif n'est affiché afin de ne pas mélanger historique et prévision."
+    )
 else:
     if _n_communes_total and _n_communes_ok < _n_communes_total:
         st.caption(f"⚠️ Données récupérées pour {_n_communes_ok}/{_n_communes_total} communes du corridor "
@@ -1254,7 +1267,7 @@ else:
     filtered_rain = all_rain_df[(all_rain_df["date"] >= date_range[0]) &
                                  (all_rain_df["date"] <= date_range[1])]
 
-    totals = (filtered_rain.groupby("commune_name")["pluie_mm"].sum()
+    totals = (filtered_rain.groupby("commune_name")["pluie_mm"].sum(min_count=1)
               .sort_values(ascending=False).head(20))
 
     if totals.empty:
@@ -1310,8 +1323,10 @@ else:
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
                 use_container_width=True, hide_index=True,
             )
-    st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
-               "une requête par commune, mise en cache 1h.")
+    st.caption(
+        "Source : ERA5-Land · 30 jours consolidés jusqu'à J-5 · cache 1 h. "
+        "Les communes sans série complète sont exclues du classement."
+    )
 
 st.divider()
 
