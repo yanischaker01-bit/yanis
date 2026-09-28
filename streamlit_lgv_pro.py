@@ -1,276 +1,790 @@
-import json
-import logging
-import os
-import signal
-import sys
-from contextlib import contextmanager
-from datetime import datetime, timezone
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
 
+import math
+import folium
+import pandas as pd
+import plotly.graph_objects as go
 import requests
+import streamlit as st
+from streamlit_folium import st_folium
 
-from meteo_test import LGVSeaMonitor
+SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
+ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+PIEZO_STATIONS_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/stations"
+PIEZO_CHRONIQUES_TR_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/chroniques_tr"
+PIEZO_MAX_AGE_HOURS = 72
+STALE_MINUTES = 180
 
-
-class TimeoutException(Exception):
-    pass
-
-
-@contextmanager
-def timeout_handler(seconds: int, task_name: str = "task"):
-    def signal_handler(signum, frame):
-        raise TimeoutException(f"{task_name} dépassé le timeout de {seconds}s")
-
-    old_handler = signal.signal(signal.SIGALRM, signal_handler)
-    signal.alarm(seconds)
-    try:
-        yield
-    except TimeoutException:
-        logging.warning("Timeout: %s", task_name)
-        raise
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
-
-
-ALIASES = {
-    "commune": "commune_name",
-    "nom_commune": "commune_name",
-    "libelle_commune": "commune_name",
-    "lat": "latitude",
-    "y": "latitude",
-    "latitude_wgs84": "latitude",
-    "lon": "longitude",
-    "lng": "longitude",
-    "long": "longitude",
-    "x": "longitude",
-    "longitude_wgs84": "longitude",
-    "pk": "pk_km",
-    "pk_gps": "pk_km",
-    "pk_theorique": "pk_km",
-    "pk_m": "pk_km",
+RISK_COLOR = {
+    "FAIBLE": "#16a34a", "MODERE": "#ea580c",
+    "ELEVE": "#dc2626", "CRITIQUE": "#7f1d1d", "INDETERMINE": "#6b7280",
 }
-REQUIRED_FIELDS = {"commune_name", "latitude", "longitude", "pk_km"}
-REMOTE_SNAPSHOT_URLS = [
-    "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json",
-    "https://yanischaker01-bit.github.io/yanis/dashboard/reports/streamlit_snapshot_latest.json",
-]
+RISK_RANK = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
+RISK_EMOJI = {"FAIBLE": "🟢", "MODERE": "🟠", "ELEVE": "🔴", "CRITIQUE": "⛔", "INDETERMINE": "⚪"}
+
+FACTOR_LABELS = {
+    "pluie_24h": "Pluie 24h",
+    "cumul_7j": "Cumul pluie 7j",
+    "fragilite_sol": "Fragilité du sol",
+    "interaction_pluie_sol": "Interaction pluie × sol",
+    "signal_geotech": "Signal géotechnique",
+    "signal_hydro": "Signal hydro",
+    "signal_nappes": "Signal nappes",
+    "signal_faible": "Signal faible",
+}
+
+CHART_LAYOUT = dict(plot_bgcolor="white", paper_bgcolor="white", margin=dict(t=20, b=20, l=20, r=20))
 
 
-def normalize_key(k: Any) -> str:
-    key = str(k or "").strip().lower()
-    key = key.replace(" ", "_").replace("-", "_").replace(".", "_")
-    return ALIASES.get(key, key)
+@st.cache_data(ttl=300, show_spinner=False)
+def load_snapshot():
+    """Charge le snapshot le plus récent, local ou distant.
 
+    Le fichier local permet à l'application de fonctionner même si GitHub Pages
+    est momentanément indisponible. Le fichier distant permet de récupérer la
+    dernière collecte publiée par GitHub Actions.
+    """
+    candidates = []
+    errors = []
 
-def extract_sectors(snapshot: Any) -> list:
-    if not isinstance(snapshot, dict):
-        return []
-    container = snapshot.get("sectors")
-    if isinstance(container, dict):
-        for candidate in ("sectors", "records", "items", "features"):
-            val = container.get(candidate)
-            if isinstance(val, list):
-                return val
-        if isinstance(container.get("data"), list):
-            return container["data"]
-        return []
-    if isinstance(container, list):
-        return container
-    for candidate in ("sectors", "records", "items", "features", "data", "snapshot"):
-        val = snapshot.get(candidate)
-        if isinstance(val, list):
-            return val
-    return []
-
-
-def _coerce_geometry_point(sector: dict) -> None:
-    if not isinstance(sector, dict):
-        return
-    geom = sector.get("geometry")
-    if not isinstance(geom, dict):
-        return
-    coords = geom.get("coordinates")
-    if geom.get("type") == "Point" and isinstance(coords, (list, tuple)) and len(coords) >= 2:
-        sector.setdefault("longitude", coords[0])
-        sector.setdefault("latitude", coords[1])
-
-
-def sector_has_required(sector: dict) -> tuple[bool, set]:
-    if not isinstance(sector, dict):
-        return False, set()
-    _coerce_geometry_point(sector)
-    keys = {normalize_key(k) for k in sector.keys()}
-    if "pk_m" in keys and "pk_km" not in keys:
-        keys.add("pk_km")
-    has_commune = "commune_name" in keys
-    has_lat = "latitude" in keys
-    has_lon = "longitude" in keys
-    has_pk = "pk_km" in keys
-    return has_commune and has_lat and has_lon and has_pk, keys
-
-
-def count_exploitable_sectors(sectors: list) -> tuple[int, int, set]:
-    total = 0
-    usable = 0
-    available_keys: set[str] = set()
-    for sector in sectors:
-        if not isinstance(sector, dict):
-            continue
-        total += 1
-        ok, keys = sector_has_required(sector)
-        if ok:
-            usable += 1
-        available_keys.update(keys)
-    return total, usable, available_keys
-
-
-def is_snapshot_valid(snapshot: Any) -> tuple[bool, str, int, int, set]:
-    sectors = extract_sectors(snapshot)
-    if not isinstance(sectors, list) or len(sectors) == 0:
-        return False, "aucun secteur dans sectors", 0, 0, set()
-    total, usable, available = count_exploitable_sectors(sectors)
-    if total == 0:
-        return False, "aucun secteur détecté", 0, 0, available
-    if usable == 0:
-        return False, "aucun secteur exploitable (colonnes manquantes)", total, usable, available
-    for sector in sectors:
-        if not isinstance(sector, dict):
-            continue
-        for field in ("latitude", "longitude", "pk_km"):
-            if field in sector:
-                try:
-                    float(sector[field])
-                except (TypeError, ValueError):
-                    return False, f"valeur non numérique pour {field}", total, usable, available
-    return True, "ok", total, usable, available
-
-
-def read_json_file(path: str) -> Optional[dict]:
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return None
-
-
-def fetch_json_url(url: str, timeout: int = 15) -> Optional[dict]:
-    try:
-        headers = {"Accept": "application/json", "Cache-Control": "no-cache", "Pragma": "no-cache"}
-        resp = requests.get(url, headers=headers, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception:
-        return None
-
-
-def find_last_valid_snapshot() -> tuple[Optional[dict], Optional[str]]:
-    candidates = [
-        os.path.join("reports", "streamlit_snapshot_latest.json"),
-        os.path.join("reports", "streamlit_snapshot_last_valid.json"),
+    local_paths = [
+        Path(__file__).resolve().parent / "reports" / "streamlit_snapshot_latest.json",
+        Path.cwd() / "reports" / "streamlit_snapshot_latest.json",
     ]
-    for path in candidates:
-        if not os.path.isfile(path):
-            continue
-        payload = read_json_file(path)
-        if payload is None:
-            continue
-        valid, reason, total, usable, _ = is_snapshot_valid(payload)
-        if valid:
-            logging.info("Snapshot local valide trouvé: %s (%s secteurs, %s exploitables)", path, total, usable)
-            return payload, path
-        logging.warning("Snapshot local invalide ignoré: %s (%s)", path, reason)
-    for url in REMOTE_SNAPSHOT_URLS:
-        payload = fetch_json_url(url)
-        if payload is None:
-            continue
-        valid, reason, total, usable, _ = is_snapshot_valid(payload)
-        if valid:
-            logging.info("Snapshot distant valide trouvé: %s (%s secteurs, %s exploitables)", url, total, usable)
-            return payload, url
-        logging.warning("Snapshot distant invalide ignoré: %s (%s)", url, reason)
-    return None, None
 
-
-def atomic_write_json(target_path: str, obj: Any) -> None:
-    target = Path(target_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(obj, fh, ensure_ascii=False, indent=2, default=str)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, target)
-
-
-def restore_snapshot(snapshot: Optional[dict], source: Optional[str], target_path: str) -> None:
-    if snapshot is None:
-        if os.path.exists(target_path):
-            os.remove(target_path)
-        logging.error("Aucun snapshot valide disponible ; fichier latest supprimé")
-        return
-    atomic_write_json(target_path, snapshot)
-    logging.info("Dernier snapshot valide restauré")
-
-
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    max_total_seconds = int(os.getenv("LGV_MAX_CYCLE_SECONDS", "720"))
-    logging.info("Démarrage du cycle LGV (timeout total: %ss)", max_total_seconds)
-
-    last_snapshot, last_source = find_last_valid_snapshot()
-    latest_path = os.path.join("reports", "streamlit_snapshot_latest.json")
+    for path in local_paths:
+        try:
+            if path.is_file() and path.stat().st_size > 0:
+                with path.open("r", encoding="utf-8") as file:
+                    payload = file.read()
+                data = requests.models.complexjson.loads(payload)
+                if isinstance(data, dict) and data:
+                    candidates.append(("local", str(path), data))
+                    break
+        except Exception as error:
+            errors.append(f"Local {path}: {error}")
 
     try:
-        with timeout_handler(max_total_seconds, "Cycle LGV complet"):
-            monitor = LGVSeaMonitor()
-            monitor.run_cycle()
-        logging.info("Cycle LGV terminé")
-    except TimeoutException as exc:
-        logging.error("Cycle LGV annulé: %s", exc)
-        if last_snapshot is not None:
-            restore_snapshot(last_snapshot, last_source, latest_path)
-        else:
-            if os.path.exists(latest_path):
-                os.remove(latest_path)
-        sys.exit(1)
-    except Exception as exc:
-        logging.error("Erreur lors du cycle LGV: %s", exc, exc_info=True)
-        if last_snapshot is not None:
-            restore_snapshot(last_snapshot, last_source, latest_path)
-        else:
-            if os.path.exists(latest_path):
-                os.remove(latest_path)
-        sys.exit(1)
+        response = requests.get(
+            SNAPSHOT_URL,
+            timeout=(10, 30),
+            headers={
+                "Accept": "application/json",
+                "Cache-Control": "no-cache",
+                "User-Agent": "LGV-SEA-Monitoring/1.0",
+            },
+            params={"v": int(datetime.now(timezone.utc).timestamp() // 300)},
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict) or not data:
+            raise ValueError("réponse JSON vide ou de format inattendu")
+        candidates.append(("distant", SNAPSHOT_URL, data))
+    except Exception as error:
+        errors.append(f"Distant {SNAPSHOT_URL}: {error}")
 
-    new_snapshot = read_json_file(latest_path)
-    if new_snapshot is None:
-        logging.error("Snapshot généré introuvable ou illisible")
-        if last_snapshot is not None:
-            restore_snapshot(last_snapshot, last_source, latest_path)
-        else:
-            if os.path.exists(latest_path):
-                os.remove(latest_path)
-        sys.exit(1)
+    if not candidates:
+        return {
+            "_error": "Aucun snapshot valide n'a pu être chargé.",
+            "_details": errors,
+        }
 
-    valid, reason, total, usable, available = is_snapshot_valid(new_snapshot)
-    if valid:
-        logging.info("Snapshot valide : %s secteurs, %s exploitables", total, usable)
-        atomic_write_json(os.path.join("reports", "streamlit_snapshot_last_valid.json"), new_snapshot)
-        sys.exit(0)
+    def timestamp_value(candidate):
+        raw = candidate[2].get("timestamp_utc", "")
+        try:
+            return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min.replace(tzinfo=timezone.utc)
 
-    logging.error("Snapshot généré invalide : %s", reason)
-    logging.error("Colonnes disponibles : %s", sorted(available))
-    if last_snapshot is not None:
-        restore_snapshot(last_snapshot, last_source, latest_path)
-        logging.info("Dernier snapshot valide restauré")
+    source_type, source_name, selected = max(candidates, key=timestamp_value)
+    selected = dict(selected)
+    selected["_snapshot_source"] = source_type
+    selected["_snapshot_location"] = source_name
+    selected["_load_warnings"] = errors
+    return selected
+
+
+def safe_df(records) -> pd.DataFrame:
+    if isinstance(records, list) and records:
+        try:
+            return pd.DataFrame(records)
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def safe_dict(value) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def safe_float(value, default: float = 0.0) -> float:
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    return f if f == f else default  # f == f is False for NaN
+
+
+@st.cache_data(ttl=3600)
+def load_monthly_rain(lat: float, lon: float) -> pd.DataFrame:
+    end = datetime.now(timezone.utc).date()
+    start = datetime(2021, 1, 1).date()
+    try:
+        r = requests.get(ARCHIVE_URL, params={
+            "latitude": lat, "longitude": lon,
+            "start_date": str(start), "end_date": str(end),
+            "daily": "precipitation_sum", "timezone": "Europe/Paris",
+        }, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        dates = data["daily"]["time"]
+        rain = data["daily"]["precipitation_sum"]
+        monthly: dict = {}
+        for d, v in zip(dates, rain):
+            if v is not None:
+                monthly[d[:7]] = monthly.get(d[:7], 0.0) + v
+        return pd.DataFrame([{"mois": m, "pluie_mm": round(v, 1)} for m, v in sorted(monthly.items())])
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=900)
+def load_commune_rain_ometo(lat: float, lon: float, periode: str) -> float:
+    """Cumul pluie via Open-Meteo.
+    24h  → AROME Météo-France 1,3 km (orages locaux), sinon ERA5.
+    7j+  → ERA5 seamless (couverture longue durée).
+    """
+    today = datetime.now(timezone.utc).date()
+    if periode == "24h":
+        past_days = 1
+    elif periode == "7 jours":
+        past_days = 7
+    elif periode == "30 jours":
+        past_days = 30
     else:
-        if os.path.exists(latest_path):
-            os.remove(latest_path)
-        logging.error("Aucun snapshot valide disponible ; fichier latest supprimé")
-    sys.exit(1)
+        past_days = today.day - 1
+    if past_days <= 0:
+        return 0.0
+
+    base = {
+        "latitude": round(lat, 4), "longitude": round(lon, 4),
+        "daily": "precipitation_sum",
+        "past_days": past_days, "forecast_days": 0,
+        "timezone": "Europe/Paris",
+    }
+    models = ["meteofrance_arome_france", None] if periode == "24h" else [None]
+    for model in models:
+        try:
+            params = dict(base)
+            if model:
+                params["models"] = model
+            r = requests.get(FORECAST_URL, params=params, timeout=15)
+            r.raise_for_status()
+            vals = r.json()["daily"]["precipitation_sum"]
+            if vals and any(v is not None for v in vals):
+                return round(sum(v for v in vals if v is not None), 1)
+        except Exception:
+            continue
+    return float("nan")
 
 
-if __name__ == "__main__":
-    main()
+def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dp/2)**2 + math.cos(p1)*math.cos(p2)*math.sin(dl/2)**2
+    return 2*r*math.asin(min(1.0, math.sqrt(a)))
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_piezo_stations(bbox: tuple[float,float,float,float]) -> tuple[pd.DataFrame, str | None]:
+    try:
+        response = requests.get(PIEZO_STATIONS_URL,
+            params={"bbox": ",".join(map(str,bbox)), "size": 20000},
+            headers={"Accept":"application/json","User-Agent":"LGV-SEA-Monitoring/2.0"}, timeout=(8,35))
+        response.raise_for_status()
+        df = pd.DataFrame(response.json().get("data", []))
+        if df.empty: return df, None
+        for source,target in {"x":"longitude","y":"latitude","libelle_pe":"nom_station","nom_commune":"commune_piezo"}.items():
+            if source in df.columns and target not in df.columns: df[target]=df[source]
+        for col in ("latitude","longitude"):
+            if col in df.columns: df[col]=pd.to_numeric(df[col],errors="coerce")
+        return df.dropna(subset=["latitude","longitude"]), None
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def load_piezo_realtime(code_bss: str) -> tuple[pd.DataFrame, str | None]:
+    try:
+        end=datetime.now(timezone.utc); start=end-timedelta(days=14)
+        response=requests.get(PIEZO_CHRONIQUES_TR_URL, params={"code_bss":code_bss,
+            "date_debut_mesure":start.strftime("%Y-%m-%d"),"date_fin_mesure":end.strftime("%Y-%m-%d"),"size":20000},
+            headers={"Accept":"application/json","User-Agent":"LGV-SEA-Monitoring/2.0"}, timeout=(8,35))
+        response.raise_for_status()
+        df=pd.DataFrame(response.json().get("data", []))
+        if df.empty: return df, None
+        date_col=next((c for c in ("date_mesure","date_mesure_piezo") if c in df.columns),None)
+        level_col=next((c for c in ("niveau_nappe_eau","niveau_eau_ngf") if c in df.columns),None)
+        if not date_col: return pd.DataFrame(), "champ date absent"
+        df["date_mesure_dt"]=pd.to_datetime(df[date_col],errors="coerce",utc=True)
+        if level_col: df["niveau_ngf_m"]=pd.to_numeric(df[level_col],errors="coerce")
+        return df.dropna(subset=["date_mesure_dt"]).sort_values("date_mesure_dt"), None
+    except Exception as error:
+        return pd.DataFrame(), str(error)
+
+def sector_expert_assessment(row) -> dict:
+    p24=max(0.0,safe_float(getattr(row,"weather_max_24h_mm",0)))
+    p7=max(0.0,safe_float(getattr(row,"weather_max_7d_mm",0)))
+    p30=max(0.0,safe_float(getattr(row,"weather_max_30d_mm",0)))
+    soil=min(max(safe_float(getattr(row,"ai_soil_fragility",0)),0),1)
+    pred=min(max(safe_float(getattr(row,"ai_pred_probability",0)),0),1)
+    signal=min(max(safe_float(getattr(row,"score",0)),0),4)/4
+    rain=.55*min(p24/60,1)+.30*min(p7/120,1)+.15*min(p30/250,1)
+    index=round(100*(.26*soil+.14*signal+.33*pred+.27*rain),1)
+    factors=[]
+    if p24>=30: factors.append("pluie 24 h forte")
+    if p7>=70: factors.append("cumul 7 j élevé")
+    if p30>=150: factors.append("sols humides sur 30 j")
+    if soil>=.65: factors.append("sol fragile")
+    if signal>=.65: factors.append("signal géotechnique")
+    if pred>=.65: factors.append("indice prédictif élevé")
+    if index>=85: level,action="CRITIQUE","Procédure interne et inspection immédiate"
+    elif index>=65: level,action="ELEVE","Inspection sous 24 h et contrôle du drainage"
+    elif index>=40: level,action="MODERE","Surveillance renforcée et revue sous 48 h"
+    else: level,action="FAIBLE","Surveillance courante"
+    fields=("weather_max_24h_mm","weather_max_7d_mm","ai_soil_fragility","ai_pred_probability","score")
+    completeness=round(100*sum(hasattr(row,c) for c in fields)/len(fields))
+    return {"expert_index":index,"expert_level":level,"expert_action":action,
+            "expert_factors":factors or ["aucun facteur dominant"],"data_completeness":completeness}
+
+def risk_badge(level: str) -> str:
+    color = RISK_COLOR.get(level, "#6b7280")
+    emoji = RISK_EMOJI.get(level, "⚪")
+    return f'<span class="risk-badge" style="background:{color}20;color:{color};border-color:{color}">{emoji} {level}</span>'
+
+
+def fmt_pct(series: pd.Series) -> pd.Series:
+    pct = pd.to_numeric(series, errors="coerce") * 100
+    return pct.round(0).apply(lambda v: "—" if pd.isna(v) else f"{int(v)} %")
+
+
+def factor_tags(factors) -> str:
+    if not isinstance(factors, list) or not factors:
+        return "—"
+    return "".join(f'<span class="factor-tag">{FACTOR_LABELS.get(f, f)}</span>' for f in factors)
+
+
+def humanize_alert_message(message: str, lookup: dict) -> str:
+    if ":" not in message:
+        return message
+    sid, rest = message.split(":", 1)
+    info = lookup.get(sid.strip())
+    if not info:
+        return message
+    pk = info.get("pk_km")
+    pk_label = f"PK {pk:.1f} km" if isinstance(pk, (int, float)) and pk == pk else "PK n/a"
+    commune = info.get("commune_name") or "commune inconnue"
+    return f"{pk_label} — {commune} ·{rest}"
+
+
+def data_age_minutes(timestamp_utc: str) -> float | None:
+    try:
+        dt = datetime.fromisoformat(timestamp_utc.replace("Z", "+00:00"))
+        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
+    except Exception:
+        return None
+
+
+st.set_page_config(page_title="LGV SEA – Pluvio & glissements", page_icon="🌧", layout="wide")
+st.markdown(
+    """
+    <style>
+    .risk-badge { border-radius: 12px; padding: 1px 9px; font-size: 12px; font-weight: 600; border: 1px solid; }
+    .factor-tag { background: #eef2ff; color: #3730a3; border-radius: 10px; padding: 1px 8px;
+                  font-size: 11px; margin-right: 4px; display: inline-block; margin-bottom: 2px; }
+    .alert-card { padding: 6px 12px; border-radius: 6px; border-left: 4px solid; margin-bottom: 5px; font-size: 13px; }
+    .commune-banner { padding: 14px; border-radius: 8px; border-left: 6px solid; margin-bottom: 12px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+st.title("🌧 LGV SEA – Pluviométrie & prédiction glissements")
+
+snapshot = load_snapshot()
+
+if not isinstance(snapshot, dict) or "_error" in snapshot:
+    err = snapshot.get("_error", "format inattendu") if isinstance(snapshot, dict) else "format inattendu"
+    st.error(f"Erreur chargement des données : {err}")
+    st.caption("Réessaie via le bouton Rafraîchir dans la barre latérale, ou reviens dans quelques minutes.")
+    st.stop()
+
+ts = snapshot.get("timestamp_utc", "")
+age_min = data_age_minutes(ts) if ts else None
+if snapshot.get("_load_warnings"):
+    with st.expander("État des sources de données", expanded=False):
+        st.caption(f"Source utilisée : {snapshot.get('_snapshot_source', 'inconnue')}")
+        st.caption(f"Emplacement : {snapshot.get('_snapshot_location', 'inconnu')}")
+        for warning in snapshot.get("_load_warnings", []):
+            st.warning(warning)
+
+if ts:
+    caption = f"Données : {ts[:16].replace('T', ' ')} UTC"
+    if age_min is not None:
+        caption += f" (il y a {age_min:.0f} min)" if age_min < 120 else f" (il y a {age_min / 60:.1f} h)"
+    st.caption(caption)
+
+sectors_payload = safe_dict(snapshot.get("sectors"))
+sectors_df = safe_df(sectors_payload.get("sectors", []))
+sector_summary = safe_dict(sectors_payload.get("summary"))
+sector_alerts = sectors_payload.get("alerts", []) if isinstance(sectors_payload.get("alerts"), list) else []
+commune_ranking = safe_df(snapshot.get("commune_ranking", []))
+ai_model = safe_dict(sectors_payload.get("ai_model"))
+
+if sectors_df.empty:
+    st.warning("Aucune donnée secteur dans le snapshot.")
+    st.stop()
+
+for col in ["weather_max_24h_mm", "weather_max_7d_mm", "weather_max_30d_mm",
+            "weather_max_month_mm", "latitude", "longitude", "pk_km", "score",
+            "ai_pred_probability", "ai_confidence", "ai_soil_fragility"]:
+    if col in sectors_df.columns:
+        sectors_df[col] = pd.to_numeric(sectors_df[col], errors="coerce")
+
+expert_df = pd.DataFrame([sector_expert_assessment(r) for r in sectors_df.itertuples(index=False)], index=sectors_df.index)
+for expert_col in expert_df.columns:
+    sectors_df[expert_col] = expert_df[expert_col]
+sector_lookup: dict = {}
+if {"sector_id", "pk_km", "commune_name"}.issubset(sectors_df.columns):
+    sector_lookup = sectors_df.set_index("sector_id")[["pk_km", "commune_name"]].to_dict("index")
+
+# ── Vue d'ensemble (toujours visible) ────────────────────────────────────
+st.subheader("Vue d'ensemble")
+k1, k2, k3, k4, k5 = st.columns(5)
+k1.metric("Secteurs sous surveillance", int(sector_summary.get("watch", 0)))
+k2.metric("Critiques / Élevés (mesuré)",
+          int(sector_summary.get("critical", 0)) + int(sector_summary.get("high", 0)))
+k3.metric("Critiques / Élevés (IA)",
+          int(sector_summary.get("ai_critical", 0)) + int(sector_summary.get("ai_high", 0)))
+k4.metric("Probabilité IA moyenne", f"{safe_float(sector_summary.get('ai_mean_probability')) * 100:.0f} %")
+k5.metric("Secteurs sol fragile", int(sector_summary.get("fragile_soil_sectors", 0)))
+e1,e2,e3=st.columns(3)
+e1.metric("Priorités génie civil", int(sectors_df["expert_level"].isin(["ELEVE","CRITIQUE"]).sum()))
+e2.metric("Critiques multicritères", int((sectors_df["expert_level"]=="CRITIQUE").sum()))
+e3.metric("Données incomplètes", int((sectors_df["data_completeness"]<75).sum()))
+st.caption("Indice explicable de priorisation, pas une probabilité statistique validée. Les seuils opérationnels doivent être validés par l'exploitant.")
+
+st.subheader("🚨 Alertes secteurs")
+if not sector_alerts:
+    st.success("Aucun secteur en alerte actuellement.")
+else:
+    for a in sector_alerts:
+        level = a.get("level", "")
+        color = RISK_COLOR.get(level, "#6b7280")
+        kind = "🤖 Prédiction IA" if a.get("type") == "SECTEUR_IA" else "📏 Mesure"
+        msg = humanize_alert_message(a.get("message", ""), sector_lookup)
+        st.markdown(
+            f'<div class="alert-card" style="border-left-color:{color};background:{color}12">'
+            f'<b>[{level}]</b> {kind} — {msg}</div>',
+            unsafe_allow_html=True)
+
+st.divider()
+
+# ── Sidebar ──────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.subheader("Filtres")
+    if st.button("🔄 Rafraîchir", width="stretch"):
+        st.cache_data.clear()
+        st.rerun()
+
+    communes = sorted(sectors_df["commune_name"].dropna().unique()) if "commune_name" in sectors_df.columns else []
+    selected = st.selectbox("📍 Commune", ["— Toutes —"] + list(communes))
+
+    periode = st.selectbox("📅 Période", ["24h", "7 jours", "30 jours", "Mois courant"])
+
+    risque_min = st.selectbox("⚠ Risque minimum", ["Tout", "FAIBLE", "MODERE", "ELEVE", "CRITIQUE"])
+    show_ai_detail = st.checkbox("Colonnes IA détaillées dans le tableau", value=False)
+
+    st.divider()
+    model_name = ai_model.get("name") or "modèle IA LGV SEA"
+    model_version = ai_model.get("version")
+    st.caption(f"Modèle : {model_name}" + (f" v{model_version}" if model_version else ""))
+    st.caption("Sources : Open-Meteo (prévisions + archives), pédologie/géotechnique BRGM, RGA/MVT Géorisques.")
+    st.caption("La prédiction IA est une aide à la priorisation, à confirmer par expertise terrain.")
+
+# ── Filtrage ─────────────────────────────────────────────────────────────
+df = sectors_df.copy()
+if selected != "— Toutes —":
+    df = df[df["commune_name"] == selected]
+if risque_min != "Tout" and "risk_level" in df.columns:
+    min_rank = RISK_RANK.get(risque_min, 0)
+    df = df[df["risk_level"].map(lambda x: RISK_RANK.get(str(x), 0)) >= min_rank]
+
+map_df = df.dropna(subset=["latitude", "longitude"]) if {"latitude", "longitude"}.issubset(df.columns) else pd.DataFrame()
+
+tab_carte, tab_expert, tab_analyses, tab_hist, tab_secteurs, tab_communes = st.tabs(
+    ["🗺 Carte", "🛠 Surveillance GC", "📊 Analyses", "📅 Historique", "📋 Secteurs", "🏘 Communes"]
+)
+
+# ── Carte ────────────────────────────────────────────────────────────────
+with tab_carte:
+    if map_df.empty:
+        st.info("Pas de coordonnées disponibles pour la carte.")
+    else:
+        try:
+            lat_c = float(map_df["latitude"].mean())
+            lon_c = float(map_df["longitude"].mean())
+            m = folium.Map(location=[lat_c, lon_c],
+                            zoom_start=8 if selected == "— Toutes —" else 12,
+                            tiles=None, control_scale=True)
+            folium.TileLayer(
+                tiles=("https://server.arcgisonline.com/ArcGIS/rest/services/"
+                       "World_Imagery/MapServer/tile/{z}/{y}/{x}"),
+                attr="Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+                name="Satellite", overlay=False, control=False, max_zoom=19,
+            ).add_to(m)
+            for seg in (snapshot.get("lgv_lines") or []):
+                if isinstance(seg, list):
+                    pts = [[p[0], p[1]] for p in seg if isinstance(p, (list, tuple)) and len(p) >= 2]
+                    if pts:
+                        folium.PolyLine(pts, color="#1d4ed8", weight=2.5, opacity=0.7,
+                                         tooltip="Trace LGV SEA").add_to(m)
+            for row in map_df.itertuples(index=False):
+                risk_lvl_row = str(getattr(row, "risk_level", "INDETERMINE"))
+                ai_lvl_row = str(getattr(row, "ai_pred_risk_level", "INDETERMINE"))
+                color_map = RISK_COLOR.get(ai_lvl_row, "#6b7280")
+                proba_row = min(max(safe_float(getattr(row, "ai_pred_probability", 0.0)), 0.0), 1.0)
+                popup = (
+                    f"<b>{getattr(row, 'sector_id', '')}</b> — {getattr(row, 'commune_name', '')} "
+                    f"(PK {getattr(row, 'pk_km', '')} km)<br>"
+                    f"Risque mesuré : {risk_lvl_row}<br>"
+                    f"Prédiction IA : {ai_lvl_row} ({proba_row * 100:.0f} %)<br>"
+                    f"Sol dominant : {getattr(row, 'ai_dominant_pedology', '—')}"
+                )
+                folium.CircleMarker(
+                    [safe_float(row.latitude), safe_float(row.longitude)],
+                    radius=6 + 6 * proba_row, color=color_map, fill=True, fill_opacity=0.8, weight=1.5,
+                    tooltip=f"{getattr(row, 'sector_id', '')} — IA {ai_lvl_row}",
+                    popup=folium.Popup(popup, max_width=280),
+                ).add_to(m)
+            st.caption("Couleur = niveau de risque prédit par l'IA (glissement). Taille = probabilité.")
+            st_folium(m, width=1400, height=520, returned_objects=[])
+        except Exception as e:
+            st.warning(f"Carte indisponible pour le moment ({e}).")
+
+# ── Surveillance génie civil ─────────────────────────────────────────────
+with tab_expert:
+    st.markdown("**Priorisation multicritère des secteurs**")
+    priority=df[df["expert_level"].isin(["ELEVE","CRITIQUE"])].sort_values("expert_index",ascending=False)
+    if priority.empty:
+        st.success("Aucun secteur élevé ou critique selon l'indice actuel.")
+    else:
+        st.warning(f"{len(priority)} secteur(s) à examiner en priorité.")
+        for row in priority.head(20).itertuples(index=False):
+            level=getattr(row,"expert_level","INDETERMINE"); color=RISK_COLOR.get(level,"#6b7280")
+            factors=", ".join(getattr(row,"expert_factors",[]) or [])
+            st.markdown(f'<div class="alert-card" style="border-left-color:{color};background:{color}12"><b>{RISK_EMOJI.get(level,"⚪")} {getattr(row,"sector_id","Secteur")} · PK {getattr(row,"pk_km","—")} · {getattr(row,"commune_name","—")}</b><br>Indice : {getattr(row,"expert_index",0):.0f}/100 · {level}<br>Facteurs : {factors}<br><b>Action :</b> {getattr(row,"expert_action","Surveillance")}</div>',unsafe_allow_html=True)
+    st.markdown("**Piézométrie publique Hub'Eau à proximité**")
+    st.caption("Contexte hydrogéologique uniquement. Une station publique distante n'est pas un capteur implanté dans l'ouvrage LGV.")
+    if map_df.empty:
+        st.info("Aucune emprise disponible.")
+    else:
+        bbox=(float(map_df.longitude.min())-.25,float(map_df.latitude.min())-.18,float(map_df.longitude.max())+.25,float(map_df.latitude.max())+.18)
+        stations,piezo_error=load_piezo_stations(bbox)
+        if piezo_error:
+            st.warning(f"Piézométrie non vérifiée : {piezo_error}")
+        elif stations.empty:
+            st.info("Aucun piézomètre public trouvé dans l'emprise.")
+        else:
+            clat,clon=float(map_df.latitude.mean()),float(map_df.longitude.mean())
+            stations=stations.copy()
+            stations["distance_km"]=stations.apply(lambda x:haversine_km(clat,clon,float(x.latitude),float(x.longitude)),axis=1)
+            near=stations.sort_values("distance_km").head(8)
+            station_index=st.selectbox("Station publique",near.index.tolist(),format_func=lambda i:f"{near.loc[i].get('code_bss',near.loc[i].get('bss_id','Station'))} · {near.loc[i].get('commune_piezo',near.loc[i].get('nom_station',''))} · {near.loc[i].distance_km:.1f} km")
+            code=str(near.loc[station_index].get("code_bss","") or near.loc[station_index].get("bss_id",""))
+            series,series_error=load_piezo_realtime(code)
+            if series_error:
+                st.warning(f"Chronique non vérifiée : {series_error}")
+            elif series.empty or "niveau_ngf_m" not in series.columns:
+                st.info("Pas de mesure télétransmise récente : statut non mesuré.")
+            else:
+                valid=series.dropna(subset=["niveau_ngf_m"])
+                if valid.empty:
+                    st.info("Niveau piézométrique non disponible.")
+                else:
+                    last=valid.iloc[-1]
+                    age=(pd.Timestamp.now(tz="UTC")-last.date_mesure_dt).total_seconds()/3600
+                    c1,c2,c3=st.columns(3)
+                    c1.metric("Dernier niveau",f"{last.niveau_ngf_m:.2f} m NGF")
+                    c2.metric("Fraîcheur",f"{age:.0f} h")
+                    c3.metric("État","À JOUR" if age<=PIEZO_MAX_AGE_HOURS else "DONNÉE ANCIENNE")
+                    figp=go.Figure()
+                    figp.add_scatter(x=valid.date_mesure_dt,y=valid.niveau_ngf_m,mode="lines+markers",name="Niveau nappe")
+                    figp.update_layout(height=320,xaxis_title="Date",yaxis_title="m NGF",**CHART_LAYOUT)
+                    st.plotly_chart(figp,width="stretch")
+    st.info("Pour une alerte complète, raccorder les piézomètres internes, inclinomètres, tassements, géométrie des talus, drainage, ouvrages hydrauliques, incidents et inspections. Aucune valeur absente n'est simulée.")
+
+# ── Analyses (profil PK, répartition, facteurs) ───────────────────────────
+with tab_analyses:
+    st.markdown("**Profil du risque le long de la ligne (prédiction IA)**")
+    profile_df = df.dropna(subset=["pk_km"]).sort_values("pk_km") if "pk_km" in df.columns else pd.DataFrame()
+    if profile_df.empty:
+        st.info("Pas de profil PK disponible.")
+    else:
+        try:
+            if "ai_pred_risk_level" in profile_df.columns:
+                bar_colors = profile_df["ai_pred_risk_level"].map(lambda x: RISK_COLOR.get(str(x), "#6b7280"))
+            else:
+                bar_colors = pd.Series(["#6b7280"] * len(profile_df), index=profile_df.index)
+            proba_pct = (profile_df["ai_pred_probability"].fillna(0.0) * 100
+                         if "ai_pred_probability" in profile_df.columns else pd.Series(0.0, index=profile_df.index))
+            fig = go.Figure()
+            fig.add_bar(
+                x=profile_df["pk_km"], y=proba_pct, marker_color=bar_colors,
+                name="Probabilité IA glissement (%)",
+                hovertemplate="PK %{x} km<br>Proba IA : %{y:.0f} %<extra></extra>",
+            )
+            if "score" in profile_df.columns:
+                fig.add_scatter(
+                    x=profile_df["pk_km"], y=profile_df["score"].fillna(0.0) * 25,
+                    mode="lines+markers", name="Risque mesuré (score ×25)",
+                    line=dict(color="#0f172a", dash="dot"), marker=dict(size=5),
+                )
+            fig.add_hline(y=65, line_dash="dash", line_color="#dc2626", annotation_text="Seuil élevé")
+            fig.add_hline(y=85, line_dash="dash", line_color="#7f1d1d", annotation_text="Seuil critique")
+            fig.update_layout(xaxis_title="PK (km)", yaxis_title="Probabilité IA (%) / Score mesuré",
+                               height=320, legend=dict(orientation="h", y=1.12), **CHART_LAYOUT)
+            st.plotly_chart(fig, width="stretch")
+        except Exception as e:
+            st.warning(f"Profil indisponible ({e}).")
+
+    st.markdown("**Répartition du risque — mesuré vs prédiction IA**")
+    levels = ["FAIBLE", "MODERE", "ELEVE", "CRITIQUE"]
+    if "risk_level" in df.columns or "ai_pred_risk_level" in df.columns:
+        try:
+            measured_counts = df["risk_level"].value_counts() if "risk_level" in df.columns else pd.Series(dtype=int)
+            ai_counts = df["ai_pred_risk_level"].value_counts() if "ai_pred_risk_level" in df.columns else pd.Series(dtype=int)
+            fig_dist = go.Figure()
+            fig_dist.add_bar(x=levels, y=[int(measured_counts.get(lvl, 0)) for lvl in levels],
+                              name="Mesuré", marker_color="#0f172a")
+            fig_dist.add_bar(x=levels, y=[int(ai_counts.get(lvl, 0)) for lvl in levels],
+                              name="Prédiction IA", marker_color="#3b82f6")
+            fig_dist.update_layout(barmode="group", yaxis_title="Nombre de secteurs", height=280,
+                                    legend=dict(orientation="h", y=1.15), **CHART_LAYOUT)
+            st.plotly_chart(fig_dist, width="stretch")
+        except Exception as e:
+            st.warning(f"Répartition indisponible ({e}).")
+    else:
+        st.info("Pas de niveau de risque disponible.")
+
+    st.markdown("**Facteurs de risque les plus fréquents**")
+    if "ai_top_factors" in df.columns:
+        try:
+            factor_counts: dict = {}
+            for factors in df["ai_top_factors"]:
+                if isinstance(factors, list):
+                    for f in factors:
+                        if f == "signal_faible":
+                            continue
+                        factor_counts[f] = factor_counts.get(f, 0) + 1
+            if not factor_counts:
+                st.info("Aucun facteur de risque marquant sur ce filtre.")
+            else:
+                factors_df = pd.DataFrame(
+                    [{"facteur": FACTOR_LABELS.get(k, k), "secteurs": v} for k, v in factor_counts.items()]
+                ).sort_values("secteurs", ascending=True)
+                fig_factors = go.Figure()
+                fig_factors.add_bar(x=factors_df["secteurs"], y=factors_df["facteur"], orientation="h",
+                                     marker_color="#7c3aed")
+                fig_factors.update_layout(xaxis_title="Nombre de secteurs concernés", height=280, **CHART_LAYOUT)
+                st.plotly_chart(fig_factors, width="stretch")
+        except Exception as e:
+            st.warning(f"Facteurs indisponibles ({e}).")
+    else:
+        st.info("Facteurs IA indisponibles dans ce snapshot.")
+
+# ── Historique ───────────────────────────────────────────────────────────
+with tab_hist:
+    hist_label = selected if selected != "— Toutes —" else "LGV SEA (centroïde)"
+    st.markdown(f"**Historique pluviométrique depuis 2021 — {hist_label}**")
+    if map_df.empty:
+        st.info("Pas de localisation pour l'historique.")
+    else:
+        try:
+            lat_h = float(map_df["latitude"].mean())
+            lon_h = float(map_df["longitude"].mean())
+            monthly_df = load_monthly_rain(lat_h, lon_h)
+            if monthly_df.empty:
+                st.info("Historique indisponible (source externe injoignable pour le moment).")
+            else:
+                fig_hist = go.Figure()
+                fig_hist.add_bar(x=monthly_df["mois"], y=monthly_df["pluie_mm"],
+                                  marker_color="#3b82f6", text=monthly_df["pluie_mm"], textposition="outside")
+                fig_hist.update_layout(xaxis_title="Mois", yaxis_title="Pluie (mm)", height=300,
+                                        xaxis=dict(tickangle=-30), **CHART_LAYOUT)
+                st.plotly_chart(fig_hist, width="stretch")
+        except Exception as e:
+            st.warning(f"Historique indisponible ({e}).")
+
+# ── Secteurs (bandeau commune + détail IA + tableau) ──────────────────────
+with tab_secteurs:
+    ometo_rain: dict = {}
+    if selected != "— Toutes —":
+        commune_row = {}
+        if not commune_ranking.empty and "commune_name" in commune_ranking.columns:
+            r = commune_ranking[commune_ranking["commune_name"] == selected]
+            if not r.empty:
+                commune_row = r.iloc[0].to_dict()
+
+        risk_lvl = str(commune_row.get("commune_risk_level", "INDETERMINE"))
+        ai_lvl = str(commune_row.get("ai_commune_risk_level", "INDETERMINE"))
+        color = RISK_COLOR.get(risk_lvl, "#6b7280")
+        emoji = RISK_EMOJI.get(risk_lvl, "⚪")
+
+        st.markdown(
+            f'<div class="commune-banner" style="border-left-color:{color};background:{color}18">'
+            f'<b style="font-size:20px">{emoji} {selected}</b>'
+            f'<span style="margin-left:16px;color:{color};font-weight:600">Risque mesuré : {risk_lvl}</span>'
+            f'<span style="margin-left:16px">Prédiction IA glissement : {risk_badge(ai_lvl)}</span>'
+            f'</div>', unsafe_allow_html=True)
+
+        _om_lat = _om_lon = None
+        _loc = map_df.dropna(subset=["latitude", "longitude"]) if not map_df.empty else pd.DataFrame()
+        if not _loc.empty:
+            _om_lat = round(float(_loc["latitude"].mean()), 4)
+            _om_lon = round(float(_loc["longitude"].mean()), 4)
+
+        if _om_lat is not None:
+            for _p in ["24h", "7 jours", "30 jours", "Mois courant"]:
+                ometo_rain[_p] = load_commune_rain_ometo(_om_lat, _om_lon, _p)
+
+        c1, c2, c3, c4 = st.columns(4)
+        for _cw, _label, _key in [
+            (c1, "☔ Cumul 24h",       "24h"),
+            (c2, "🌧 Cumul 7j",        "7 jours"),
+            (c3, "🌦 Cumul 30j",       "30 jours"),
+            (c4, "📅 Mois courant",    "Mois courant"),
+        ]:
+            _v = ometo_rain.get(_key, float("nan"))
+            _cw.metric(_label, f"{_v:.1f} mm" if pd.notna(_v) else "—")
+        st.caption("Pluie : Open-Meteo ERA5 (near real-time, lag ~6h)")
+
+        a1, a2, a3 = st.columns(3)
+        a1.metric("Probabilité IA max", f"{safe_float(commune_row.get('ai_max_probability')) * 100:.0f} %")
+        a2.metric("Fragilité sol moyenne", f"{safe_float(commune_row.get('ai_avg_soil_fragility')) * 100:.0f} %")
+        a3.metric("Secteurs IA critiques/élevés",
+                  int(commune_row.get("ai_critical", 0)) + int(commune_row.get("ai_high", 0)))
+
+        with st.expander(f"🔎 Détail prédiction IA par secteur — {selected}", expanded=False):
+            detail_df = (df.sort_values("ai_pred_probability", ascending=False)
+                         if "ai_pred_probability" in df.columns else df)
+            for row in detail_df.itertuples(index=False):
+                proba = min(max(safe_float(getattr(row, "ai_pred_probability", 0.0)), 0.0), 1.0)
+                conf = safe_float(getattr(row, "ai_confidence", 0.0))
+                st.markdown(
+                    f'**{getattr(row, "sector_id", "?")}** · PK {getattr(row, "pk_km", "—")} km '
+                    f'&nbsp; {risk_badge(str(getattr(row, "risk_level", "INDETERMINE")))} '
+                    f'&nbsp; IA {risk_badge(str(getattr(row, "ai_pred_risk_level", "INDETERMINE")))}',
+                    unsafe_allow_html=True)
+                st.progress(proba, text=f"Probabilité IA glissement : {proba * 100:.0f} % (confiance {conf * 100:.0f} %)")
+                st.markdown(
+                    f'Sol dominant : **{getattr(row, "ai_dominant_pedology", "—")}** '
+                    f'({getattr(row, "ai_dominant_soil_type", "—")}) &nbsp;·&nbsp; '
+                    f'Facteurs : {factor_tags(getattr(row, "ai_top_factors", None))}',
+                    unsafe_allow_html=True)
+                st.markdown("&nbsp;", unsafe_allow_html=True)
+        st.markdown("---")
+
+    titre = f"Secteurs — {selected}" if selected != "— Toutes —" else "Tous les secteurs"
+    st.markdown(f"**{titre}**")
+    if df.empty:
+        st.info("Aucun secteur pour ces filtres.")
+    else:
+        base_cols = ["commune_name", "pk_km", "risk_level", "ai_pred_risk_level", "expert_level", "expert_index", "data_completeness", "expert_action"]
+        ai_cols = ["ai_pred_probability", "ai_confidence", "ai_soil_fragility", "ai_dominant_pedology"]
+        show_cols = [c for c in base_cols + (ai_cols if show_ai_detail else []) if c in df.columns]
+        rename = {
+            "commune_name": "Commune", "pk_km": "PK (km)",
+            "risk_level": "Risque", "ai_pred_risk_level": "Risque IA",
+            "ai_pred_probability": "Proba IA", "ai_confidence": "Confiance IA",
+            "ai_soil_fragility": "Fragilité sol", "ai_dominant_pedology": "Sol dominant",
+            "expert_level": "Priorité GC", "expert_index": "Indice GC /100",
+            "data_completeness": "Complétude (%)", "expert_action": "Action proposée",
+        }
+        disp = df[show_cols].copy().rename(columns=rename)
+        # Insérer colonne pluie Open-Meteo (commune sélectionnée uniquement)
+        if selected != "— Toutes —" and ometo_rain:
+            _rv = ometo_rain.get(periode, float("nan"))
+            _pluvio_label = f"Pluie {periode}"
+            disp.insert(2, _pluvio_label, f"{_rv:.1f} mm" if pd.notna(_rv) else "—")
+        for pct_col in ["Proba IA", "Confiance IA", "Fragilité sol"]:
+            if pct_col in disp.columns:
+                disp[pct_col] = fmt_pct(disp[pct_col])
+        if "Risque IA" in disp.columns:
+            disp = disp.sort_values(
+                "Risque IA",
+                key=lambda s: s.map(lambda x: RISK_RANK.get(str(x), 0)),
+                ascending=False, na_position="last")
+        elif "Risque" in disp.columns:
+            disp = disp.sort_values(
+                "Risque",
+                key=lambda s: s.map(lambda x: RISK_RANK.get(str(x), 0)),
+                ascending=False, na_position="last")
+        st.dataframe(disp, width="stretch", hide_index=True, height=360)
+
+# ── Communes ────────────────────────────────────────────────────────────
+with tab_communes:
+    if selected != "— Toutes —":
+        st.info("Sélectionne « — Toutes — » dans le filtre Commune pour voir le classement complet.")
+    elif commune_ranking.empty:
+        st.info("Classement communes indisponible dans ce snapshot.")
+    else:
+        cr = commune_ranking.copy()
+        if "commune_risk_level" in cr.columns:
+            cr["_rank"] = cr["commune_risk_level"].map(lambda x: RISK_RANK.get(str(x), 0))
+            cr = cr.sort_values("_rank", ascending=False).drop(columns=["_rank"])
+        show = [c for c in ["commune_name", "departement_name", "commune_risk_level",
+                             "commune_note", "sector_count", "critical", "high",
+                             "ai_commune_risk_level", "ai_max_probability"] if c in cr.columns]
+        rename_cr = {"commune_name": "Commune", "departement_name": "Département",
+                     "commune_risk_level": "Risque", "commune_note": "Note",
+                     "sector_count": "Secteurs", "critical": "Critique", "high": "Élevé",
+                     "ai_commune_risk_level": "Risque IA", "ai_max_probability": "Proba IA max"}
+        disp_cr = cr[show].rename(columns=rename_cr)
+        if "Proba IA max" in disp_cr.columns:
+            disp_cr["Proba IA max"] = fmt_pct(disp_cr["Proba IA max"])
+        st.markdown("**Classement communes**")
+        st.dataframe(disp_cr, width="stretch", hide_index=True, height=380)
+
+        if {"commune_name", "commune_note"}.issubset(cr.columns):
+            st.markdown("**Top 10 communes les plus à risque**")
+            try:
+                top_cr = cr.dropna(subset=["commune_note"]).sort_values("commune_note", ascending=False).head(10)
+                if not top_cr.empty:
+                    fig_top = go.Figure()
+                    fig_top.add_bar(
+                        x=top_cr["commune_note"], y=top_cr["commune_name"], orientation="h",
+                        marker_color=top_cr.get("commune_risk_level", pd.Series(dtype=str)).map(
+                            lambda x: RISK_COLOR.get(str(x), "#6b7280")),
+                        text=top_cr["commune_note"], textposition="outside",
+                    )
+                    fig_top.update_layout(xaxis_title="Note de risque (/100)", yaxis=dict(autorange="reversed"),
+                                           height=340, margin=dict(t=20, b=20, l=20, r=40),
+                                           plot_bgcolor="white", paper_bgcolor="white")
+                    st.plotly_chart(fig_top, width="stretch")
+            except Exception as e:
+                st.warning(f"Graphe top communes indisponible ({e}).")
+
+with st.expander("ℹ️ À propos de ce tableau de bord", expanded=False):
+    st.markdown(
+        f"- **Modèle IA** : {ai_model.get('name', 'n/a')} "
+        f"(v{ai_model.get('version', '?')}) — {ai_model.get('description', '')}\n"
+        "- **Sources** : Open-Meteo (prévisions + archives), pédologie/lithologie BRGM, "
+        "retrait-gonflement des argiles (RGA) et mouvements de terrain (MVT) Géorisques.\n"
+        "- **Limites** : la prédiction IA est un outil d'aide à la priorisation basé sur pluie + "
+        "fragilité des sols ; elle ne remplace pas une expertise géotechnique de terrain.\n"
+        f"- **Fraîcheur** : rafraîchi automatiquement toutes les heures ; alerte si les données "
+        f"dépassent {STALE_MINUTES / 60:.0f} h."
+    )
