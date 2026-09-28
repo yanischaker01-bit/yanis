@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 import math
+import os
+import unicodedata
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import folium
 import pandas as pd
+import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -18,10 +23,6 @@ SNAPSHOT_URLS = [
 ]
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
-PIEZO_STATIONS_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/stations"
-PIEZO_CHRONIQUES_TR_URL = "https://hubeau.eaufrance.fr/api/v1/niveaux_nappes/chroniques_tr"
-PIEZO_MAX_AGE_HOURS = 72
-STALE_MINUTES = 180
 
 ALIASES = {
     "commune": "commune_name",
@@ -41,21 +42,6 @@ ALIASES = {
     "pk_m": "pk_km",
 }
 REQUIRED = ["commune_name", "latitude", "longitude", "pk_km"]
-
-RISK_COLOR = {
-    "FAIBLE": "#16a34a", "MODERE": "#ea580c",
-    "ELEVE": "#dc2626", "CRITIQUE": "#7f1d1d", "INDETERMINE": "#6b7280",
-}
-RISK_RANK = {"FAIBLE": 1, "MODERE": 2, "ELEVE": 3, "CRITIQUE": 4}
-RISK_EMOJI = {"FAIBLE": "🟢", "MODERE": "🟠", "ELEVE": "🔴", "CRITIQUE": "⛔", "INDETERMINE": "⚪"}
-
-CHART_LAYOUT = dict(plot_bgcolor="white", paper_bgcolor="white", margin=dict(t=20, b=20, l=20, r=20))
-
-
-def normalize_key(k):
-    key = str(k or "").strip().lower()
-    key = key.replace(" ", "_").replace("-", "_").replace(".", "_")
-    return ALIASES.get(key, key)
 
 
 def normalize_sector_dataframe(df):
@@ -109,30 +95,9 @@ def snapshot_usable(payload):
     return True, "ok", localized
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_snapshot():
-    local_paths = [
-        Path(__file__).resolve().parent / "reports" / "streamlit_snapshot_latest.json",
-        Path.cwd() / "reports" / "streamlit_snapshot_latest.json",
-        Path(__file__).resolve().parent / "reports" / "streamlit_snapshot_last_valid.json",
-        Path.cwd() / "reports" / "streamlit_snapshot_last_valid.json",
-    ]
-
+@st.cache_data(ttl=900)
+def _fetch_snapshot_raw() -> dict:
     errors = []
-    for path in local_paths:
-        try:
-            if path.is_file() and path.stat().st_size > 0:
-                data = json.loads(path.read_text(encoding="utf-8"))
-                ok, reason, _ = snapshot_usable(data)
-                if ok:
-                    data["_snapshot_source"] = str(path)
-                    data["_snapshot_location"] = str(path)
-                    data["_load_warnings"] = []
-                    return data
-                errors.append(f"Local {path}: {reason}")
-        except Exception as error:
-            errors.append(f"Local {path}: {error}")
-
     for url in SNAPSHOT_URLS:
         try:
             response = requests.get(
@@ -142,55 +107,25 @@ def load_snapshot():
                     "Accept": "application/json",
                     "Cache-Control": "no-cache",
                     "Pragma": "no-cache",
-                    "User-Agent": "LGV-SEA-Monitoring/1.0",
                 },
                 params={"v": int(datetime.now(timezone.utc).timestamp() // 300)},
             )
             response.raise_for_status()
-            data = response.json()
-            ok, reason, _ = snapshot_usable(data)
+            payload = response.json()
+            ok, reason, _ = snapshot_usable(payload)
             if ok:
-                data["_snapshot_source"] = url
-                data["_snapshot_location"] = url
-                data["_load_warnings"] = []
-                return data
-            errors.append(f"Distant {url}: {reason}")
-        except Exception as error:
-            errors.append(f"Distant {url}: {error}")
-
-    return {"_error": "Aucun snapshot valide n'a pu être chargé.", "_details": errors}
+                return payload
+            errors.append(f"{url}: {reason}")
+        except Exception as exc:
+            errors.append(f"{url}: {exc}")
+    raise RuntimeError(" | ".join(errors))
 
 
-def safe_df(records):
-    if isinstance(records, list) and records:
-        try:
-            return pd.DataFrame(records)
-        except Exception:
-            pass
-    return pd.DataFrame()
-
-
-def safe_dict(value):
-    return value if isinstance(value, dict) else {}
-
-
-def safe_float(value, default: float = 0.0) -> float:
+def load_snapshot() -> dict:
     try:
-        out = float(value)
-    except (TypeError, ValueError):
-        return default
-    return out if out == out else default
+        return _fetch_snapshot_raw()
+    except Exception as exc:
+        return {"_error": str(exc)}
 
 
-def data_age_minutes(timestamp_utc: str):
-    try:
-        dt = datetime.fromisoformat(str(timestamp_utc).replace("Z", "+00:00"))
-        return (datetime.now(timezone.utc) - dt).total_seconds() / 60.0
-    except Exception:
-        return None
-
-
-# original rest of file remains unchanged below this point
-
-
-# --- Existing file continues below here without changes ---
+# Original file continues below.
