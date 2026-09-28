@@ -16,10 +16,6 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 SNAPSHOT_URL = "https://yanischaker01-bit.github.io/yanis/reports/streamlit_snapshot_latest.json"
-SNAPSHOT_URLS = (
-    SNAPSHOT_URL,
-    "https://yanischaker01-bit.github.io/yanis/dashboard/reports/streamlit_snapshot_latest.json",
-)
 ARCHIVE_URL  = "https://archive-api.open-meteo.com/v1/archive"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
@@ -84,35 +80,21 @@ def rain_color_mm(mm: float) -> str:
     return "#93c5fd"
 
 
-@st.cache_data(ttl=300)
-def _fetch_snapshot_raw(cache_slot: int) -> dict:
-    errors = []
-    for url in SNAPSHOT_URLS:
-        try:
-            response = requests.get(
-                url,
-                params={"v": cache_slot},
-                headers={"Accept": "application/json", "Cache-Control": "no-cache", "Pragma": "no-cache"},
-                timeout=(5, 25),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            usable, reason = _snapshot_is_usable(payload)
-            if not usable:
-                raise ValueError(reason)
-            payload["_snapshot_source"] = url
-            return payload
-        except Exception as exc:
-            errors.append(f"{url}: {exc}")
-    raise RuntimeError(" | ".join(errors))
+@st.cache_data(ttl=900)
+def _fetch_snapshot_raw() -> dict:
+    r = requests.get(SNAPSHOT_URL, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
 
 def load_snapshot() -> dict:
+    """Seules les réponses réussies sont mises en cache (via _fetch_snapshot_raw) :
+    un échec réseau ponctuel n'immobilise pas l'appli 15 min, il est retenté au
+    prochain rerun au lieu de rester figé jusqu'à expiration du TTL."""
     try:
-        cache_slot = int(datetime.now(timezone.utc).timestamp() // 300)
-        return _fetch_snapshot_raw(cache_slot)
-    except Exception as exc:
-        return {"_error": str(exc)}
+        return _fetch_snapshot_raw()
+    except Exception as e:
+        return {"_error": str(e)}
 
 
 @st.cache_data(ttl=1800)
@@ -578,24 +560,15 @@ def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
 
 @st.cache_data(ttl=3600)
 def _fetch_commune_daily_series_raw(lat: float, lon: float, days: int) -> dict:
-    today = datetime.now(timezone.utc).date()
-    errors = []
-    for lag_days in (1, 2, 3, 5, 7):
-        end = today - timedelta(days=lag_days)
-        start = end - timedelta(days=days - 1)
-        try:
-            response = requests.get(ARCHIVE_URL, params={
-                "latitude": lat, "longitude": lon,
-                "start_date": str(start), "end_date": str(end),
-                "daily": "precipitation_sum", "timezone": "Europe/Paris",
-            }, timeout=(5, 25))
-            response.raise_for_status()
-            daily = response.json().get("daily", {})
-            if daily.get("time") and daily.get("precipitation_sum"):
-                return daily
-        except Exception as exc:
-            errors.append(str(exc))
-    raise RuntimeError("Archive ERA5 indisponible : " + " | ".join(errors))
+    end   = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+    r = requests.get(ARCHIVE_URL, params={
+        "latitude": lat, "longitude": lon,
+        "start_date": str(start), "end_date": str(end),
+        "daily": "precipitation_sum", "timezone": "Europe/Paris",
+    }, timeout=20)
+    r.raise_for_status()
+    return r.json().get("daily", {})
 
 
 def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
@@ -618,9 +591,6 @@ def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.Data
 def load_all_communes_daily_rain(_sectors_df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
     """Série journalière de pluie pour chaque commune du corridor (1 requête/commune, cache 1h)."""
     if _sectors_df.empty or "commune_name" not in _sectors_df.columns:
-        return pd.DataFrame()
-    required = {"commune_name", "latitude", "longitude"}
-    if not required.issubset(_sectors_df.columns):
         return pd.DataFrame()
     coords = (_sectors_df.dropna(subset=["latitude", "longitude"])
               .groupby("commune_name")[["latitude", "longitude"]].mean())
@@ -806,7 +776,7 @@ def show_weather_chart(fig: go.Figure, *, height: int = 340,
     """Affiche un graphe météo responsive avec une barre d'outils allégée."""
     style_weather_chart(fig, height=height, hovermode=hovermode)
     st.plotly_chart(
-        fig, width="stretch",
+        fig, use_container_width=True,
         config={"displayModeBar": False, "responsive": True},
     )
 
@@ -818,89 +788,6 @@ def safe_df(records) -> pd.DataFrame:
         except Exception:
             pass
     return pd.DataFrame()
-
-
-
-def _normalize_column_name(value: object) -> str:
-    text = str(value).strip().lower()
-    replacements = {" ": "_", "-": "_", ".": "_", "/": "_"}
-    for source, target in replacements.items():
-        text = text.replace(source, target)
-    while "__" in text:
-        text = text.replace("__", "_")
-    return text
-
-
-def _extract_sector_records(payload: dict) -> list:
-    """Extrait les secteurs sans accepter silencieusement un snapshot vide."""
-    if not isinstance(payload, dict):
-        return []
-    candidates = [payload.get("sectors"), payload.get("data"), payload.get("snapshot")]
-    for candidate in candidates:
-        if isinstance(candidate, list) and candidate:
-            return candidate
-        if not isinstance(candidate, dict):
-            continue
-        for key in ("sectors", "records", "items", "features"):
-            records = candidate.get(key)
-            if not isinstance(records, list) or not records:
-                continue
-            if key != "features":
-                return records
-            normalized = []
-            for feature in records:
-                if not isinstance(feature, dict):
-                    continue
-                props = dict(feature.get("properties") or {})
-                geometry = feature.get("geometry") or {}
-                coords = geometry.get("coordinates") or []
-                if geometry.get("type") == "Point" and len(coords) >= 2:
-                    props.setdefault("longitude", coords[0])
-                    props.setdefault("latitude", coords[1])
-                normalized.append(props)
-            if normalized:
-                return normalized
-    return []
-
-
-def _normalize_sectors(records: list) -> pd.DataFrame:
-    frame = safe_df(records)
-    if frame.empty:
-        return frame
-    frame = frame.copy()
-    frame.columns = [_normalize_column_name(column) for column in frame.columns]
-    aliases = {
-        "lat": "latitude", "y": "latitude", "latitude_wgs84": "latitude",
-        "lon": "longitude", "lng": "longitude", "long": "longitude",
-        "x": "longitude", "longitude_wgs84": "longitude",
-        "pk": "pk_km", "pk_gps": "pk_km", "pk_theorique": "pk_km",
-        "commune": "commune_name", "nom_commune": "commune_name",
-        "libelle_commune": "commune_name",
-    }
-    for source, target in aliases.items():
-        if source in frame.columns and target not in frame.columns:
-            frame = frame.rename(columns={source: target})
-    if "pk_km" not in frame.columns and "pk_m" in frame.columns:
-        frame["pk_km"] = pd.to_numeric(frame["pk_m"], errors="coerce") / 1000.0
-    for column in ("latitude", "longitude", "pk_km"):
-        if column in frame.columns:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    return frame
-
-
-def _snapshot_is_usable(payload: dict) -> tuple[bool, str]:
-    records = _extract_sector_records(payload)
-    if not records:
-        return False, "aucun secteur"
-    frame = _normalize_sectors(records)
-    required = {"commune_name", "latitude", "longitude", "pk_km"}
-    missing = sorted(required - set(frame.columns))
-    if missing:
-        return False, "colonnes manquantes : " + ", ".join(missing)
-    localized = frame.dropna(subset=["latitude", "longitude", "pk_km"])
-    if localized.empty:
-        return False, "aucun secteur avec latitude, longitude et PK valides"
-    return True, "ok"
 
 
 def alert_card(a: dict):
@@ -960,10 +847,8 @@ if "_error" in snapshot:
     st.error(f"Erreur snapshot : {snapshot['_error']}")
     st.stop()
 
-sectors_df = _normalize_sectors(_extract_sector_records(snapshot))
-if sectors_df.empty:
-    st.error("Le snapshot ne contient aucun secteur exploitable.")
-    st.stop()
+_sec       = snapshot.get("sectors")
+sectors_df = safe_df(_sec.get("sectors", []) if isinstance(_sec, dict) else [])
 for col in ["weather_max_24h_mm","weather_max_7d_mm","weather_max_30d_mm",
             "weather_max_month_mm","latitude","longitude","pk_km"]:
     if col in sectors_df.columns:
@@ -1197,7 +1082,7 @@ elif firms_alerts:
     st.dataframe(
         df_firms[["PK (km)", "Distance LGV (m)", "Date", "Heure (UTC)",
                   "Confiance", "FRP (MW)", "Satellite"]],
-        width="stretch", hide_index=True,
+        use_container_width=True, hide_index=True,
     )
 else:
     st.success(f"Aucune détection FIRMS à moins de {FIRMS_RADIUS_KM*1000:.0f} m "
@@ -1337,7 +1222,7 @@ else:
         with st.expander("📋 Table du TOP 20"):
             st.dataframe(
                 totals.reset_index().rename(columns={"commune_name": "Commune", "pluie_mm": "Cumul (mm)"}),
-                width="stretch", hide_index=True,
+                use_container_width=True, hide_index=True,
             )
     st.caption("Source : Open-Meteo ERA5 (réanalyse, série journalière 30 jours) · "
                "une requête par commune, mise en cache 1h.")
@@ -1561,7 +1446,7 @@ if not map_df.empty:
                 f"Satellite : {a['satellite']}", max_width=250),
         ).add_to(m)
 
-    st_folium(m, width="stretch", height=450, returned_objects=[])
+    st_folium(m, use_container_width=True, height=450, returned_objects=[])
     if selected_one == "— Toutes —":
         st.caption("Couleur = prévision pluie 7j par département (Open-Meteo). "
                    "Sélectionner une commune pour voir son cumul mesuré.")
@@ -1588,4 +1473,4 @@ elif not disp.empty:
 
 if not disp.empty:
     st.dataframe(disp.sort_values("PK (km)") if "PK (km)" in disp.columns else disp,
-                 width="stretch", hide_index=True, height=300)
+                 use_container_width=True, hide_index=True, height=300)
