@@ -25,7 +25,7 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 # Modèle unique et explicite pour toutes les prévisions affichées.
 # Le second identifiant n'est qu'un alias de compatibilité Open-Meteo.
-FORECAST_MODEL_ALIASES = ("ecmwf_ifs", "ecmwf_ifs025", None)
+FORECAST_MODEL_ALIASES = ("ecmwf_ifs", "ecmwf_ifs025")
 
 # Session HTTP robuste : les erreurs temporaires ne sont pas transformées en 0 mm.
 _HTTP_RETRY = Retry(
@@ -60,14 +60,10 @@ def _forecast_json(params: dict) -> tuple[dict, str]:
     for model_code in FORECAST_MODEL_ALIASES:
         try:
             request_params = dict(params)
-            if model_code:
-                request_params["models"] = model_code
-            else:
-                request_params.pop("models", None)
-            payload = _get_json(FORECAST_URL, params=request_params, timeout=(5, 35))
-            return payload, (model_code or "best_match")
+            request_params["models"] = model_code
+            return _get_json(FORECAST_URL, params=request_params), model_code
         except Exception as exc:
-            errors.append(f"{model_code or 'best_match'}: {exc}")
+            errors.append(f"{model_code}: {exc}")
     raise RuntimeError("Prévision ECMWF indisponible — " + " | ".join(errors))
 
 # NASA FIRMS (Fire Information for Resource Management System) — détections satellite quasi temps réel
@@ -638,94 +634,52 @@ def load_firms_alerts(_polyline: list, day_range: int = 1, end_date=None,
 
 @st.cache_data(ttl=3600)
 def _fetch_commune_daily_series_raw(lat: float, lon: float, days: int) -> dict:
-    """Secours individuel pour une commune, via jours passés Open-Meteo."""
-    payload = _get_json(FORECAST_URL, params={
-        "latitude": round(float(lat), 4),
-        "longitude": round(float(lon), 4),
-        "daily": "precipitation_sum",
-        "past_days": min(int(days), 92),
-        "forecast_days": 0,
-        "timezone": "Europe/Paris",
-    }, timeout=(5, 35))
-    return payload.get("daily", {})
+    end   = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+    r = requests.get(ARCHIVE_URL, params={
+        "latitude": lat, "longitude": lon,
+        "start_date": str(start), "end_date": str(end),
+        "daily": "precipitation_sum", "timezone": "Europe/Paris",
+    }, timeout=20)
+    r.raise_for_status()
+    return r.json().get("daily", {})
 
 
 def load_commune_daily_series(lat: float, lon: float, days: int = 30) -> pd.DataFrame:
+    """Série journalière de pluie sur les `days` derniers jours — API archive ERA5
+    (réanalyse), pas l'API prévision : son paramètre `past_days` renvoie pour les
+    1-2 derniers jours une sortie modèle non recalée sur l'observé, constatée jusqu'à
+    11x plus élevée que l'ERA5 le même jour (45,6 mm vs 4,0 mm), ce qui gonflait
+    artificiellement les cumuls du classement TOP 20."""
     try:
         daily = _fetch_commune_daily_series_raw(lat, lon, days)
     except Exception:
         return pd.DataFrame()
-    frame = pd.DataFrame({
-        "date": daily.get("time", []),
-        "pluie_mm": daily.get("precipitation_sum", []),
-    })
-    frame["pluie_mm"] = pd.to_numeric(frame["pluie_mm"], errors="coerce")
-    return frame.dropna(subset=["date"])
-
-
-@st.cache_data(ttl=3600)
-def _fetch_rain_batch(coords: tuple, days: int) -> list:
-    """Charge plusieurs communes en une requête pour éviter les erreurs 429."""
-    if not coords:
-        return []
-    latitudes = ",".join(f"{lat:.4f}" for lat, _ in coords)
-    longitudes = ",".join(f"{lon:.4f}" for _, lon in coords)
-    response = HTTP.get(FORECAST_URL, params={
-        "latitude": latitudes,
-        "longitude": longitudes,
-        "daily": "precipitation_sum",
-        "past_days": min(int(days), 92),
-        "forecast_days": 0,
-        "timezone": "Europe/Paris",
-    }, timeout=(5, 60))
-    response.raise_for_status()
-    payload = response.json()
-    if isinstance(payload, dict):
-        payload = [payload]
-    if not isinstance(payload, list):
-        raise RuntimeError("Réponse météo groupée inattendue")
-    return payload
+    df = pd.DataFrame({"date": daily.get("time", []),
+                        "pluie_mm": daily.get("precipitation_sum", [])})
+    df["pluie_mm"] = pd.to_numeric(df["pluie_mm"], errors="coerce").fillna(0.0)
+    return df
 
 
 @st.cache_data(ttl=3600)
 def load_all_communes_daily_rain(_sectors_df: pd.DataFrame, days: int = 30) -> pd.DataFrame:
-    """Série journalière par commune, chargée par lots pour fiabiliser le TOP 20."""
-    required = {"commune_name", "latitude", "longitude"}
-    if _sectors_df.empty or not required.issubset(_sectors_df.columns):
+    """Série journalière de pluie pour chaque commune du corridor (1 requête/commune, cache 1h)."""
+    if _sectors_df.empty or "commune_name" not in _sectors_df.columns:
         return pd.DataFrame()
-    coords_df = (
-        _sectors_df.dropna(subset=["commune_name", "latitude", "longitude"])
-        .groupby("commune_name")[["latitude", "longitude"]]
-        .mean()
-        .reset_index()
-    )
+    coords = (_sectors_df.dropna(subset=["latitude", "longitude"])
+              .groupby("commune_name")[["latitude", "longitude"]].mean())
     frames = []
-    batch_size = 20
-    for start_idx in range(0, len(coords_df), batch_size):
-        batch = coords_df.iloc[start_idx:start_idx + batch_size]
-        coords = tuple(
-            (round(float(row.latitude), 4), round(float(row.longitude), 4))
-            for row in batch.itertuples(index=False)
-        )
-        try:
-            payloads = _fetch_rain_batch(coords, days)
-        except Exception:
-            payloads = []
-        for position, row in enumerate(batch.itertuples(index=False)):
-            try:
-                daily = payloads[position].get("daily", {})
-                frame = pd.DataFrame({
-                    "date": daily.get("time", []),
-                    "pluie_mm": daily.get("precipitation_sum", []),
-                })
-                frame["pluie_mm"] = pd.to_numeric(frame["pluie_mm"], errors="coerce")
-                frame = frame.dropna(subset=["date", "pluie_mm"])
-                if not frame.empty:
-                    frame["commune_name"] = row.commune_name
-                    frames.append(frame)
-            except Exception:
-                continue
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    for commune, row in coords.iterrows():
+        df = load_commune_daily_series(round(float(row["latitude"]), 4),
+                                        round(float(row["longitude"]), 4), days)
+        if df.empty:
+            continue
+        df = df.copy()
+        df["commune_name"] = commune
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
 
 @st.cache_data(ttl=900)
@@ -804,48 +758,29 @@ def load_forecast_dep(dep: str) -> dict:
 
 @st.cache_data(ttl=1800)
 def load_forecast_coord(lat: float, lon: float) -> tuple[pd.DataFrame, str | None]:
-    """Prévision fiable 7 jours. Best Match assure toutes les variables journalières."""
-    base_params = {
-        "latitude": round(float(lat), 4),
-        "longitude": round(float(lon), 4),
-        "daily": "precipitation_sum,temperature_2m_min,temperature_2m_max,weather_code",
-        "forecast_days": 7,
-        "timezone": "Europe/Paris",
-        "cell_selection": "land",
-    }
-    attempts = [
-        (dict(base_params), "best_match"),
-        ({**base_params, "daily": "precipitation_sum,temperature_2m_min,temperature_2m_max"}, "best_match"),
-    ]
-    for params, source_name in attempts:
-        try:
-            payload = _get_json(FORECAST_URL, params=params, timeout=(5, 35))
-            daily = payload.get("daily", {})
-            dates = daily.get("time", [])
-            rain = daily.get("precipitation_sum", [])
-            tmin = daily.get("temperature_2m_min", [])
-            tmax = daily.get("temperature_2m_max", [])
-            if not dates or len(rain) != len(dates):
-                continue
-            if len(tmin) != len(dates):
-                tmin = [None] * len(dates)
-            if len(tmax) != len(dates):
-                tmax = [None] * len(dates)
-            weather = daily.get("weather_code", [None] * len(dates))
-            if len(weather) != len(dates):
-                weather = [None] * len(dates)
-            frame = pd.DataFrame({
-                "date": dates, "pluie_mm": rain,
-                "tmin_c": tmin, "tmax_c": tmax,
-                "weather_code": weather,
-            })
-            for column in ("pluie_mm", "tmin_c", "tmax_c", "weather_code"):
-                frame[column] = pd.to_numeric(frame[column], errors="coerce")
-            if not frame["pluie_mm"].dropna().empty:
-                return frame, source_name
-        except Exception:
-            continue
-    return pd.DataFrame(), None
+    """Prévision 7 jours ECMWF IFS à la coordonnée d'une commune."""
+    try:
+        payload, model_code = _forecast_json({
+            "latitude": round(float(lat), 4),
+            "longitude": round(float(lon), 4),
+            "daily": "precipitation_sum,temperature_2m_min,temperature_2m_max,weather_code",
+            "forecast_days": 7,
+            "timezone": "Europe/Paris",
+            "cell_selection": "land",
+        })
+        daily = payload.get("daily", {})
+        frame = pd.DataFrame({
+            "date": daily.get("time", []),
+            "pluie_mm": daily.get("precipitation_sum", []),
+            "tmin_c": daily.get("temperature_2m_min", []),
+            "tmax_c": daily.get("temperature_2m_max", []),
+            "weather_code": daily.get("weather_code", []),
+        })
+        for column in ("pluie_mm", "tmin_c", "tmax_c", "weather_code"):
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame, model_code
+    except Exception:
+        return pd.DataFrame(), None
 
 
 @st.cache_data(ttl=3600)
@@ -931,41 +866,36 @@ def safe_df(records) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def alert_card(a: dict):
-    """Carte d'alerte plus lisible. FIRMS conserve volontairement son rendu initial."""
-    lvl   = a.get("level", "")
+def alert_card(a: dict, compact: bool = True):
+    """Affiche une alerte compacte afin d'économiser l'espace vertical."""
+    lvl = a.get("level", "INFO")
     atype = a.get("type", "")
-    icon  = a.get("icon") or ALERT_CFG.get(atype, ("", ""))[0] or None
-
-    # Ne pas modifier la présentation ni le comportement des alertes NASA FIRMS.
-    if atype == "FEU_FIRMS":
-        c_badge, c_msg = st.columns([1, 7], vertical_alignment="center")
-        with c_badge:
-            st.badge(LEVEL_LABEL.get(lvl, lvl or "Info"), color=LEVEL_BADGE.get(lvl, "gray"))  # type: ignore[arg-type]
-        with c_msg:
-            st.markdown(f"{icon}  {a.get('msg','')}" if icon else a.get("msg", ""))
-        return
-
+    icon = a.get("icon") or ALERT_CFG.get(atype, ("ℹ️", ""))[0] or "ℹ️"
     label = ALERT_CFG.get(atype, ("", atype.replace("_", " ").title()))[1]
     color = LEVEL_COLOR.get(lvl, LEVEL_COLOR["INFO"])
-    date_label = a.get("date", "")
     dep_label = f"Dép. {a['dep']}" if a.get("dep") else ""
-    meta = " · ".join(str(v) for v in (label, dep_label, date_label) if v)
+    date_label = str(a.get("date", ""))
+    meta = " · ".join(value for value in (label, dep_label, date_label) if value)
+    message = str(a.get("msg", ""))
+
+    if compact:
+        st.markdown(
+            f"<div style='display:flex;gap:.55rem;align-items:flex-start;"
+            f"border-left:4px solid {color};padding:.38rem .65rem;"
+            f"margin:.18rem 0;background:#f8fafc;border-radius:0 .45rem .45rem 0'>"
+            f"<span style='font-size:1rem'>{icon}</span>"
+            f"<div style='line-height:1.25'>"
+            f"<span style='font-weight:700;color:{color}'>{LEVEL_LABEL.get(lvl, lvl)}</span>"
+            f"<span style='font-weight:600'> · {meta}</span>"
+            f"<br><span style='font-size:.86rem;color:#475569'>{message}</span>"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+        return
 
     with st.container(border=True):
-        c_icon, c_body, c_level = st.columns([0.45, 6.4, 1.15], vertical_alignment="center")
-        with c_icon:
-            st.markdown(f"<div style='font-size:1.45rem;text-align:center'>{icon or 'ℹ️'}</div>", unsafe_allow_html=True)
-        with c_body:
-            st.markdown(f"**{meta or label}**")
-            st.caption(str(a.get("msg", "")))
-        with c_level:
-            st.markdown(
-                f"<div style='border-left:4px solid {color};padding-left:.55rem;font-weight:700;color:{color}'>"
-                f"{LEVEL_LABEL.get(lvl, lvl or 'Info')}</div>",
-                unsafe_allow_html=True,
-            )
-
+        st.markdown(f"**{icon} {meta}**")
+        st.caption(message)
 
 # ═══════════════════════════════════════════════════════════════════════════
 st.set_page_config(page_title="LGV SEA – Pluviométrie", page_icon="🌧", layout="wide")
@@ -1086,12 +1016,21 @@ elif met_ok < met_total:
                "le reste sera réessayé au prochain rafraîchissement.")
 
 if active_met:
-    badge_cols = st.columns(len(by_met))
-    for col, (atype, alist) in zip(badge_cols, by_met.items()):
+    _indicator_parts = []
+    for atype, alist in by_met.items():
         worst = max(alist, key=lambda x: LEVEL_RANK.get(x["level"], 0))
         icon, label = ALERT_CFG.get(atype, ("", atype))
-        col.badge(f"{label} ({len(alist)})", icon=icon or None,
-                  color=LEVEL_BADGE.get(worst["level"], "gray"))  # type: ignore[arg-type]
+        _indicator_parts.append(
+            f"<span style='white-space:nowrap'><b>{icon} {label}</b> "
+            f"<span style='color:{LEVEL_COLOR.get(worst['level'], '#475569')}'>"
+            f"{len(alist)}</span></span>"
+        )
+    st.markdown(
+        "<div style='display:flex;flex-wrap:wrap;gap:.55rem 1.2rem;"
+        "padding:.55rem .75rem;background:#f8fafc;border:1px solid #e2e8f0;"
+        "border-radius:.65rem'>" + "".join(_indicator_parts) + "</div>",
+        unsafe_allow_html=True,
+    )
 elif met_ok > 0:
     st.success("Aucun indicateur météo significatif sur les 7 prochains jours.")
 
@@ -1114,17 +1053,17 @@ tab_labels.append(vc_label)
 tab_data.append(vc_alerts)
 
 if tab_labels:
-    tabs = st.tabs(tab_labels)
-    for tab, alist in zip(tabs, tab_data):
-        with tab:
-            if tab is tabs[-1] and not vc_ok:
-                st.warning("API Vigicrue injoignable — statut crues **non vérifié** "
-                           "(réessaie dans quelques minutes).")
-            elif not alist:
-                st.info("Aucune crue en vigilance actuellement sur ces cours d'eau."
-                         if tab is tabs[-1] else "Aucune donnée.")
-            for a in alist:
-                alert_card(a)
+    with st.expander("Voir le détail des indicateurs météo et Vigicrue", expanded=False):
+        tabs = st.tabs(tab_labels)
+        for tab, alist in zip(tabs, tab_data):
+            with tab:
+                if tab is tabs[-1] and not vc_ok:
+                    st.warning("API Vigicrue injoignable — statut crues **non vérifié**.")
+                elif not alist:
+                    st.info("Aucune crue en vigilance actuellement sur ces cours d'eau."
+                             if tab is tabs[-1] else "Aucune donnée.")
+                for a in alist:
+                    alert_card(a, compact=True)
 
 st.divider()
 
@@ -1288,30 +1227,36 @@ st.subheader("🧭 Points de vigilance — surveillance ligne LGV SEA")
 
 _firms_unverified = firms_err in ("fetch_failed", "invalid_key", "missing_key")
 
-vig_cols = st.columns(4)
-vig_cols[0].badge(
-    "Vigilance MF — non vérifié" if not mf_ok else f"Vigilance MF ({len(mf_alerts)})",
-    icon="🛡️", color="gray" if not mf_ok else ("red" if mf_alerts else "green"))  # type: ignore[arg-type]
-vig_cols[1].badge(
-    "Météo — non vérifié" if met_ok == 0 else f"Météo ({len(active_met)})",
-    icon="🌦️", color="gray" if met_ok == 0 else ("orange" if active_met else "green"))  # type: ignore[arg-type]
-vig_cols[2].badge(
-    "Vigicrue — non vérifié" if not vc_ok else f"Vigicrue ({len(vc_active)})",
-    icon="🏞️", color="gray" if not vc_ok else ("blue" if vc_active else "green"))  # type: ignore[arg-type]
-vig_cols[3].badge(
-    "FIRMS — non vérifié" if _firms_unverified else f"FIRMS ({len(firms_alerts)})",
-    icon="🔥", color="gray" if _firms_unverified else ("red" if firms_alerts else "green"))  # type: ignore[arg-type]
-
+_status_items = [
+    ("🛡️", "Météo-France", None if not mf_ok else len(mf_alerts), not mf_ok),
+    ("🌦️", "Météo", None if met_ok == 0 else len(active_met), met_ok == 0),
+    ("🏞️", "Vigicrue", None if not vc_ok else len(vc_active), not vc_ok),
+    ("🔥", "FIRMS", None if _firms_unverified else len(firms_alerts), _firms_unverified),
+]
+_status_html = []
+for _icon, _label, _count, _unknown in _status_items:
+    _text = "non vérifié" if _unknown else ("aucune" if _count == 0 else f"{_count} active(s)")
+    _color = "#64748b" if _unknown else ("#dc2626" if (_count or 0) > 0 else "#15803d")
+    _status_html.append(
+        f"<span style='white-space:nowrap'><b>{_icon} {_label}</b> "
+        f"<span style='color:{_color}'>{_text}</span></span>"
+    )
+st.markdown(
+    "<div style='display:flex;flex-wrap:wrap;gap:.5rem 1.35rem;"
+    "padding:.6rem .8rem;border:1px solid #e2e8f0;border-radius:.7rem;"
+    "background:#fff'>" + "".join(_status_html) + "</div>",
+    unsafe_allow_html=True,
+)
 if mf_alerts or active_met or vc_active or firms_alerts:
-    with st.expander("⚠️ Détail des alertes actives (vigilance MF, météo, crues, incendie)", expanded=True):
+    with st.expander("⚠️ Voir le détail des alertes actives", expanded=False):
         for a in mf_alerts:
-            alert_card(a)
+            alert_card(a, compact=True)
         for a in sorted(active_met, key=lambda x: -LEVEL_RANK.get(x["level"], 0)):
-            alert_card(a)
+            alert_card(a, compact=True)
         for a in vc_active:
-            alert_card(a)
+            alert_card(a, compact=True)
         for a in firms_alerts:
-            alert_card(a)
+            alert_card(a, compact=True)
 elif not mf_ok or met_ok == 0 or not vc_ok or _firms_unverified:
     st.warning("Au moins une source (vigilance MF, météo, crues ou incendie) n'a pas pu être vérifiée "
                "— voir le détail ci-dessus. Ne pas interpréter comme « aucune alerte ».")
@@ -1498,8 +1443,8 @@ label_loc = "LGV SEA" if selected_one == "— Toutes —" else selected_one
 
 st.subheader("🔮 Prévisions pluie et températures à 7 jours — communes à fort risque")
 st.caption(
-    "Une prévision unique et homogène par commune. Le graphique réunit pluie, "
-    "température minimale et maximale sur les 7 prochains jours."
+    "Une prévision unique par commune, issue du même modèle ECMWF IFS que les prévisions "
+    "et alertes départementales. Le graphique réunit pluie, température minimale et maximale."
 )
 
 _communes_forecast = selected_multi or _default_communes
@@ -1589,7 +1534,7 @@ if _commune_forecasts:
             if _risk_works.get(_commune):
                 st.caption(f"Zones : {_risk_works[_commune]}")
 
-    st.caption("Source communale : Open-Meteo Best Match · cache 30 min · aucune donnée manquante n'est remplacée par 0 mm.")
+    st.caption("Modèle affiché : ECMWF IFS · cache 30 min · aucune valeur manquante n'est remplacée par 0 mm.")
 else:
     st.warning("Prévisions communales non vérifiées actuellement.")
 
