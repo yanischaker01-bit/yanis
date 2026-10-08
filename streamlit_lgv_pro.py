@@ -211,9 +211,9 @@ def make_sectors(points, width=SECTOR_WIDTH_KM):
     rows = []
 
     for pk_start, group in work.groupby("pk_start"):
-        ai = pd.to_numeric(group.get("ai_pred_probability"), errors="coerce").dropna()
-        soil = pd.to_numeric(group.get("ai_soil_fragility"), errors="coerce").dropna()
-        measured = pd.to_numeric(group.get("score"), errors="coerce").dropna()
+        ai = pd.to_numeric(group.get("ai_pred_probability", pd.Series(np.nan, index=group.index)), errors="coerce").dropna()
+        soil = pd.to_numeric(group.get("ai_soil_fragility", pd.Series(np.nan, index=group.index)), errors="coerce").dropna()
+        measured = pd.to_numeric(group.get("score", pd.Series(np.nan, index=group.index)), errors="coerce").dropna()
 
         susceptibility = float(ai.max()) if not ai.empty else 0.40
         fragility = float(soil.mean()) if not soil.empty else 0.40
@@ -607,9 +607,181 @@ def calculate_risk(rain, sector, piezo=None, forecast=None, mf="VERT", vc="VERT"
 # =============================================================================
 # APPLICATION
 # =============================================================================
+
+# Surveillance communale independante des secteurs.
+@st.cache_data(ttl=900, show_spinner=False)
+def surveillance_payload(lat, lon):
+    p = get_json(FORECAST_URL, params={
+        "latitude": round(float(lat), 4), "longitude": round(float(lon), 4),
+        "current": "precipitation,weather_code,wind_gusts_10m,temperature_2m",
+        "hourly": "precipitation,precipitation_probability,weather_code,wind_gusts_10m",
+        "past_days": 7, "forecast_days": 8, "timezone": "Europe/Paris"})
+    p["retrieved"] = datetime.now(timezone.utc).isoformat()
+    return p
+
+
+def surveillance_hours(p):
+    h = p.get("hourly", {})
+    f = pd.DataFrame({"time": pd.to_datetime(h.get("time", []), errors="coerce")})
+    for k in ["precipitation", "precipitation_probability", "weather_code", "wind_gusts_10m"]:
+        f[k] = pd.to_numeric(pd.Series(h.get(k, []), dtype="object").reindex(f.index), errors="coerce")
+    f["time"] = f.time.dt.tz_localize("Europe/Paris", ambiguous="NaT", nonexistent="NaT")
+    return f.dropna(subset=["time"]).sort_values("time").drop_duplicates("time")
+
+
+def surveillance_sum(f, start, end):
+    v = f.loc[(f.time > start) & (f.time <= end), "precipitation"]
+    n = int((end - start).total_seconds() / 3600)
+    return float(v.sum()) if len(v) == n and not v.isna().any() else np.nan
+
+
+def surveillance_level(r24, r72, gust, storm, limits):
+    if any(pd.isna(x) for x in [r24, r72, gust]):
+        return "INDETERMINE", "Donnees incompletes"
+    rank, causes = 0, []
+    for name, value, thresholds in [("Pluie 24 h", r24, limits[0]), ("Pluie 72 h", r72, limits[1]), ("Rafales", gust, limits[2])]:
+        r = sum(value >= t for t in thresholds)
+        rank = max(rank, r)
+        if r:
+            causes.append(f"{name} : {value:.1f}")
+    if storm:
+        rank = max(rank, 1)
+        causes.append("Signal d'orage")
+    return ["VERT", "JAUNE", "ORANGE", "ROUGE"][rank], "; ".join(causes) or "Aucun seuil depasse"
+
+
+def surveillance_build(coords, limits):
+    now = pd.Timestamp.now(tz="Europe/Paris")
+    anchor = now.floor("h")
+    live, future, failures = [], [], []
+    for r in coords.to_dict("records"):
+        base = {"Commune": r["commune_name"], "Departement": r["department_code"],
+                "PK min": r["pk_min"], "PK max": r["pk_max"],
+                "latitude": r["latitude"], "longitude": r["longitude"]}
+        try:
+            p = surveillance_payload(r["latitude"], r["longitude"])
+            h = surveillance_hours(p)
+            current = p.get("current", {})
+            stamp = pd.to_datetime(current.get("time"), errors="coerce")
+            stamp = stamp.tz_localize("Europe/Paris", ambiguous="NaT", nonexistent="NaT") if pd.notna(stamp) else pd.NaT
+            age = (now - stamp).total_seconds() / 60 if pd.notna(stamp) else np.nan
+            r24 = surveillance_sum(h, anchor - pd.Timedelta(hours=24), anchor)
+            r72 = surveillance_sum(h, anchor - pd.Timedelta(hours=72), anchor)
+            gust = safe_float(current.get("wind_gusts_10m"))
+            code = safe_float(current.get("weather_code"))
+            level, reasons = surveillance_level(r24, r72, gust, code in THUNDERSTORM_CODES, limits)
+            fresh = pd.notna(age) and -15 <= age <= 90
+            if not fresh:
+                level, reasons = "INDETERMINE", "Donnees perimees ou non datees"
+            live.append({**base, "Niveau": level, "Pluie 24 h modele (mm)": r24,
+                         "Pluie 72 h modele (mm)": r72, "Rafales (km/h)": gust,
+                         "Horodatage": stamp, "Age (min)": age, "Motifs": reasons,
+                         "Source": "Open-Meteo MODELE, pas une station", "Recuperation UTC": p["retrieved"]})
+            for day in range(7):
+                start = now.normalize() + pd.DateOffset(days=day)
+                end = start + pd.DateOffset(days=1)
+                begin = max(anchor, start)
+                part = h[(h.time > begin) & (h.time <= end)]
+                rain = surveillance_sum(h, begin, end)
+                r24 = surveillance_sum(h, end - pd.Timedelta(hours=24), end)
+                r72 = surveillance_sum(h, end - pd.Timedelta(hours=72), end)
+                gust = part.wind_gusts_10m.max()
+                storm = bool(part.weather_code.isin(THUNDERSTORM_CODES).any())
+                level, reasons = surveillance_level(r24, r72, gust, storm, limits)
+                if pd.isna(rain) or part[["weather_code", "wind_gusts_10m"]].isna().any().any():
+                    level, reasons = "INDETERMINE", "Couverture horaire incomplete"
+                future.append({**base, "Date": start.date(), "Niveau": level,
+                               "Pluie a venir (mm)": rain, "Cumul 24 h (mm)": r24,
+                               "Cumul 72 h (mm)": r72, "Rafales (km/h)": gust,
+                               "Orage": storm, "Probabilite pluie (%)": part.precipitation_probability.max(),
+                               "Motifs": reasons})
+        except Exception as exc:
+            failures.append({"Commune": r["commune_name"], "Erreur": str(exc)})
+            # Supprimer les resultats partiels si la commune a echoue.
+            live = [x for x in live if (x["Commune"], x["Departement"]) != (base["Commune"], base["Departement"])]
+            future = [x for x in future if (x["Commune"], x["Departement"]) != (base["Commune"], base["Departement"])]
+            live.append({**base, "Niveau": "INDETERMINE", "Motifs": "Source indisponible"})
+            for day in range(7):
+                future.append({**base, "Date": (now.normalize() + pd.DateOffset(days=day)).date(),
+                               "Niveau": "INDETERMINE", "Motifs": "Source indisponible",
+                               "Pluie a venir (mm)": np.nan})
+    return pd.DataFrame(live), pd.DataFrame(future), failures
+
+
+def surveillance_view(frame, key):
+    cols = st.columns(5)
+    for col, level in zip(cols, ["ROUGE", "ORANGE", "JAUNE", "VERT", "INDETERMINE"]):
+        col.metric(level, int((frame.Niveau == level).sum()))
+    f = frame.assign(_rank=frame.Niveau.map(LEVEL_RANK)).sort_values(["_rank", "Commune"], ascending=[False, True])
+    display = f.drop(columns=["latitude", "longitude", "_rank"])
+    st.dataframe(display, hide_index=True, use_container_width=True, height=400)
+    st.download_button("Exporter la vue", display.to_csv(index=False).encode("utf-8-sig"), f"{key}.csv", "text/csv", key=f"export_{key}")
+    m = folium.Map(location=[f.latitude.mean(), f.longitude.mean()], zoom_start=8)
+    for segment in snapshot.get("lgv_lines", []):
+        vertices = [[p["lat"], p["lon"]] for p in segment if isinstance(p, dict) and "lat" in p and "lon" in p]
+        if vertices:
+            folium.PolyLine(vertices, color="#2563eb", weight=3).add_to(m)
+    for r in f.to_dict("records"):
+        folium.CircleMarker([r["latitude"], r["longitude"]], radius=7,
+                            color=LEVEL_COLOR[r["Niveau"]], fill=True, fill_opacity=.85,
+                            tooltip=f'{r["Commune"]} : {r["Niveau"]}').add_to(m)
+    st_folium(m, use_container_width=True, height=400, returned_objects=[], key=key)
+    st.caption("Points representatifs des communes le long de la LGV, pas leurs limites administratives.")
+
+
+def surveillance_panel(coords, limits):
+    st.caption("Actualisation ecran : " + pd.Timestamp.now(tz="Europe/Paris").strftime("%d/%m/%Y %H:%M:%S"))
+    with st.spinner("Chargement de la surveillance communale..."):
+        live, future, failures = surveillance_build(coords, limits)
+    if failures:
+        st.warning(f"{len(failures)} commune(s) sans donnees : niveau INDETERMINE, jamais vert par defaut.")
+        with st.expander("Diagnostic des sources"):
+            st.dataframe(pd.DataFrame(failures), hide_index=True)
+    current_tab, forecast_tab, sources_tab = st.tabs(["Situation actuelle", "Risque previsionnel - 7 jours", "Vigilances et sources"])
+    with current_tab:
+        st.subheader("Surveillance actuelle par commune")
+        st.warning("Situation actuelle MODELISEE : aucune station terrain n'est connectee. Ce n'est pas une mesure en temps reel.")
+        surveillance_view(live, "surveillance_actuelle")
+    with forecast_tab:
+        st.subheader("Surveillance previsionnelle par commune")
+        st.caption("Aujourd'hui + 6 jours. Aujourd'hui : pluie restante ; cumuls 24/72 h incluant les heures passees du modele. Aucun cumul n'est presente comme une mesure.")
+        matrix = future.pivot(index=["Departement", "Commune"], columns="Date", values="Niveau")
+        def color_level(value):
+            return "background-color: " + LEVEL_COLOR.get(value, "#64748b") + "; color: white"
+        styled = matrix.style.map(color_level) if hasattr(matrix.style, "map") else matrix.style.applymap(color_level)
+        st.dataframe(styled, use_container_width=True)
+        day = st.selectbox("Jour a surveiller", sorted(future.Date.unique()), key="surveillance_day")
+        surveillance_view(future[future.Date == day], "surveillance_previsionnelle")
+        name = st.selectbox("Detail d'une commune", sorted(future.Commune.unique()), key="surveillance_name")
+        detail = future[future.Commune == name]
+        fig = go.Figure()
+        for dep, group in detail.groupby("Departement"):
+            fig.add_bar(x=group.Date, y=group["Pluie a venir (mm)"], name=f"Pluie - {dep}")
+        fig.update_layout(yaxis_title="Pluie prevue (mm)", height=320)
+        st.plotly_chart(fig, use_container_width=True)
+        st.dataframe(detail.drop(columns=["latitude", "longitude"]), hide_index=True)
+    with sources_tab:
+        st.warning("Vigilances departementales et troncons Vigicrues : ne pas les attribuer automatiquement a chaque commune. Le relais meteo existant ne certifie pas la validite temporelle.")
+        if st.button("Consulter les flux existants", key="surveillance_vigilance"):
+            for label, loader in [("Relais meteo", load_mf_alerts), ("Vigicrues", load_vigicrues)]:
+                st.subheader(label)
+                try:
+                    alerts, ok = loader()
+                    if not ok:
+                        st.warning("Source indisponible")
+                    elif alerts:
+                        st.dataframe(pd.DataFrame(alerts), hide_index=True)
+                    else:
+                        st.info("Aucune alerte retournee. Cela ne certifie pas une vigilance verte.")
+                except Exception as exc:
+                    st.warning(str(exc))
+        st.markdown("[Documentation Open-Meteo](https://open-meteo.com/en/docs) | [Vigilance Meteo-France](https://vigilance.meteofrance.fr/) | [Vigicrues](https://www.vigicrues.gouv.fr/)")
+        st.caption("Cache meteo : 15 minutes. Actualisation automatique uniquement pendant une session ouverte. Aucun envoi externe, aucune surveillance serveur permanente. Pour un usage professionnel, verifier les conditions commerciales et quotas Open-Meteo.")
+
+
 st.title("⚠️ LGV SEA - Surveillance des risques de glissement")
 st.caption(
-    "Découpage fixe par secteurs de 10 km. Les données lourdes sont chargées uniquement dans le module sélectionné."
+    "Secteurs de 10 km pour les analyses ; surveillance meteo par commune. Chargement a la demande."
 )
 
 try:
@@ -691,100 +863,41 @@ if module == "Vue rapide":
 # ALERTES ET PREVISIONS
 # -----------------------------------------------------------------------------
 elif module == "Alertes et prévisions":
-    st.subheader(f"Alertes et prévisions - {sector_name}")
-
-    with st.spinner("Chargement des vigilances et des prévisions..."):
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_mf = pool.submit(load_mf_alerts)
-            f_vc = pool.submit(load_vigicrues)
-            f_fc = pool.submit(load_forecast, lat_c, lon_c)
-            mf_alerts, mf_ok = f_mf.result()
-            vc_alerts, vc_ok = f_vc.result()
-            try:
-                forecast = forecast_summary(f_fc.result())
-                fc_ok = True
-            except Exception:
-                forecast, fc_ok = {}, False
-
-    selected_deps = {clean_department(x) for x in selected_points["department_code"] if clean_department(x)}
-    relevant_mf = [x for x in mf_alerts if not selected_deps or x["dep"] in selected_deps]
-    mf_level = highest_level(relevant_mf)
-    vc_level = highest_level(vc_alerts)
-
-    a, b, c = st.columns(3)
-    with a:
-        st.markdown("### Vigilance par département")
-        if not mf_ok:
-            st.warning("Vigilance non vérifiée")
-        elif not relevant_mf:
-            st.success("Aucune vigilance non verte sur la sélection")
-        else:
-            alerts_df = pd.DataFrame(relevant_mf)
-            alerts_df["rank"] = alerts_df["level"].map(LEVEL_RANK)
-            alerts_df = alerts_df.sort_values(["rank", "dep"], ascending=[False, True])
-            for dep, group in alerts_df.groupby("dep"):
-                level = group.iloc[0]["level"]
-                st.markdown(f"**Département {dep} : {level}**")
-                for alert in group.to_dict("records"):
-                    st.write(f"• {alert['phenomenon']} | {alert['day']}")
-
-    with b:
-        st.markdown("### Prévision du secteur")
-        if not fc_ok:
-            st.warning("Prévisions non vérifiées")
-        else:
-            st.metric("Pluie 24 h", f"{forecast['rain_24h']:.1f} mm")
-            st.metric("Pluie 72 h", f"{forecast['rain_72h']:.1f} mm")
-            st.metric("Pluie 7 jours", f"{forecast['rain_7d']:.1f} mm")
-            if forecast["thunderstorm"]:
-                st.warning("Orage possible dans les 7 prochains jours")
-
-    with c:
-        st.markdown("### Vigicrues")
-        if not vc_ok:
-            st.warning("Vigicrues non vérifié")
-        else:
-            non_green = [x for x in vc_alerts if x["level"] != "VERT"]
-            if not non_green:
-                st.success("Aucune vigilance non verte détectée")
-            else:
-                for item in sorted(non_green, key=lambda z: -LEVEL_RANK[z["level"]])[:15]:
-                    st.write(f"**{item['level']}** | {item['name']}")
-
-    st.divider()
-    st.markdown("### ⛈️ Prévisions d’orage par commune")
-    coords = selected_points.groupby("commune_name", as_index=False).agg(
-        latitude=("latitude", "mean"),
-        longitude=("longitude", "mean"),
-        pk_min=("pk_km", "min"),
-        pk_max=("pk_km", "max"),
-        department_code=("department_code", "first"),
-    )
-
-    with st.spinner(f"Analyse de {len(coords)} commune(s)..."):
-        commune_forecasts = load_commune_forecasts(coords)
-
-    if commune_forecasts.empty:
-        st.warning("Prévisions communales indisponibles.")
+    st.subheader("Surveillance meteo et alertes par commune")
+    st.caption("Communes de toute la ligne, independamment du filtre des secteurs de 10 km. Les autres modules conservent ce filtre.")
+    st.info("Indice meteorologique experimental, pas une probabilite de glissement ni une consigne ferroviaire. Seuils proposes a valider par le metier.")
+    coords = points.groupby(["department_code", "commune_name"], as_index=False).agg(
+        latitude=("latitude", "mean"), longitude=("longitude", "mean"),
+        pk_min=("pk_km", "min"), pk_max=("pk_km", "max"))
+    deps = st.multiselect("Departements (vide = tous)", sorted(coords.department_code.unique()), key="surveillance_deps")
+    if deps:
+        coords = coords[coords.department_code.isin(deps)]
+    names = st.multiselect("Communes (vide = toutes)", sorted(coords.commune_name.unique()), key="surveillance_communes")
+    if names:
+        coords = coords[coords.commune_name.isin(names)]
+    st.caption(f"{len(coords)} commune(s) dans le perimetre de surveillance.")
+    limits = [(20., 40., 60.), (40., 70., 100.), (60., 80., 100.)]
+    with st.expander("Seuils configurables, a valider par le metier"):
+        for i, label in enumerate(["Pluie 24 h (mm)", "Pluie 72 h (mm)", "Rafales (km/h)"]):
+            cols = st.columns(3)
+            limits[i] = tuple(col.number_input(f"{label} - {level}", min_value=0.1, value=limits[i][j], key=f"threshold_{i}_{j}")
+                              for j, (col, level) in enumerate(zip(cols, ["JAUNE", "ORANGE", "ROUGE"])))
+            if not limits[i][0] < limits[i][1] < limits[i][2]:
+                st.error("Seuils strictement croissants requis.")
+                st.stop()
+        st.caption("Niveau maximal parmi pluie 24 h, pluie 72 h et rafales. Orage : au minimum jaune. Donnees incompletes : indetermine.")
+    auto = st.checkbox("Actualisation automatique pendant que la page reste ouverte", value=True)
+    interval = st.selectbox("Frequence de rafraichissement ecran", [300, 600, 900], format_func=lambda n: f"{n // 60} minutes")
+    if coords.empty:
+        st.warning("Aucune commune selectionnee.")
+    elif hasattr(st, "fragment"):
+        @st.fragment(run_every=interval if auto else None)
+        def surveillance_fragment():
+            surveillance_panel(coords, limits)
+        surveillance_fragment()
     else:
-        thunderstorms = commune_forecasts[commune_forecasts["Orage"]].copy()
-        if thunderstorms.empty:
-            st.success("Aucun signal d’orage détecté sur les communes sélectionnées pour les 7 prochains jours.")
-        else:
-            thunderstorms["Secteur 10 km"] = thunderstorms["PK min"].apply(
-                lambda pk: f"PK {int(pk // 10) * 10:03d}-{int(pk // 10) * 10 + 10:03d}"
-            )
-            display_cols = [
-                "Date", "Département", "Commune", "Secteur 10 km", "Phénomène",
-                "Probabilité pluie (%)", "Pluie prévue (mm)", "Rafales max (km/h)",
-            ]
-            thunderstorms = thunderstorms.sort_values(
-                ["Date", "Probabilité pluie (%)", "Pluie prévue (mm)"],
-                ascending=[True, False, False],
-            )
-            st.warning(f"{len(thunderstorms)} signal(s) journalier(s) d’orage détecté(s).")
-            st.dataframe(thunderstorms[display_cols], use_container_width=True, hide_index=True)
-            st.caption("L’orage par commune est une prévision localisée, pas une vigilance communale officielle.")
+        st.warning("Streamlit >= 1.37 requis pour l'actualisation automatique. Le bouton Actualiser reste disponible.")
+        surveillance_panel(coords, limits)
 
 # -----------------------------------------------------------------------------
 # PLUIE HISTORIQUE
